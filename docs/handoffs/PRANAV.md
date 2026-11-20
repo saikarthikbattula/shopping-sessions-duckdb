@@ -2,6 +2,65 @@
 
 Status: prepared; not sent externally and implementation has not started.
 
+## Using this with Cursor Mobile
+
+Open this repository in a Cursor agent session with repository access, then paste the prompt below. If the mobile session cannot run commands, have it prepare the code changes and explicitly report which checks still need a terminal-capable environment. Karthik uses Codex for the analytical side. Relay coordination notes between the two sessions; neither agent can assume it can see the other's unpushed edits.
+
+```text
+Implement Pranav's ingestion workstream in:
+https://github.com/saikarthikbattula/shopping-sessions-duckdb
+
+First inspect the current branch, git status, and applicable AGENTS.md instructions.
+Read README.md, docs/IMPLEMENTATION_PLAN.md, docs/DATA_CONTRACT.md, and
+docs/handoffs/PRANAV.md. Read the competition rules.md when available.
+Treat the data contract as the interface shared with Karthik's Codex agent.
+
+Create branch codex/pranav-ingestion from the latest shared main. Preserve
+existing work; if the branch already exists, inspect and continue it.
+Implement strict parsing, timestamp validation, identity union-find, and
+bounded Arrow/Parquet staging. Own only pipeline/ingest.py,
+pipeline/parsing.py, pipeline/identity.py, and tests/test_ingest.py.
+Implement prepare_inputs with exactly the signature and schemas in the
+shared contract. Never deduplicate events or discard invalid event copies
+before the analytical stage. Apply all acceptance checks in this handoff.
+
+The repository may initially contain planning documents only. Inspect first.
+If the official starter, rules, dependencies, or pipeline/contracts.py are
+missing, report the specific missing prerequisite to Pranav for relay to
+the integrator. Continue independent parser and union-find work that can
+be verified from the available specification; do not invent missing
+competition rules or silently take over integrator-owned files. Do not
+claim complete ingestion validation until the prerequisites are present.
+
+Do not edit analytics, shared contract, Docker, runner, or dependencies
+without coordinating a concrete change with the integrator. Do not alter
+official fixture expectations, hard-code generated IDs, commit datasets,
+publish a competition submission, or force-push. Do not assume access to
+another agent or external messaging service.
+
+Run meaningful focused tests if your environment permits. Finish with:
+branch and commit if committed; changed files; exact commands and results;
+checks not run and why; contract compatibility; known limitations; and a
+short coordination note that Pranav can paste to Karthik/integrator.
+State the next action and owner for each unresolved dependency. Do not
+report planned work as implemented or unrun tests as passed.
+```
+
+### Coordination message to send back
+
+Copy the agent's final report to Karthik with this structure:
+
+```text
+Pranav / ingestion
+Branch + commit:
+Files changed:
+Contract: unchanged / proposed change with reason
+Tests run + results:
+Tests not run + reason:
+Ready for integration: yes / no
+Blockers and next action + owner:
+```
+
 ## Objective and ownership
 
 Implement the input side of the official DuckDB starter solution. Read [the implementation plan](../IMPLEMENTATION_PLAN.md) and [the shared data contract](../DATA_CONTRACT.md) first, then the supplied `rules.md`.

@@ -13,6 +13,8 @@ Competition planning and implementation handoffs for an exact shopping-event att
 
 Pranav owns ingestion and canonical person IDs. Karthik owns sessions, attribution, assists, and daily aggregates. The integrator owns starter setup, orchestration, Docker, independent correctness checks, and packaging. The handoff documents describe proposed ownership; they have not been delivered through an external messaging service.
 
+Each handoff includes a ready-to-paste agent prompt: Pranav's is written for Cursor Mobile, and Karthik's for Codex. They include branch names, file boundaries, missing-prerequisite handling, acceptance checks, and a report template to relay between agents.
+
 ## Required competition materials
 
 Obtain `starter-duckdb.zip`, `rules.md`, `generator.zip`, and `dev-answer.zip` from the competition. The supplied rules are authoritative. Import the starter into the repository root before implementing; preserve its fixture and comparison tools. Keep generated datasets and dev answers outside the committed submission.
