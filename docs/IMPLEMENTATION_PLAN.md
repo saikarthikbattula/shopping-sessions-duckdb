@@ -1,6 +1,6 @@
 # DuckDB competition implementation plan
 
-Status: ready for implementation. This workspace currently contains planning documents only; the starter has not been imported and no pipeline or checks have run.
+Status: shared setup is implemented on the setup PR branch. The starter, rules, 36 fixtures, generator source, shared contract, and connected entrypoint stubs are present. Three bootstrap integration checks pass. Workstream implementations, official output comparisons, and container validation remain outstanding; see [validation status](VALIDATION.md).
 
 ## Goal and source of truth
 
@@ -18,11 +18,11 @@ All implementation and integration changes use task branches and pull requests t
 | Karthik | DuckDB event/click processing, sessions, attribution, assists, both output tables | [Karthik](handoffs/KARTHIK.md) |
 | Integrator (Codex) | Starter import, shared contract module, orchestration, dependencies, Docker, independent oracle, full validation and submission candidate | [Shared contract](DATA_CONTRACT.md) |
 
-1. Integrator imports the starter and rules, creates the contract module and an isolated environment, and pins the Arrow dependency. Preserve the supplied fixtures and harness.
+1. Completed: integrator imported the starter and rules, created the contract module and isolated environment, and pinned Arrow. Supplied fixtures and harness are unchanged. Both agent functions have explicit unimplemented stubs.
 2. Pranav and Karthik can implement independently against the shared contract. Karthik uses synthetic staged tables until ingestion is ready. Keep edits within each owner's files.
 3. Integrator wires `prepare_inputs` to `run_pipeline` in the starter entrypoint and runs all exact comparisons. Resolve correctness failures before tuning.
 4. Measure stages and resource usage across seeds and increasing sizes. Keep only optimizations that preserve exact results.
-5. Build and check the amd64 image under scorer flags, commit the validated candidate, and provide reproducible commands and evidence. Public repository creation and track submission remain separate handoff actions.
+5. Build and check the amd64 image under scorer flags, commit the validated candidate, and provide reproducible commands and evidence. The public repository exists; track submission remains a separate handoff action.
 
 ## Processing design
 
