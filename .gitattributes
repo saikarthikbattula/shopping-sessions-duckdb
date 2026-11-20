@@ -1,0 +1,5 @@
+# Official CSV fixtures include intentional CR bytes and whitespace edge cases.
+# Preserve their bytes on every platform and do not flag them as formatting errors.
+fixtures/** -text -whitespace
+# Preserve the authoritative rules verbatim, including their final blank line.
+rules.md -text whitespace=-blank-at-eof
