@@ -2,7 +2,22 @@
 
 Competition planning and implementation handoffs for an exact shopping-event attribution pipeline, based on the official DuckDB starter.
 
-**Status:** planning documents only. The starter has not been imported, the pipeline is not implemented, and no fixture, dev-answer, or Docker validation has run.
+**Status:** shared setup is implemented. The official starter, rules, all 36 fixtures, generator source, shared schemas, and connected workstream entrypoints are present. Three bootstrap integration checks pass. Pranav's ingestion and Karthik's analytics are explicit stubs; this is not yet a working competition submission.
+
+## Pull and start your agent
+
+Until the setup PR is human-merged into `main`, clone its branch:
+
+```sh
+git clone --branch codex/starter-bootstrap https://github.com/saikarthikbattula/shopping-sessions-duckdb.git
+cd shopping-sessions-duckdb
+make setup
+make test
+```
+
+For an existing clone, fetch `origin` and open `codex/starter-bootstrap` to read the latest handoff. After the setup PR is merged, use an updated `main` instead. Use Python 3.12 or 3.13 for local development. Docker is optional for native workstream tests.
+
+Then open the appropriate handoff below and paste its prompt into your agent. The prompt creates your own task branch from the shared setup; do not code on the setup branch or `main`. Pranav uses Cursor Mobile and Karthik uses Codex. If the mobile agent cannot execute commands, it must report which validations need another environment.
 
 ## Start here
 
@@ -20,7 +35,25 @@ All agents must push only to task branches and open pull requests targeting `mai
 
 ## Required competition materials
 
-Obtain `starter-duckdb.zip`, `rules.md`, `generator.zip`, and `dev-answer.zip` from the competition. The supplied rules are authoritative. Import the starter into the repository root before implementing; preserve its fixture and comparison tools. Keep generated datasets and dev answers outside the committed submission.
+The official DuckDB starter is imported at the repository root. `rules.md` is authoritative, `fixtures/` and `scripts/` preserve the official checks, and `tools/generator/` contains the unmodified generator source. The original starter README is preserved in `docs/STARTER_README.md`; use this README for the updated module commands. No ZIP downloads are needed to begin either workstream.
+
+Obtain `dev-answer.zip` from the competition and unpack it as `dev-answer/` for final dev comparison; it is deliberately not committed. Generated datasets, answers, outputs, and scratch directories are ignored by Git and excluded from the image build context.
+
+## Development commands
+
+```sh
+make test                    # shared setup checks; does not prove pipeline correctness
+make fixtures-local          # official fixtures; expected to fail until both workstreams are implemented
+make generator               # Rust 1.85+ required
+make dev                     # generate seed-1 public dev data
+make run-local               # native pipeline run after implementation
+make check-dev               # needs unpacked dev-answer/
+make fixtures                # amd64 Docker fixture run; Docker/buildx required
+```
+
+The entrypoint is `python -m pipeline.pipeline`. Set `DATA_DIR`, `OUTPUT_DIR`, `SCRATCH_DIR`, `NCPU`, and `MEM_GB` to run it directly. `run.sh` uses the same module inside the Docker image. All runtime diagnostics go to stderr; stage stubs deliberately exit with an error rather than writing misleading empty outputs.
+
+See [validation status](docs/VALIDATION.md) for checks performed and outstanding gates.
 
 ## Acceptance gates
 
@@ -30,4 +63,4 @@ Obtain `starter-duckdb.zip`, `rules.md`, `generator.zip`, and `dev-answer.zip` f
 4. Validate the linux/amd64 image under the scorer's restricted runtime: 8 CPUs, 24 GB RAM, no network, read-only root, and uid 1000.
 5. Measure runtime and resource use before selecting a submission commit. The committed repository must remain below 50 MB and contain no generated input data.
 
-The Dockerfile and runnable pipeline will be added when the starter is imported. This repository is not yet a competition submission.
+The Dockerfile is present, but the Docker image has not been built or checked on this machine. This repository is not yet a competition submission.

@@ -7,6 +7,7 @@ These instructions apply to Codex, Cursor, and every agent working in this repos
 - Read this file, `docs/IMPLEMENTATION_PLAN.md`, `docs/DATA_CONTRACT.md`, and your assigned handoff before editing.
 - Work on a task branch based on the latest shared `main`. Never code or commit directly on `main`, and never push directly to `main`.
 - Use `codex/pranav-ingestion` for Pranav's work, `codex/karthik-analytics` for Karthik's work, and a separate `codex/<task>` branch for integration or other changes. Inspect existing branches and local changes before switching; preserve other people's work.
+- Bootstrap exception: until the shared setup PR is human-merged, workstream branches may start from `origin/codex/starter-bootstrap` so they include the starter and contract. Still target `main` with PRs, disclose the shared dependency, and leave bootstrap merging to a human. After that merge, use updated `origin/main` for new work.
 - Commit and push changes only to your task branch. Open a pull request targeting `main`. Open a draft PR while work is incomplete, checks have failed, or required checks remain unrun; update that PR as work proceeds.
 - Never merge a pull request, enable auto-merge, or bypass review/branch protections. Leave merging to a human maintainer. Do not force-push or rewrite shared history.
 - Include the problem and resulting behavior, scope, validation commands/results, unrun checks and reasons, and interface/dependency changes in the PR description. Do not mark checks as passed unless they ran successfully.

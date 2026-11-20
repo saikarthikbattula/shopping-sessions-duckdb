@@ -1,6 +1,6 @@
 # Shared ingestion-to-DuckDB contract
 
-Status: agreed planning interface; code is to be created during starter integration. The supplied rules remain authoritative.
+Status: implemented in `pipeline/contracts.py`, with connected entrypoint stubs in `pipeline/ingest.py` and `pipeline/analytics.py`. The supplied rules remain authoritative.
 
 ## Modules and calls
 
@@ -10,11 +10,15 @@ Integrator owns `pipeline/contracts.py` with frozen `PreparedInputs` and these f
 - `products_path: Path`, `campaigns_path: Path`: staged lookup Parquet files.
 - `window_start_ms: int`, `window_end_ms: int`: manifest boundaries.
 
+Import `EVENTS_SCHEMA`, `CLICKS_SCHEMA`, `PRODUCTS_SCHEMA`, and `CAMPAIGNS_SCHEMA` from that module when writing staged Arrow/Parquet data. `USER_DAILY_SCHEMA` and `CAMPAIGN_DAILY_SCHEMA` also describe the required outputs. The integrator's `make test` checks these schemas across the Arrow/Parquet/DuckDB boundary; it does not test workstream correctness.
+
 Pranav implements `prepare_inputs(data_dir: Path, scratch_dir: Path, *, batch_rows: int = 65536) -> PreparedInputs` in `pipeline/ingest.py`. Helpers belong in `pipeline/parsing.py` and `pipeline/identity.py`.
 
 Karthik implements `run_pipeline(con: duckdb.DuckDBPyConnection, prepared: PreparedInputs, output_dir: Path) -> None` in `pipeline/analytics.py`; SQL may live under `pipeline/sql/`.
 
 Integrator owns the existing `pipeline/pipeline.py`: environment/configuration, DuckDB connection, ingestion call, analytical call, timings, and failure exit. It owns Dockerfile, run.sh, Makefile, requirements, and harness integration. Neither owner creates a connection or executes the pipeline on module import.
+
+Use package imports such as `from pipeline.contracts import PreparedInputs`. The canonical entrypoint is `python -m pipeline.pipeline`, not direct script execution. The integrator supplies a dedicated temporary working directory inside `SCRATCH_DIR`, closes the connection, and removes only that directory when the invocation finishes. Its DuckDB memory limit is 75% of `MEM_GB` to reserve Python/Arrow headroom; all spills use that working directory.
 
 ## Staged schemas
 

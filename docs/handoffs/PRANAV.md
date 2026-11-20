@@ -1,6 +1,6 @@
 # Pranav handoff: strict ingestion and identity resolution
 
-Status: prepared; not sent externally and implementation has not started.
+Status: shared setup and entrypoint stub are present on the setup PR branch. Ingestion logic is not implemented. This handoff has not been sent through an external messaging service.
 
 ## Using this with Cursor Mobile
 
@@ -15,8 +15,16 @@ Read README.md, docs/IMPLEMENTATION_PLAN.md, docs/DATA_CONTRACT.md, and
 docs/handoffs/PRANAV.md. Read the competition rules.md when available.
 Treat the data contract as the interface shared with Karthik's Codex agent.
 
-Create branch codex/pranav-ingestion from the latest shared main. Preserve
-existing work; if the branch already exists, inspect and continue it.
+The official starter, rules, generator source, and schemas are now included.
+Use make setup to install pinned dependencies and make test for the shared
+bootstrap checks. Write focused tests using unittest so make test discovers
+them; run make fixtures-local only when both stages can produce real output.
+Import the shared Arrow schemas rather than redeclaring their field types.
+
+Fetch origin. Use origin/main as the base once it contains pipeline/contracts.py.
+Until the shared setup PR is human-merged, use origin/codex/starter-bootstrap
+as the base instead. Create your branch codex/pranav-ingestion from that
+base. Preserve existing work; if it already exists, inspect and continue it.
 Never commit or push directly to main. Push only to your task branch and
 open a PR targeting main; use a draft while incomplete or required checks
 are unrun/failing. Never merge the PR or enable auto-merge. A human
