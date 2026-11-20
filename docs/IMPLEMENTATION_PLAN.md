@@ -10,6 +10,8 @@ Retain the starter Docker entrypoint, pinned DuckDB version, runner, fixtures, a
 
 ## Ownership and integration order
 
+All implementation and integration changes use task branches and pull requests targeting `main`, as required by root `AGENTS.md`. Use draft PRs for incomplete work or unrun required checks. Agents never push directly to `main`, merge PRs, or enable auto-merge; a human maintainer performs merges.
+
 | Owner | Deliverable | Handoff |
 | --- | --- | --- |
 | Pranav | Strict CSV/timestamp parsing, union-find identity resolution, bounded typed staging | [Pranav](handoffs/PRANAV.md) |

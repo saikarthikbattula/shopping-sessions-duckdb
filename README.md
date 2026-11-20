@@ -6,6 +6,7 @@ Competition planning and implementation handoffs for an exact shopping-event att
 
 ## Start here
 
+- [Agent instructions: task branches and PRs; human-only merging](AGENTS.md)
 - [Implementation plan and integration ownership](docs/IMPLEMENTATION_PLAN.md)
 - [Shared ingestion-to-DuckDB contract](docs/DATA_CONTRACT.md)
 - [Pranav: strict parsing and identity resolution](docs/handoffs/PRANAV.md)
@@ -14,6 +15,8 @@ Competition planning and implementation handoffs for an exact shopping-event att
 Pranav owns ingestion and canonical person IDs. Karthik owns sessions, attribution, assists, and daily aggregates. The integrator owns starter setup, orchestration, Docker, independent correctness checks, and packaging. The handoff documents describe proposed ownership; they have not been delivered through an external messaging service.
 
 Each handoff includes a ready-to-paste agent prompt: Pranav's is written for Cursor Mobile, and Karthik's for Codex. They include branch names, file boundaries, missing-prerequisite handling, acceptance checks, and a report template to relay between agents.
+
+All agents must push only to task branches and open pull requests targeting `main`. Agents must not push to `main`, merge PRs, or enable auto-merge. Incomplete work or unrun required checks belongs in a draft PR. A human maintainer reviews and merges.
 
 ## Required competition materials
 
