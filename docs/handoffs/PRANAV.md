@@ -17,6 +17,10 @@ Treat the data contract as the interface shared with Karthik's Codex agent.
 
 Create branch codex/pranav-ingestion from the latest shared main. Preserve
 existing work; if the branch already exists, inspect and continue it.
+Never commit or push directly to main. Push only to your task branch and
+open a PR targeting main; use a draft while incomplete or required checks
+are unrun/failing. Never merge the PR or enable auto-merge. A human
+maintainer reviews and merges. Follow root AGENTS.md throughout.
 Implement strict parsing, timestamp validation, identity union-find, and
 bounded Arrow/Parquet staging. Own only pipeline/ingest.py,
 pipeline/parsing.py, pipeline/identity.py, and tests/test_ingest.py.
@@ -40,6 +44,7 @@ another agent or external messaging service.
 
 Run meaningful focused tests if your environment permits. Finish with:
 branch and commit if committed; changed files; exact commands and results;
+PR URL (or explicitly state why a PR could not be created);
 checks not run and why; contract compatibility; known limitations; and a
 short coordination note that Pranav can paste to Karthik/integrator.
 State the next action and owner for each unresolved dependency. Do not
@@ -53,6 +58,7 @@ Copy the agent's final report to Karthik with this structure:
 ```text
 Pranav / ingestion
 Branch + commit:
+PR URL + draft/ready status:
 Files changed:
 Contract: unchanged / proposed change with reason
 Tests run + results:

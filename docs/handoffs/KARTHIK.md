@@ -17,6 +17,10 @@ Treat the data contract as the interface shared with Pranav's Cursor agent.
 
 Create branch codex/karthik-analytics from the latest shared main. Preserve
 existing work; if the branch already exists, inspect and continue it.
+Never commit or push directly to main. Push only to your task branch and
+open a PR targeting main; use a draft while incomplete or required checks
+are unrun/failing. Never merge the PR or enable auto-merge. A human
+maintainer reviews and merges. Follow root AGENTS.md throughout.
 Own only pipeline/analytics.py, optional pipeline/sql/, and
 tests/test_analytics.py. Implement run_pipeline with exactly the shared
 signature. Start with small synthetic staged inputs matching the contract
@@ -45,6 +49,7 @@ inspect Pranav's agent directly.
 Run meaningful focused tests where possible. The complete acceptance gate
 is all 36 official fixtures plus both published dev-answer tables after
 integration. Finish with branch and commit if committed; changed files;
+PR URL (or explicitly state why a PR could not be created);
 exact commands/results; unrun checks and reasons; contract compatibility;
 known limitations; and a short coordination note for Pranav/integrator.
 State the next action and owner for each unresolved dependency. Do not
@@ -58,6 +63,7 @@ Copy the agent's final report to Pranav/integrator with this structure:
 ```text
 Karthik / analytics
 Branch + commit:
+PR URL + draft/ready status:
 Files changed:
 Contract: unchanged / proposed change with reason
 Tests run + results:
