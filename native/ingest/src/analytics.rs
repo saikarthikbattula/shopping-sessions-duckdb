@@ -1324,6 +1324,10 @@ pub fn run_pipeline(
                 handles.push(scope.spawn(move || -> Result<(HashMap<(u16, i32), CampaignDailyAccumulator>, u64)> {
                     let cpu_start = thread_cpu_time_ns();
                     let mut user_rows = Vec::new();
+                    let profiling = std::env::var_os("NATIVE_PROFILE").as_deref() == Some(std::ffi::OsStr::new("1"));
+                    let worker_started = profiling.then(std::time::Instant::now);
+                    let mut sort_time = std::time::Duration::ZERO;
+                    let mut attribution_time = std::time::Duration::ZERO;
                     let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
 
                     let mut shard_person_map: HashMap<CompactId, u32, FastBuildHasher> =
@@ -1397,12 +1401,15 @@ pub fn run_pipeline(
                             }
                         }
 
+                        let sort_started = profiling.then(std::time::Instant::now);
                         // Ultra-fast packed 64-bit integer key sort: (p_idx << 32 | ts_offset) compiles to single cmp instruction
                         local_events.sort_unstable_by_key(|e| ((e.p_idx as u64) << 32) | ((e.ts_ms - window_start) as u32 as u64));
                         local_clicks.sort_unstable_by(|a, b| {
                             (a.p_idx, a.ts_ms, a.click_id.as_bytes()).cmp(&(b.p_idx, b.ts_ms, b.click_id.as_bytes()))
                         });
+                        if let Some(started) = sort_started { sort_time += started.elapsed(); }
 
+                        let attribution_started = profiling.then(std::time::Instant::now);
                         let (u_part, c_part) = execute_shard_local(
                             &local_events,
                             &local_clicks,
@@ -1410,6 +1417,7 @@ pub fn run_pipeline(
                             category_names,
                         );
                         user_rows.extend(u_part);
+                        if let Some(started) = attribution_started { attribution_time += started.elapsed(); }
                         for (k, acc) in c_part {
                             let entry = campaign_daily_map.entry(k).or_default();
                             entry.sessions += acc.sessions;
@@ -1419,8 +1427,16 @@ pub fn run_pipeline(
                         }
                     }
 
+                    let parquet_started = profiling.then(std::time::Instant::now);
                     if worker_idx == 0 || !user_rows.is_empty() {
                         write_user_daily_shard(output_dir, worker_idx, &user_rows, category_names)?;
+                    }
+                    if let Some(started) = worker_started {
+                        eprintln!("[profile/worker] worker={worker_idx} wall_ms={:.3} sort_ms={:.3} attribution_ms={:.3} parquet_ms={:.3} rows={} raw_event_bytes={} person_event_bytes={} local_event_bytes={}",
+                            started.elapsed().as_secs_f64()*1000.0, sort_time.as_secs_f64()*1000.0,
+                            attribution_time.as_secs_f64()*1000.0, parquet_started.unwrap().elapsed().as_secs_f64()*1000.0,
+                            user_rows.len(), std::mem::size_of::<RawEvent>(),
+                            std::mem::size_of::<RawPersonEvent>(), std::mem::size_of::<LocalEvent>());
                     }
 
                     let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);

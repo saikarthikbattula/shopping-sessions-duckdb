@@ -1,0 +1,68 @@
+diff --git a/native/ingest/src/analytics.rs b/native/ingest/src/analytics.rs
+index 1b20e23..819c78a 100644
+--- a/native/ingest/src/analytics.rs
++++ b/native/ingest/src/analytics.rs
+@@ -1214,13 +1214,17 @@ pub fn run_pipeline(
+         // 6. Lock-Free Parallel Deduplication of Events and Routing to Person Shards
+         let t_events_dedup_start = std::time::Instant::now();
+         let (worker_person_events, events_dedup_cpu_ns): (Vec<Vec<Vec<RawPersonEvent>>>, u64) = std::thread::scope(|e_scope| {
+-            let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
++            let mut jobs: Vec<usize> = (0..NUM_SHARDS).collect();
++            jobs.sort_unstable_by_key(|&shard| std::cmp::Reverse(
++                worker_event_shards.iter().map(|worker| worker[shard].len()).sum::<usize>()));
++            let jobs = Arc::new(jobs);
++            let next_job = Arc::new(AtomicUsize::new(0));
+             let mut handles = Vec::new();
+             let worker_event_shards = &worker_event_shards;
+
+-            for worker_idx in 0..workers_count {
+-                let start_shard = worker_idx * shards_per_worker;
+-                let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
++            for _ in 0..workers_count {
++                let jobs = Arc::clone(&jobs);
++                let next_job = Arc::clone(&next_job);
+
+                 handles.push(e_scope.spawn(move || -> (Vec<Vec<RawPersonEvent>>, u64) {
+                     let cpu_start = thread_cpu_time_ns();
+@@ -1230,7 +1234,7 @@ pub fn run_pipeline(
+                     let mut dedup_map: HashMap<u128, EventDedupEntry, FastBuildHasher> =
+                         HashMap::with_capacity_and_hasher(65536, FastBuildHasher);
+
+-                    for shard_idx in start_shard..end_shard {
++                    while let Some(&shard_idx) = jobs.get(next_job.fetch_add(1, Ordering::Relaxed)) {
+                         dedup_map.clear();
+
+                         for worker_shards in worker_event_shards {
+@@ -1311,15 +1315,20 @@ pub fn run_pipeline(
+
+     let partial_results: Vec<Result<(HashMap<(u16, i32), CampaignDailyAccumulator>, u64)>> =
+         std::thread::scope(|scope| {
+-            let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
++            let mut jobs: Vec<usize> = (0..NUM_SHARDS).collect();
++            jobs.sort_unstable_by_key(|&shard| std::cmp::Reverse(
++                worker_person_events.iter().map(|worker| worker[shard].len()).sum::<usize>()
++                + worker_person_clicks.iter().map(|worker| worker[shard].len()).sum::<usize>()));
++            let jobs = Arc::new(jobs);
++            let next_job = Arc::new(AtomicUsize::new(0));
+             let mut handles = Vec::new();
+             let worker_person_events = &worker_person_events;
+             let worker_person_clicks = &worker_person_clicks;
+             let category_names = &category_names;
+
+             for worker_idx in 0..workers_count {
+-                let start_shard = worker_idx * shards_per_worker;
+-                let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
++                let jobs = Arc::clone(&jobs);
++                let next_job = Arc::clone(&next_job);
+
+                 handles.push(scope.spawn(move || -> Result<(HashMap<(u16, i32), CampaignDailyAccumulator>, u64)> {
+                     let cpu_start = thread_cpu_time_ns();
+@@ -1332,7 +1341,7 @@ pub fn run_pipeline(
+                     let mut local_events: Vec<LocalEvent> = Vec::with_capacity(65536);
+                     let mut local_clicks: Vec<LocalClick> = Vec::with_capacity(16384);
+
+-                    for shard_idx in start_shard..end_shard {
++                    while let Some(&shard_idx) = jobs.get(next_job.fetch_add(1, Ordering::Relaxed)) {
+                         shard_person_map.clear();
+                         shard_person_names.clear();
+                         local_events.clear();
