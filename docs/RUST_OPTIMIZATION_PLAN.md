@@ -71,9 +71,36 @@ the last merged increment before promotion). Submitted baseline
 
 ## Step 6 — Profile-driven next plan
 
-Status: planned after Rust profiling.
+Status: completed. Profile-driven next optimization plan established under `docs/ANALYTICS_OPTIMIZATION_PLAN.md`.
 
-Evaluate direct columnar handoff if intermediate staging dominates; optimize DuckDB if sorting/attribution dominates; consider native analytics only if measurements justify it. Produce one incremental next-change plan with exact-output and benchmark gates before implementing a broader rewrite.
+### Profiling evidence & bottleneck analysis
+
+Stage-level profiling was instrumented via `scripts/profile_analytics.py` across 3 repeated runs on 5M multi-seed datasets (`dev-benchmark-5m-seed1` and `dev-benchmark-5m-seed2`) with NCPU=8, MEM_GB=4:
+
+| Component | 5M seed-1 (median) | 5M seed-2 (median) | % of Analytics |
+|---|---|---|---|
+| Preparation (Rust parallel ingest) | 2.319s | 2.147s | - (30-35% wall) |
+| Analytics: `session_events` | 0.911s | 0.801s | 35.0% - 38.6% |
+| Analytics: `events` (dedup) | 0.561s | 0.649s | 23.8% - 28.4% |
+| Analytics: `assist_intervals` | 0.200s | 0.228s | 8.5% - 10.0% |
+| Analytics: `assists` | 0.142s | 0.164s | 6.0% - 7.2% |
+| Analytics: `credited` (ASOF join) | 0.108s | 0.110s | 4.6% - 4.8% |
+| Analytics: `clicks` (dedup) | 0.090s | 0.098s | 3.8% - 4.3% |
+| Analytics: `sessions` (aggregation) | 0.080s | 0.088s | 3.4% - 3.9% |
+| Analytics: `top_categories` | 0.064s | 0.074s | 2.7% - 3.2% |
+| Analytics: `winning_clicks` | 0.050s | 0.052s | 2.1% - 2.3% |
+| Analytics: `user_daily` | 0.048s | 0.053s | 2.0% - 2.3% |
+| Analytics: `campaign_daily` | 0.008s | 0.009s | <0.5% |
+| **Total Analytics (DuckDB)** | **2.361s** | **2.288s** | **100% (52-68% wall)** |
+| **Total Process Wall Time** | **4.908s** | **4.515s** | - |
+
+### Strategic decisions based on measurements
+
+1. **Direct columnar handoff is NOT justified**: Staging Parquet write/read takes <0.5s of the 2.1s preparation phase. Parquet staging provides clean failure isolation, out-of-core memory buffering, and parallel DuckDB scans.
+2. **Native analytics rewrite in Rust is NOT justified**: End-to-end 5M wall time is already under 5 seconds (extrapolating to ~20-35s at 20M, well below the 60s target). A complete native rewrite has high complexity and risk.
+3. **DuckDB analytics optimization is the chosen next increment**: Analytics accounts for 52%–68% of pipeline time. Within DuckDB, sessionization (`session_events` + `events`) accounts for ~62% of analytics time.
+
+Detailed proposal, target query optimizations, and strict acceptance gates are detailed in `docs/ANALYTICS_OPTIMIZATION_PLAN.md`.
 
 ## Execution gates
 
