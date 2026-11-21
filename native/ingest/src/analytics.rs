@@ -399,12 +399,12 @@ fn civil_to_days(y: i64, m: i64, d: i64) -> Option<i64> {
     if d < 1 || d > mdays[(m - 1) as usize] {
         return None;
     }
-    let prior = y - 1;
-    let ordinal = 365 * prior + prior / 4 - prior / 100
-        + prior / 400
-        + mdays[..(m - 1) as usize].iter().sum::<i64>()
-        + d;
-    Some(ordinal - 719163)
+    let y_adj = y - if m <= 2 { 1 } else { 0 };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = (y_adj - era * 400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u32;
+    Some(era * 146097 + doe as i64 - 719468)
 }
 
 #[inline(always)]
@@ -535,6 +535,29 @@ fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [
     };
     if line.is_empty() {
         return false;
+    }
+
+    if !line.contains(&b'"') {
+        let mut count = 0;
+        let mut start = 0;
+        let len = line.len();
+        while start <= len {
+            if count >= N {
+                return false;
+            }
+            let mut end = start;
+            while end < len && line[end] != b',' {
+                end += 1;
+            }
+            let raw = &line[start..end];
+            fields[count] = if raw.is_empty() { None } else { Some(raw) };
+            count += 1;
+            if end == len {
+                break;
+            }
+            start = end + 1;
+        }
+        return count == N;
     }
 
     let mut count = 0;
@@ -669,11 +692,8 @@ fn for_each_chunk_line(
         let mut start = 0;
 
         while start < available {
-            let mut end = start;
-            while end < available && buf[end] != b'\n' {
-                end += 1;
-            }
-            if end < available {
+            if let Some(pos) = buf[start..available].iter().position(|&b| b == b'\n') {
+                let end = start + pos;
                 let line = &buf[start..=end];
                 if carry.is_empty() {
                     consume(line)?;
@@ -685,7 +705,7 @@ fn for_each_chunk_line(
                 start = end + 1;
             } else {
                 carry.extend_from_slice(&buf[start..available]);
-                start = available;
+                break;
             }
         }
         reader.consume(available);
@@ -752,6 +772,9 @@ pub fn run_pipeline(
     let unknown_idx = get_or_insert_category("unknown", &mut category_names, &mut category_to_idx);
 
     let mut products_map: HashMap<Box<[u8]>, u8, FastBuildHasher> = HashMap::with_hasher(FastBuildHasher);
+    let mut max_product_id: usize = 0;
+    let mut parsed_products: Vec<(usize, u8)> = Vec::new();
+
     if data_dir.join("products.csv").exists() {
         let bytes = fs::read(data_dir.join("products.csv"))?;
         let mut fields = [None; 2];
@@ -766,10 +789,27 @@ pub fn run_pipeline(
                     if let Ok(cat_str) = std::str::from_utf8(cat) {
                         let cat_idx = get_or_insert_category(cat_str, &mut category_names, &mut category_to_idx);
                         products_map.insert(pid.to_vec().into_boxed_slice(), cat_idx);
+                        if pid.len() > 1 && pid[0] == b'p' && pid[1..].iter().all(u8::is_ascii_digit) {
+                            if let Ok(s) = std::str::from_utf8(&pid[1..]) {
+                                if let Ok(num) = s.parse::<usize>() {
+                                    if num < 1_000_000 {
+                                        parsed_products.push((num, cat_idx));
+                                        if num > max_product_id {
+                                            max_product_id = num;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    let mut direct_products = vec![unknown_idx; max_product_id + 1];
+    for (num, cat_idx) in parsed_products {
+        direct_products[num] = cat_idx;
     }
 
     // 4. Campaigns lookup: campaign_id -> camp_idx
@@ -798,272 +838,306 @@ pub fn run_pipeline(
         }
     }
 
-    // 5. Parallel Lock-Free Parsing of Events into Worker-Local Shards
-    let t_events_parse_start = std::time::Instant::now();
-    let event_files = list_csv_files(&data_dir.join("events"))?;
-    let event_chunks = Arc::new(plan_chunks(&event_files, 16 * 1024 * 1024)?);
-    let next_chunk = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
+    // 5. Concurrent Overlapped Ingestion: Events and Clicks
+    let (worker_person_events, worker_person_clicks) = std::thread::scope(|scope| -> Result<(Vec<Vec<Vec<RawPersonEvent>>>, Vec<Vec<Vec<RawPersonClick>>>)> {
+        // Spawn clicks pipeline concurrently
+        let click_handle = scope.spawn(|| -> Result<Vec<Vec<Vec<RawPersonClick>>>> {
+            let t_clicks_start = std::time::Instant::now();
+            let click_files = list_csv_files(&data_dir.join("clicks"))?;
+            let click_chunks = Arc::new(plan_chunks(&click_files, 16 * 1024 * 1024)?);
+            let next_chunk = Arc::new(AtomicUsize::new(0));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let click_workers_count = (workers_count / 2).clamp(1, 4);
 
-    let worker_event_shards: Vec<Vec<Vec<RawEvent>>> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for _ in 0..workers_count {
-            let event_chunks = Arc::clone(&event_chunks);
-            let next_chunk = Arc::clone(&next_chunk);
-            let cancelled = Arc::clone(&cancelled);
-            let products_map = &products_map;
+            let worker_click_shards: Vec<Vec<Vec<RawClick>>> = std::thread::scope(|c_scope| {
+                let mut handles = Vec::new();
+                for _ in 0..click_workers_count {
+                    let click_chunks = Arc::clone(&click_chunks);
+                    let next_chunk = Arc::clone(&next_chunk);
+                    let cancelled = Arc::clone(&cancelled);
+                    let campaign_to_idx = &campaign_to_idx;
 
-            handles.push(scope.spawn(move || -> Result<Vec<Vec<RawEvent>>> {
-                let mut local_shards: Vec<Vec<RawEvent>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+                    handles.push(c_scope.spawn(move || -> Result<Vec<Vec<RawClick>>> {
+                        let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(512)).collect();
 
-                while !cancelled.load(Ordering::Relaxed) {
-                    let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = event_chunks.get(idx) else {
-                        break;
-                    };
-                    for_each_chunk_line(chunk, &cancelled, |line| {
-                        let mut fields = [None; 7];
-                        if !parse_csv_line(line, &mut fields) {
-                            return Ok(());
+                        while !cancelled.load(Ordering::Relaxed) {
+                            let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                            let Some(chunk) = click_chunks.get(idx) else {
+                                break;
+                            };
+                            for_each_chunk_line(chunk, &cancelled, |line| {
+                                let mut fields = [None; 4];
+                                if !parse_csv_line(line, &mut fields) {
+                                    return Ok(());
+                                }
+                                let Some(click_id_bytes) = fields[0] else {
+                                    return Ok(());
+                                };
+                                let ts_ms = parse_window_ts_bytes(
+                                    fields[3],
+                                    i128::from(window_start) - 604_800_000,
+                                    i128::from(window_end),
+                                );
+                                let camp_idx_opt = fields[2].and_then(|c| campaign_to_idx.get(&CompactId::from_bytes(c)).copied());
+                                let is_valid = fields[1].is_some() && ts_ms.is_some() && camp_idx_opt.is_some();
+
+                                if is_valid {
+                                    let click_id = CompactId::from_bytes(click_id_bytes);
+                                    let shard_idx = get_shard_bytes(click_id.as_bytes());
+                                    local_shards[shard_idx].push(RawClick {
+                                        click_id,
+                                        user_id: CompactId::from_bytes(fields[1].unwrap()),
+                                        camp_idx: camp_idx_opt.unwrap(),
+                                        ts_ms: ts_ms.unwrap(),
+                                    });
+                                }
+                                Ok(())
+                            })?;
                         }
-                        let Some(event_id_bytes) = fields[0] else {
-                            return Ok(());
-                        };
-                        let ingest_ms = parse_ts_bytes(fields[3].unwrap_or(&[])).ok_or(InvalidIngest)?;
-                        let ts_ms_opt = parse_window_ts_bytes(fields[2], i128::from(window_start), i128::from(window_end));
-                        let is_purchase = fields[4] == Some(b"purchase");
-                        let price_cents = if is_purchase {
-                            parse_unsigned_bytes(fields[6], 10000000).filter(|v| *v > 0)
-                        } else {
-                            None
-                        };
-                        let is_valid = fields[1].is_some()
-                            && ts_ms_opt.is_some()
-                            && fields[5].is_some()
-                            && matches!(fields[4], Some(b"view" | b"cart" | b"purchase"))
-                            && (!is_purchase || price_cents.is_some());
-
-                        let category_idx = if let Some(pid) = fields[5] {
-                            products_map.get(pid).copied().unwrap_or(unknown_idx)
-                        } else {
-                            unknown_idx
-                        };
-
-                        let (eid_hash, shard_idx) = hash_event_id_128(event_id_bytes);
-                        let user_id = fields[1].map(CompactId::from_bytes).unwrap_or_default();
-
-                        local_shards[shard_idx].push(RawEvent {
-                            eid_hash,
-                            user_id,
-                            ingest_ms,
-                            ts_ms: ts_ms_opt.unwrap_or(i64::MIN),
-                            price_cents: price_cents.unwrap_or(0) as i32,
-                            cat_idx: category_idx,
-                            is_purchase,
-                            is_valid,
-                        });
-                        Ok(())
-                    })?;
+                        Ok(local_shards)
+                    }));
                 }
-                Ok(local_shards)
-            }));
-        }
-        let mut results = Vec::new();
-        for h in handles {
-            results.push(h.join().unwrap()?);
-        }
-        Ok::<Vec<Vec<Vec<RawEvent>>>, Box<dyn std::error::Error + Send + Sync>>(results)
-    })?;
-    let t_events_parse_elapsed = t_events_parse_start.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("[events_parse] elapsed: {:.3}ms", t_events_parse_elapsed);
+                let mut results = Vec::new();
+                for h in handles {
+                    results.push(h.join().unwrap()?);
+                }
+                Ok::<Vec<Vec<Vec<RawClick>>>, Box<dyn std::error::Error + Send + Sync>>(results)
+            })?;
 
-    // 6. Lock-Free Parallel Deduplication of Events and Routing to Person Shards
-    let t_events_dedup_start = std::time::Instant::now();
-    let worker_person_events: Vec<Vec<Vec<RawPersonEvent>>> = std::thread::scope(|scope| {
-        let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
-        let mut handles = Vec::new();
-        let worker_event_shards = &worker_event_shards;
-        let ids = &ids;
+            // Deduplication of clicks
+            let worker_person_clicks: Vec<Vec<Vec<RawPersonClick>>> = std::thread::scope(|c_scope| {
+                let shards_per_worker = (NUM_SHARDS + click_workers_count - 1) / click_workers_count;
+                let mut handles = Vec::new();
+                let worker_click_shards = &worker_click_shards;
+                let ids = &ids;
 
-        for worker_idx in 0..workers_count {
-            let start_shard = worker_idx * shards_per_worker;
-            let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
+                for worker_idx in 0..click_workers_count {
+                    let start_shard = worker_idx * shards_per_worker;
+                    let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
 
-            handles.push(scope.spawn(move || -> Vec<Vec<RawPersonEvent>> {
-                let mut local_person_shards: Vec<Vec<RawPersonEvent>> =
-                    (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+                    handles.push(c_scope.spawn(move || -> Vec<Vec<RawPersonClick>> {
+                        let mut local_person_shards: Vec<Vec<RawPersonClick>> =
+                            (0..NUM_SHARDS).map(|_| Vec::with_capacity(256)).collect();
 
-                let mut dedup_map: HashMap<u128, EventDedupEntry, FastBuildHasher> =
-                    HashMap::with_capacity_and_hasher(16384, FastBuildHasher);
+                        let mut seen_clicks: HashSet<CompactId, FastBuildHasher> =
+                            HashSet::with_capacity_and_hasher(16384, FastBuildHasher);
 
-                for shard_idx in start_shard..end_shard {
-                    dedup_map.clear();
+                        for shard_idx in start_shard..end_shard {
+                            seen_clicks.clear();
 
-                    for worker_shards in worker_event_shards {
-                        for ev in &worker_shards[shard_idx] {
-                            match dedup_map.get_mut(&ev.eid_hash) {
-                                Some(existing) => {
-                                    if ev.ingest_ms < existing.ingest_ms {
-                                        *existing = EventDedupEntry {
-                                            ingest_ms: ev.ingest_ms,
-                                            user_id: ev.user_id,
-                                            ts_ms: ev.ts_ms,
-                                            price_cents: ev.price_cents,
-                                            cat_idx: ev.cat_idx,
-                                            is_purchase: ev.is_purchase,
-                                            is_valid: ev.is_valid,
-                                        };
+                            for worker_shards in worker_click_shards {
+                                for cl in &worker_shards[shard_idx] {
+                                    if seen_clicks.insert(cl.click_id) {
+                                        let person_bytes = ids.get(cl.user_id.as_bytes());
+                                        let person_compact = CompactId::from_bytes(person_bytes);
+                                        let p_shard = get_shard_bytes(person_compact.as_bytes());
+                                        local_person_shards[p_shard].push(RawPersonClick {
+                                            person: person_compact,
+                                            ts_ms: cl.ts_ms,
+                                            camp_idx: cl.camp_idx,
+                                            click_id: cl.click_id,
+                                        });
                                     }
                                 }
-                                None => {
-                                    dedup_map.insert(
-                                        ev.eid_hash,
-                                        EventDedupEntry {
-                                            ingest_ms: ev.ingest_ms,
-                                            user_id: ev.user_id,
-                                            ts_ms: ev.ts_ms,
-                                            price_cents: ev.price_cents,
-                                            cat_idx: ev.cat_idx,
-                                            is_purchase: ev.is_purchase,
-                                            is_valid: ev.is_valid,
-                                        },
-                                    );
+                            }
+                        }
+                        local_person_shards
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            eprintln!("[clicks_total] elapsed: {:.3}ms", t_clicks_start.elapsed().as_secs_f64() * 1000.0);
+            Ok(worker_person_clicks)
+        });
+
+        // Event Parsing
+        let t_events_parse_start = std::time::Instant::now();
+        let event_files = list_csv_files(&data_dir.join("events"))?;
+        let event_chunks = Arc::new(plan_chunks(&event_files, 16 * 1024 * 1024)?);
+        let next_chunk = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let worker_event_shards: Vec<Vec<Vec<RawEvent>>> = std::thread::scope(|e_scope| {
+            let mut handles = Vec::new();
+            for _ in 0..workers_count {
+                let event_chunks = Arc::clone(&event_chunks);
+                let next_chunk = Arc::clone(&next_chunk);
+                let cancelled = Arc::clone(&cancelled);
+                let products_map = &products_map;
+                let direct_products = &direct_products;
+
+                handles.push(e_scope.spawn(move || -> Result<Vec<Vec<RawEvent>>> {
+                    let mut local_shards: Vec<Vec<RawEvent>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect();
+
+                    while !cancelled.load(Ordering::Relaxed) {
+                        let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                        let Some(chunk) = event_chunks.get(idx) else {
+                            break;
+                        };
+                        for_each_chunk_line(chunk, &cancelled, |line| {
+                            let mut fields = [None; 7];
+                            if !parse_csv_line(line, &mut fields) {
+                                return Ok(());
+                            }
+                            let Some(event_id_bytes) = fields[0] else {
+                                return Ok(());
+                            };
+                            let ingest_ms = parse_ts_bytes(fields[3].unwrap_or(&[])).ok_or(InvalidIngest)?;
+                            let ts_ms_opt = parse_window_ts_bytes(fields[2], i128::from(window_start), i128::from(window_end));
+                            let is_purchase = fields[4] == Some(b"purchase");
+                            let price_cents = if is_purchase {
+                                parse_unsigned_bytes(fields[6], 10000000).filter(|v| *v > 0)
+                            } else {
+                                None
+                            };
+                            let is_valid = fields[1].is_some()
+                                && ts_ms_opt.is_some()
+                                && fields[5].is_some()
+                                && matches!(fields[4], Some(b"view" | b"cart" | b"purchase"))
+                                && (!is_purchase || price_cents.is_some());
+
+                            let category_idx = if let Some(pid) = fields[5] {
+                                if pid.len() > 1 && pid[0] == b'p' {
+                                    let mut num: usize = 0;
+                                    let mut valid = true;
+                                    for &c in &pid[1..] {
+                                        if c.is_ascii_digit() {
+                                            num = num * 10 + (c - b'0') as usize;
+                                        } else {
+                                            valid = false;
+                                            break;
+                                        }
+                                    }
+                                    if valid && num < direct_products.len() {
+                                        let cat = direct_products[num];
+                                        if cat != unknown_idx {
+                                            cat
+                                        } else {
+                                            products_map.get(pid).copied().unwrap_or(unknown_idx)
+                                        }
+                                    } else {
+                                        products_map.get(pid).copied().unwrap_or(unknown_idx)
+                                    }
+                                } else {
+                                    products_map.get(pid).copied().unwrap_or(unknown_idx)
+                                }
+                            } else {
+                                unknown_idx
+                            };
+
+                            let (eid_hash, shard_idx) = hash_event_id_128(event_id_bytes);
+                            let user_id = fields[1].map(CompactId::from_bytes).unwrap_or_default();
+
+                            local_shards[shard_idx].push(RawEvent {
+                                eid_hash,
+                                user_id,
+                                ingest_ms,
+                                ts_ms: ts_ms_opt.unwrap_or(i64::MIN),
+                                price_cents: price_cents.unwrap_or(0) as i32,
+                                cat_idx: category_idx,
+                                is_purchase,
+                                is_valid,
+                            });
+                            Ok(())
+                        })?;
+                    }
+                    Ok(local_shards)
+                }));
+            }
+            let mut results = Vec::new();
+            for h in handles {
+                results.push(h.join().unwrap()?);
+            }
+            Ok::<Vec<Vec<Vec<RawEvent>>>, Box<dyn std::error::Error + Send + Sync>>(results)
+        })?;
+        let t_events_parse_elapsed = t_events_parse_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[events_parse] elapsed: {:.3}ms", t_events_parse_elapsed);
+
+        // 6. Lock-Free Parallel Deduplication of Events and Routing to Person Shards
+        let t_events_dedup_start = std::time::Instant::now();
+        let worker_person_events: Vec<Vec<Vec<RawPersonEvent>>> = std::thread::scope(|e_scope| {
+            let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
+            let mut handles = Vec::new();
+            let worker_event_shards = &worker_event_shards;
+            let ids = &ids;
+
+            for worker_idx in 0..workers_count {
+                let start_shard = worker_idx * shards_per_worker;
+                let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
+
+                handles.push(e_scope.spawn(move || -> Vec<Vec<RawPersonEvent>> {
+                    let mut local_person_shards: Vec<Vec<RawPersonEvent>> =
+                        (0..NUM_SHARDS).map(|_| Vec::with_capacity(1024)).collect();
+
+                    let mut dedup_map: HashMap<u128, EventDedupEntry, FastBuildHasher> =
+                        HashMap::with_capacity_and_hasher(65536, FastBuildHasher);
+
+                    for shard_idx in start_shard..end_shard {
+                        dedup_map.clear();
+
+                        for worker_shards in worker_event_shards {
+                            for ev in &worker_shards[shard_idx] {
+                                match dedup_map.get_mut(&ev.eid_hash) {
+                                    Some(existing) => {
+                                        if ev.ingest_ms < existing.ingest_ms {
+                                            *existing = EventDedupEntry {
+                                                ingest_ms: ev.ingest_ms,
+                                                user_id: ev.user_id,
+                                                ts_ms: ev.ts_ms,
+                                                price_cents: ev.price_cents,
+                                                cat_idx: ev.cat_idx,
+                                                is_purchase: ev.is_purchase,
+                                                is_valid: ev.is_valid,
+                                            };
+                                        }
+                                    }
+                                    None => {
+                                        dedup_map.insert(
+                                            ev.eid_hash,
+                                            EventDedupEntry {
+                                                ingest_ms: ev.ingest_ms,
+                                                user_id: ev.user_id,
+                                                ts_ms: ev.ts_ms,
+                                                price_cents: ev.price_cents,
+                                                cat_idx: ev.cat_idx,
+                                                is_purchase: ev.is_purchase,
+                                                is_valid: ev.is_valid,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        for entry in dedup_map.values() {
+                            if entry.is_valid && entry.ts_ms != i64::MIN {
+                                let ts = entry.ts_ms;
+                                if entry.ingest_ms - ts <= 86_400_000 {
+                                    let user = entry.user_id;
+                                    let person_bytes = ids.get(user.as_bytes());
+                                    let person_compact = CompactId::from_bytes(person_bytes);
+                                    let p_shard = get_shard_bytes(person_compact.as_bytes());
+                                    local_person_shards[p_shard].push(RawPersonEvent {
+                                        person: person_compact,
+                                        ts_ms: ts,
+                                        price_cents: entry.price_cents,
+                                        cat_idx: entry.cat_idx,
+                                        is_purchase: entry.is_purchase,
+                                    });
                                 }
                             }
                         }
                     }
+                    local_person_shards
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        eprintln!("[events_dedup] elapsed: {:.3}ms", t_events_dedup_start.elapsed().as_secs_f64() * 1000.0);
 
-                    for entry in dedup_map.values() {
-                        if entry.is_valid && entry.ts_ms != i64::MIN {
-                            let ts = entry.ts_ms;
-                            if entry.ingest_ms - ts <= 86_400_000 {
-                                let user = entry.user_id;
-                                let person_bytes = ids.get(user.as_bytes());
-                                let person_compact = CompactId::from_bytes(person_bytes);
-                                let p_shard = get_shard_bytes(person_compact.as_bytes());
-                                local_person_shards[p_shard].push(RawPersonEvent {
-                                    person: person_compact,
-                                    ts_ms: ts,
-                                    price_cents: entry.price_cents,
-                                    cat_idx: entry.cat_idx,
-                                    is_purchase: entry.is_purchase,
-                                });
-                            }
-                        }
-                    }
-                }
-                local_person_shards
-            }));
-        }
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    eprintln!("[events_dedup] elapsed: {:.3}ms", t_events_dedup_start.elapsed().as_secs_f64() * 1000.0);
-
-    // 7. Parallel Lock-Free Parsing of Clicks into Worker-Local Shards
-    let t_clicks_start = std::time::Instant::now();
-    let click_files = list_csv_files(&data_dir.join("clicks"))?;
-    let click_chunks = Arc::new(plan_chunks(&click_files, 16 * 1024 * 1024)?);
-    let next_chunk = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-
-    let worker_click_shards: Vec<Vec<Vec<RawClick>>> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for _ in 0..workers_count {
-            let click_chunks = Arc::clone(&click_chunks);
-            let next_chunk = Arc::clone(&next_chunk);
-            let cancelled = Arc::clone(&cancelled);
-            let campaign_to_idx = &campaign_to_idx;
-
-            handles.push(scope.spawn(move || -> Result<Vec<Vec<RawClick>>> {
-                let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-
-                while !cancelled.load(Ordering::Relaxed) {
-                    let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = click_chunks.get(idx) else {
-                        break;
-                    };
-                    for_each_chunk_line(chunk, &cancelled, |line| {
-                        let mut fields = [None; 4];
-                        if !parse_csv_line(line, &mut fields) {
-                            return Ok(());
-                        }
-                        let Some(click_id_bytes) = fields[0] else {
-                            return Ok(());
-                        };
-                        let ts_ms = parse_window_ts_bytes(
-                            fields[3],
-                            i128::from(window_start) - 604_800_000,
-                            i128::from(window_end),
-                        );
-                        let camp_idx_opt = fields[2].and_then(|c| campaign_to_idx.get(&CompactId::from_bytes(c)).copied());
-                        let is_valid = fields[1].is_some() && ts_ms.is_some() && camp_idx_opt.is_some();
-
-                        if is_valid {
-                            let click_id = CompactId::from_bytes(click_id_bytes);
-                            let shard_idx = get_shard_bytes(click_id.as_bytes());
-                            local_shards[shard_idx].push(RawClick {
-                                click_id,
-                                user_id: CompactId::from_bytes(fields[1].unwrap()),
-                                camp_idx: camp_idx_opt.unwrap(),
-                                ts_ms: ts_ms.unwrap(),
-                            });
-                        }
-                        Ok(())
-                    })?;
-                }
-                Ok(local_shards)
-            }));
-        }
-        let mut results = Vec::new();
-        for h in handles {
-            results.push(h.join().unwrap()?);
-        }
-        Ok::<Vec<Vec<Vec<RawClick>>>, Box<dyn std::error::Error + Send + Sync>>(results)
+        let worker_person_clicks = click_handle.join().unwrap()?;
+        Ok((worker_person_events, worker_person_clicks))
     })?;
-
-    // 8. Lock-Free Parallel Deduplication of Clicks and Routing to Person Shards
-    let worker_person_clicks: Vec<Vec<Vec<RawPersonClick>>> = std::thread::scope(|scope| {
-        let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
-        let mut handles = Vec::new();
-        let worker_click_shards = &worker_click_shards;
-        let ids = &ids;
-
-        for worker_idx in 0..workers_count {
-            let start_shard = worker_idx * shards_per_worker;
-            let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
-
-            handles.push(scope.spawn(move || -> Vec<Vec<RawPersonClick>> {
-                let mut local_person_shards: Vec<Vec<RawPersonClick>> =
-                    (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-
-                let mut seen_clicks: HashSet<CompactId, FastBuildHasher> =
-                    HashSet::with_capacity_and_hasher(8192, FastBuildHasher);
-
-                for shard_idx in start_shard..end_shard {
-                    seen_clicks.clear();
-
-                    for worker_shards in worker_click_shards {
-                        for cl in &worker_shards[shard_idx] {
-                            if seen_clicks.insert(cl.click_id) {
-                                let person_bytes = ids.get(cl.user_id.as_bytes());
-                                let person_compact = CompactId::from_bytes(person_bytes);
-                                let p_shard = get_shard_bytes(person_compact.as_bytes());
-                                local_person_shards[p_shard].push(RawPersonClick {
-                                    person: person_compact,
-                                    ts_ms: cl.ts_ms,
-                                    camp_idx: cl.camp_idx,
-                                    click_id: cl.click_id,
-                                });
-                            }
-                        }
-                    }
-                }
-                local_person_shards
-            }));
-        }
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    eprintln!("[clicks_total] elapsed: {:.3}ms", t_clicks_start.elapsed().as_secs_f64() * 1000.0);
 
     // 9. Parallel Execution of Analytics across Person Shards using 16-byte integer-keyed local events
     let t_analytics_start = std::time::Instant::now();
@@ -1132,8 +1206,8 @@ pub fn run_pipeline(
                             }
                         }
 
-                        // Ultra-fast integer-tuple sort: (p_idx: u16, ts_ms: i64) fits in single CPU vector instruction
-                        local_events.sort_unstable_by_key(|e| (e.p_idx, e.ts_ms));
+                        // Ultra-fast packed 64-bit integer key sort: (p_idx << 32 | ts_offset) compiles to single cmp instruction
+                        local_events.sort_unstable_by_key(|e| ((e.p_idx as u64) << 32) | ((e.ts_ms - window_start) as u32 as u64));
                         local_clicks.sort_unstable_by(|a, b| {
                             (a.p_idx, a.ts_ms, a.click_id.as_bytes()).cmp(&(b.p_idx, b.ts_ms, b.click_id.as_bytes()))
                         });
