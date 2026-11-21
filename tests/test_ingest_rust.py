@@ -54,7 +54,7 @@ class NativeProtocolTests(unittest.TestCase):
                 prepare.assert_called_once_with(self.data, self.scratch, batch_rows=7)
         with patch.dict(os.environ, {'INGEST_BACKEND': 'auto'}), self.assertRaises(ValueError):
             ingest.prepare_inputs(self.data, self.scratch)
-        with patch.dict(os.environ, {}, clear=True), patch.object(ingest_python, 'prepare_inputs', return_value=sentinel):
+        with patch.dict(os.environ, {}, clear=True), patch.object(native_ingest, 'prepare_inputs', return_value=sentinel):
             self.assertIs(ingest.prepare_inputs(self.data, self.scratch), sentinel)
 
     def test_validation_precedes_launch_and_staging(self):

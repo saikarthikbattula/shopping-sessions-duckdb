@@ -9,7 +9,7 @@ from pipeline.contracts import PreparedInputs
 def prepare_inputs(
     data_dir: Path, scratch_dir: Path, *, batch_rows: int = 65536
 ) -> PreparedInputs:
-    backend = os.environ.get('INGEST_BACKEND', 'python')
+    backend = os.environ.get('INGEST_BACKEND', 'rust')
     if backend == 'python':
         return ingest_python.prepare_inputs(data_dir, scratch_dir, batch_rows=batch_rows)
     if backend == 'rust':
