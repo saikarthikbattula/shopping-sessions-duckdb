@@ -29,8 +29,14 @@ jobs:
           python-version: '3.12'
       - name: Install pinned development dependencies
         run: make setup
+      - name: Install Rust 1.85.0
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Native build, Rust tests and staging parity
+        run: INGEST_BACKEND=python make test-native
       - name: Unit and differential tests
-        run: make test
+        run: INGEST_BACKEND=python REQUIRE_RUST_INGEST=1 make test
+      - name: Rust raw-CSV analytical differential checks
+        run: INGEST_BACKEND=rust REQUIRE_RUST_INGEST=1 .venv/bin/python -m unittest tests.test_integration -v
       - name: Build linux/amd64 image within the ten-minute build limit
         run: timeout 600s make build
       - name: Check image architecture and size
@@ -45,13 +51,16 @@ jobs:
           assert image['Size'] <= 8_000_000_000, image['Size']
           print('linux/amd64 image bytes:', image['Size'])
           PY
-      - name: Official fixtures with scorer runtime restrictions
-        run: make fixtures
-      - name: Build official generator and create public seed-1 dev data
+      - name: Both backends on official fixtures with scorer runtime restrictions
         run: |
-          rustup toolchain install 1.85.0 --profile minimal
-          make generator dev
-      - name: Public dev in the restricted container
-        run: make run-dev
-      - name: Match published public dev fingerprints
-        run: .venv/bin/python scripts/check_dev_fingerprints.py out
+          for backend in python rust; do
+            INGEST_BACKEND="$backend" .venv/bin/python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+          done
+      - name: Build official generator and create public seed-1 dev data
+        run: make generator dev
+      - name: Both backends match published public dev in restricted containers
+        run: |
+          for backend in python rust; do
+            INGEST_BACKEND="$backend" scripts/docker_run.sh dev "out-$backend"
+            .venv/bin/python scripts/check_dev_fingerprints.py "out-$backend"
+          done
