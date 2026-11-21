@@ -229,7 +229,7 @@ class StagingTests(unittest.TestCase):
         for batch_rows in (0, -1, True, 1.5):
             with self.assertRaises(ValueError):
                 prepare_inputs(self.data, self.scratch, batch_rows=batch_rows)
-        with patch('pipeline.ingest.pq.ParquetWriter', side_effect=OSError('disk full')):
+        with patch('pipeline.ingest_python.pq.ParquetWriter', side_effect=OSError('disk full')):
             with self.assertRaisesRegex(OSError, 'disk full'):
                 prepare_inputs(self.data, self.scratch)
         self.write('manifest.json', '{"window_start":"bad","window_end":"bad"}')
