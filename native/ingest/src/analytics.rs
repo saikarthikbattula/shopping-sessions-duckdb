@@ -15,7 +15,6 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use crate::identity::Identity;
 use crate::{InvalidIngest, Result};
 
 pub fn epoch_days(ts_ms: i64) -> i32 {
@@ -202,6 +201,177 @@ fn get_shard_bytes(key: &[u8]) -> usize {
     let mut hasher = FastBuildHasher.build_hasher();
     hasher.write(key);
     (hasher.finish() as usize) % NUM_SHARDS
+}
+
+pub struct FrozenIdentity {
+    shards: Vec<HashMap<Box<[u8]>, Box<[u8]>, FastBuildHasher>>,
+    unique_count: usize,
+}
+
+impl FrozenIdentity {
+    pub fn empty() -> Self {
+        Self {
+            shards: (0..NUM_SHARDS).map(|_| HashMap::with_hasher(FastBuildHasher)).collect(),
+            unique_count: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn get<'a>(&'a self, user: &'a [u8]) -> &'a [u8] {
+        if self.shards.is_empty() {
+            return user;
+        }
+        let shard = get_shard_bytes(user);
+        match self.shards[shard].get(user) {
+            Some(canon) => canon.as_ref(),
+            None => user,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.unique_count
+    }
+}
+
+fn load_parallel_identity(links_dir: &Path, workers_count: usize) -> Result<FrozenIdentity> {
+    if !links_dir.exists() {
+        return Ok(FrozenIdentity::empty());
+    }
+    let files = list_csv_files(links_dir)?;
+    if files.is_empty() {
+        return Ok(FrozenIdentity::empty());
+    }
+
+    let file_batches: Vec<Vec<PathBuf>> = {
+        let mut batches: Vec<Vec<PathBuf>> = (0..workers_count).map(|_| Vec::new()).collect();
+        for (i, f) in files.into_iter().enumerate() {
+            batches[i % workers_count].push(f);
+        }
+        batches
+    };
+
+    let worker_results: Vec<(Vec<Vec<u8>>, Vec<(usize, usize, usize, usize, usize)>)> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for batch in file_batches {
+            handles.push(scope.spawn(move || -> Result<(Vec<Vec<u8>>, Vec<(usize, usize, usize, usize, usize)>)> {
+                let mut buffers = Vec::new();
+                let mut edges = Vec::new(); // (buf_idx, a_start, a_len, b_start, b_len)
+                for file_path in batch {
+                    let bytes = fs::read(&file_path)?;
+                    let buf_idx = buffers.len();
+                    let mut fields = [None; 2];
+                    for line in bytes.split(|&b| b == b'\n') {
+                        if parse_csv_line(line, &mut fields) {
+                            if let (Some(a), Some(b)) = (fields[0], fields[1]) {
+                                if !a.is_empty() && !b.is_empty() {
+                                    let a_offset = a.as_ptr() as usize - bytes.as_ptr() as usize;
+                                    let b_offset = b.as_ptr() as usize - bytes.as_ptr() as usize;
+                                    edges.push((buf_idx, a_offset, a.len(), b_offset, b.len()));
+                                }
+                            }
+                        }
+                    }
+                    buffers.push(bytes);
+                }
+                Ok((buffers, edges))
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.join().unwrap()?);
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results)
+    })?;
+
+    let total_edges_est: usize = worker_results.iter().map(|(_, e)| e.len()).sum();
+    let mut id_map: HashMap<&[u8], u32, FastBuildHasher> =
+        HashMap::with_capacity_and_hasher(total_edges_est * 2, FastBuildHasher);
+    let mut parents: Vec<u32> = Vec::with_capacity(total_edges_est * 2);
+    let mut ranks: Vec<u8> = Vec::with_capacity(total_edges_est * 2);
+    let mut minima: Vec<u32> = Vec::with_capacity(total_edges_est * 2);
+    let mut names: Vec<&[u8]> = Vec::with_capacity(total_edges_est * 2);
+
+    #[inline(always)]
+    fn intern_id<'a>(
+        slice: &'a [u8],
+        id_map: &mut HashMap<&'a [u8], u32, FastBuildHasher>,
+        parents: &mut Vec<u32>,
+        ranks: &mut Vec<u8>,
+        minima: &mut Vec<u32>,
+        names: &mut Vec<&'a [u8]>,
+    ) -> u32 {
+        if let Some(&idx) = id_map.get(slice) {
+            idx
+        } else {
+            let idx = names.len() as u32;
+            id_map.insert(slice, idx);
+            names.push(slice);
+            parents.push(idx);
+            ranks.push(0);
+            minima.push(idx);
+            idx
+        }
+    }
+
+    fn find(mut i: u32, parents: &mut [u32]) -> u32 {
+        let mut root = i;
+        while parents[root as usize] != root {
+            root = parents[root as usize];
+        }
+        while i != root {
+            let next = parents[i as usize];
+            parents[i as usize] = root;
+            i = next;
+        }
+        root
+    }
+
+    for (buffers, edges) in &worker_results {
+        for &(buf_idx, a_off, a_len, b_off, b_len) in edges {
+            let a = &buffers[buf_idx][a_off..a_off + a_len];
+            let b = &buffers[buf_idx][b_off..b_off + b_len];
+
+            let u_a = intern_id(a, &mut id_map, &mut parents, &mut ranks, &mut minima, &mut names);
+            let u_b = intern_id(b, &mut id_map, &mut parents, &mut ranks, &mut minima, &mut names);
+
+            let root_a = find(u_a, &mut parents);
+            let root_b = find(u_b, &mut parents);
+            if root_a != root_b {
+                let name_a = names[minima[root_a as usize] as usize];
+                let name_b = names[minima[root_b as usize] as usize];
+                let best_min = if name_a < name_b { minima[root_a as usize] } else { minima[root_b as usize] };
+                if ranks[root_a as usize] < ranks[root_b as usize] {
+                    parents[root_a as usize] = root_b;
+                    minima[root_b as usize] = best_min;
+                } else {
+                    parents[root_b as usize] = root_a;
+                    minima[root_a as usize] = best_min;
+                    if ranks[root_a as usize] == ranks[root_b as usize] {
+                        ranks[root_a as usize] += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut shards: Vec<HashMap<Box<[u8]>, Box<[u8]>, FastBuildHasher>> =
+        (0..NUM_SHARDS).map(|_| HashMap::with_hasher(FastBuildHasher)).collect();
+
+    let unique_count = names.len();
+    for i in 0..names.len() {
+        let root = find(i as u32, &mut parents);
+        let best_name = names[minima[root as usize] as usize];
+        let orig_name = names[i];
+        if orig_name != best_name {
+            let shard = get_shard_bytes(orig_name);
+            shards[shard].insert(orig_name.to_vec().into_boxed_slice(), best_name.to_vec().into_boxed_slice());
+        }
+    }
+
+    Ok(FrozenIdentity {
+        shards,
+        unique_count,
+    })
 }
 
 #[inline(always)]
@@ -492,6 +662,8 @@ pub fn run_pipeline(
 ) -> Result<()> {
     let workers_count = workers_count.clamp(1, 16);
 
+    let t_pipeline_start = std::time::Instant::now();
+
     // 1. Resolve window start and end
     let (window_start, window_end) = match (start_opt, end_opt) {
         (Some(s), Some(e)) => (s, e),
@@ -514,21 +686,9 @@ pub fn run_pipeline(
     }
 
     // 2. Identity resolution from links/
-    let mut ids = Identity::default();
-    for file in list_csv_files(&data_dir.join("links"))? {
-        let bytes = fs::read(&file)?;
-        let mut fields = [None; 2];
-        for line in bytes.split(|&b| b == b'\n') {
-            if parse_csv_line(line, &mut fields) {
-                if let (Some(a), Some(b)) = (fields[0], fields[1]) {
-                    if let (Ok(sa), Ok(sb)) = (std::str::from_utf8(a), std::str::from_utf8(b)) {
-                        ids.union(Some(sa), Some(sb));
-                    }
-                }
-            }
-        }
-    }
-    let ids = ids.freeze();
+    let t_identity_start = std::time::Instant::now();
+    let ids = load_parallel_identity(&data_dir.join("links"), workers_count)?;
+    eprintln!("[identity] elapsed: {:.3}ms, unique identities: {}", t_identity_start.elapsed().as_secs_f64() * 1000.0, ids.len());
 
     // 3. Products lookup: product_id -> category_idx
     let mut category_names = Vec::new();
@@ -595,6 +755,7 @@ pub fn run_pipeline(
     }
 
     // 5. Parallel Lock-Free Parsing of Events into Worker-Local Shards
+    let t_events_parse_start = std::time::Instant::now();
     let event_files = list_csv_files(&data_dir.join("events"))?;
     let event_chunks = Arc::new(plan_chunks(&event_files, 16 * 1024 * 1024)?);
     let next_chunk = Arc::new(AtomicUsize::new(0));
@@ -670,8 +831,11 @@ pub fn run_pipeline(
         }
         Ok::<Vec<Vec<Vec<RawEvent>>>, Box<dyn std::error::Error + Send + Sync>>(results)
     })?;
+    let t_events_parse_elapsed = t_events_parse_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[events_parse] elapsed: {:.3}ms", t_events_parse_elapsed);
 
     // 6. Lock-Free Parallel Deduplication of Events and Routing to Person Shards
+    let t_events_dedup_start = std::time::Instant::now();
     let worker_person_events: Vec<Vec<Vec<RawPersonEvent>>> = std::thread::scope(|scope| {
         let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
         let mut handles = Vec::new();
@@ -731,10 +895,8 @@ pub fn run_pipeline(
                             let ts = entry.ts_ms;
                             if entry.ingest_ms - ts <= 86_400_000 {
                                 let user = entry.user_id;
-                                let person_compact = match ids.get(user.as_str()) {
-                                    Some(canonical) => CompactId::from_bytes(canonical.as_bytes()),
-                                    None => user,
-                                };
+                                let person_bytes = ids.get(user.as_bytes());
+                                let person_compact = CompactId::from_bytes(person_bytes);
                                 let p_shard = get_shard_bytes(person_compact.as_bytes());
                                 local_person_shards[p_shard].push(RawPersonEvent {
                                     person: person_compact,
@@ -752,8 +914,10 @@ pub fn run_pipeline(
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    eprintln!("[events_dedup] elapsed: {:.3}ms", t_events_dedup_start.elapsed().as_secs_f64() * 1000.0);
 
     // 7. Parallel Lock-Free Parsing of Clicks into Worker-Local Shards
+    let t_clicks_start = std::time::Instant::now();
     let click_files = list_csv_files(&data_dir.join("clicks"))?;
     let click_chunks = Arc::new(plan_chunks(&click_files, 16 * 1024 * 1024)?);
     let next_chunk = Arc::new(AtomicUsize::new(0));
@@ -838,10 +1002,8 @@ pub fn run_pipeline(
                     for worker_shards in worker_click_shards {
                         for cl in &worker_shards[shard_idx] {
                             if seen_clicks.insert(cl.click_id) {
-                                let person_compact = match ids.get(cl.user_id.as_str()) {
-                                    Some(canonical) => CompactId::from_bytes(canonical.as_bytes()),
-                                    None => cl.user_id,
-                                };
+                                let person_bytes = ids.get(cl.user_id.as_bytes());
+                                let person_compact = CompactId::from_bytes(person_bytes);
                                 let p_shard = get_shard_bytes(person_compact.as_bytes());
                                 local_person_shards[p_shard].push(RawPersonClick {
                                     person: person_compact,
@@ -858,8 +1020,10 @@ pub fn run_pipeline(
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    eprintln!("[clicks_total] elapsed: {:.3}ms", t_clicks_start.elapsed().as_secs_f64() * 1000.0);
 
     // 9. Parallel Execution of Analytics across Person Shards using 16-byte integer-keyed local events
+    let t_analytics_start = std::time::Instant::now();
     let partial_results: Vec<(Vec<UserDailyRow>, HashMap<(u16, i32), CampaignDailyAccumulator>)> =
         std::thread::scope(|scope| {
             let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
@@ -985,10 +1149,14 @@ pub fn run_pipeline(
             assisted_sessions: acc.assisted_sessions,
         });
     }
+    eprintln!("[analytics_sessions_sort] elapsed: {:.3}ms", t_analytics_start.elapsed().as_secs_f64() * 1000.0);
 
     // 10. Write Parquet Files
+    let t_parquet_start = std::time::Instant::now();
     write_user_daily(output_dir, total_user_rows)?;
     write_campaign_daily(output_dir, campaign_rows)?;
+    eprintln!("[parquet_write] elapsed: {:.3}ms", t_parquet_start.elapsed().as_secs_f64() * 1000.0);
+    eprintln!("[pipeline_total] elapsed: {:.3}ms", t_pipeline_start.elapsed().as_secs_f64() * 1000.0);
 
     Ok(())
 }
