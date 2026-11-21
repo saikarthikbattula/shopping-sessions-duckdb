@@ -28,14 +28,18 @@ jobs:
           missing=required-set(flags)
           if missing: raise SystemExit(f'Compatible execution host required; missing {sorted(missing)}')
           PY
-      - name: Build trusted Rust and imported baseline
+      - name: Install pinned compilers and local validators
         run: |
           rustup toolchain install 1.85.0 --profile minimal
-          rustup toolchain install 1.90.0 --profile minimal
-          make setup native-ingest test-native generator
+          rustup toolchain install 1.95.0 --profile minimal
+          make setup
+      - name: Build and test imported candidate first
+        run: |
           cd native/express-lane
           cargo build --release --locked
           cargo test --release --locked
+      - name: Build trusted Rust and official generator
+        run: make native-ingest test-native generator
       - name: Official fixtures on imported candidate
         run: .venv/bin/python scripts/run_fixtures.py fixtures -- native/express-lane/target/release/pipeline
       - name: Independent differential and boundary checks
@@ -71,7 +75,7 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
               f.write('## Candidate recommendations\nLinux CI host; not competition scorer timings.\n```json\n'+json.dumps(results,indent=2)+'\n```\n')
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: express-candidate-measurements

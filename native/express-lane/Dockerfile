@@ -1,5 +1,5 @@
 # Evaluate only on Linux x86_64 machines supporting Cascade Lake's AVX-512 features.
-FROM rust:1.90.0-alpine AS build
+FROM rust:1.95.0-alpine AS build
 RUN apk add --no-cache musl-dev binutils
 WORKDIR /build
 COPY native/express-lane/Cargo.toml native/express-lane/Cargo.lock ./

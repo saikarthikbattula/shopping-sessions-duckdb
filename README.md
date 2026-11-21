@@ -23,7 +23,7 @@ specialized generator fast path's invariants do not hold.
 
 ## Build and run
 
-Use Rust 1.85.0 for the portable executable. The AVX-512 candidate pins Rust 1.90.0
+Use Rust 1.85.0 for the portable executable. The AVX-512 candidate pins Rust 1.95.0
 and requires a compatible Linux x86_64 CPU; it cannot run on an ARM Mac.
 
 ```sh
