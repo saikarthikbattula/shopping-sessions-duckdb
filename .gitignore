@@ -22,3 +22,6 @@ target/
 /dev-*/
 /out-*/
 /scratch-*/
+
+# Ad-hoc generated benchmark directories
+/gen_*/

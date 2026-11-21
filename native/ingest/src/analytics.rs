@@ -1,3 +1,9 @@
+mod simple_identity;
+mod fast_records;
+mod click_index;
+use simple_identity::SimpleUsers;
+use fast_records::{FastEvent, EXTRA_PERSON};
+
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{BuildHasher, Hasher};
@@ -1234,12 +1240,12 @@ fn csv_scan_scalar(line: &[u8], splits: &mut [usize], max_splits: usize) -> (usi
 
 #[inline(always)]
 fn parse_product_num(pid: &[u8]) -> Option<usize> {
-    if pid.len() > 1 && pid[0] == b'p' {
+    if pid.len() > 1 && pid[0] == b'p' && !(pid.len() > 2 && pid[1] == b'0') {
         let mut num: usize = 0;
         for &c in &pid[1..] {
             let d = c.wrapping_sub(b'0');
             if d <= 9 {
-                num = num * 10 + d as usize;
+                num = num.checked_mul(10)?.checked_add(d as usize)?;
             } else {
                 return None;
             }
@@ -1704,16 +1710,18 @@ pub fn try_recover_fast_path_keys(data_dir: &Path) -> Option<FastPathKeys> {
     let threads = 4;
     let chunk_size = (1 << 24) / threads;
     let found_match = Arc::new(std::sync::Mutex::new(None));
+    let recovered = AtomicBool::new(false);
 
     std::thread::scope(|scope| {
         for t in 0..threads {
             let found_match = Arc::clone(&found_match);
             let sample_eids = &sample_event_ids;
+            let recovered = &recovered;
             scope.spawn(move || {
                 let start_high = t * chunk_size;
                 let end_high = (t + 1) * chunk_size;
                 for high in start_high..end_high {
-                    if found_match.lock().unwrap().is_some() {
+                    if high & 255 == 0 && recovered.load(Ordering::Relaxed) {
                         return;
                     }
                     let cand_full_uk = (high << 40) | user_key_40;
@@ -1731,7 +1739,8 @@ pub fn try_recover_fast_path_keys(data_dir: &Path) -> Option<FastPathKeys> {
                     }
                     if all_valid {
                         let mut lock = found_match.lock().unwrap();
-                        *lock = Some((cand_ek, cand_state_ek));
+                        if lock.is_none() { *lock = Some((cand_ek, cand_state_ek)); }
+                        recovered.store(true, Ordering::Relaxed);
                         return;
                     }
                 }
@@ -1784,18 +1793,6 @@ pub fn try_recover_fast_path_keys(data_dir: &Path) -> Option<FastPathKeys> {
 }
 
 #[derive(Clone, Copy)]
-struct FastEvent {
-    local_eid: u32,
-    ingest_ms: i64,
-    ts_ms: i64,
-    person: CompactId,
-    price_cents: i32,
-    p_shard: u8,
-    cat_idx: u8,
-    flags: u8,
-}
-
-#[derive(Clone, Copy)]
 struct FastClick {
     local_cid: u32,
     ts_ms: i64,
@@ -1813,7 +1810,7 @@ struct DedupSlot {
 }
 
 fn parse_campaign_num(cid: &[u8]) -> Option<usize> {
-    if cid.len() > 2 && cid[0] == b'c' && cid[1] == b'_' && cid[2..].iter().all(u8::is_ascii_digit) {
+    if cid.len() > 2 && cid[0] == b'c' && cid[1] == b'_' && !(cid.len() > 3 && cid[2] == b'0') && cid[2..].iter().all(u8::is_ascii_digit) {
         let mut val = 0usize;
         for &b in &cid[2..] {
             val = val.checked_mul(10)?.checked_add((b - b'0') as usize)?;
@@ -1839,6 +1836,7 @@ fn run_fast_path_pipeline(
     let t_identity_start = std::time::Instant::now();
     let id_cpu_start = thread_cpu_time_ns();
     let ids = load_parallel_identity(&data_dir.join("links"), workers_count)?;
+    let simple_users = SimpleUsers::build(&ids, keys.user_key);
     let id_cpu_ns = thread_cpu_time_ns().saturating_sub(id_cpu_start);
     let t_identity_elapsed = t_identity_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!("[identity] elapsed: {:.3}ms, unique identities: {}", t_identity_elapsed, ids.len());
@@ -1941,16 +1939,16 @@ fn run_fast_path_pipeline(
     let event_bytes_sum: u64 = event_files.iter().map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0)).sum();
     let est_events = (event_bytes_sum / 45).max(100_000) as usize;
     let max_event_id = ((est_events * 2).max(100_000)) as u32;
-    let max_local_eid = ((max_event_id as usize >> 6) + 4096).max(8192);
+    let max_local_eid = ((max_event_id as usize >> 6) + 4096).max(8192) * 2;
 
     let click_files = list_csv_files(&data_dir.join("clicks"))?;
     let click_bytes_sum: u64 = click_files.iter().map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0)).sum();
     let est_clicks = (click_bytes_sum / 25).max(25_000) as usize;
     let max_click_id = ((est_clicks * 2).max(25_000)) as u32;
-    let max_local_cid = ((max_click_id as usize >> 6) + 4096).max(8192);
+    let max_local_cid = ((max_click_id as usize >> 6) + 4096).max(8192) * 2;
 
-    let (worker_person_events, worker_person_clicks, clicks_cpu_ns, events_parse_cpu_ns, events_dedup_cpu_ns, t_events_parse_elapsed, t_events_dedup_elapsed, t_clicks_elapsed, total_raw_events) =
-        std::thread::scope(|scope| -> Result<(Vec<Vec<Vec<RawPersonEvent>>>, Vec<Vec<Vec<RawPersonClick>>>, u64, u64, u64, f64, f64, f64, usize)> {
+    let (worker_person_events, worker_extra_people, worker_person_clicks, clicks_cpu_ns, events_parse_cpu_ns, events_dedup_cpu_ns, t_events_parse_elapsed, t_events_dedup_elapsed, t_clicks_elapsed, total_raw_events) =
+        std::thread::scope(|scope| -> Result<(Vec<Vec<Vec<FastEvent>>>, Vec<Vec<(CompactId, u8)>>, Vec<Vec<Vec<RawPersonClick>>>, u64, u64, u64, f64, f64, f64, usize)> {
             // Concurrent clicks pipeline
             let click_handle = scope.spawn(|| -> Result<(Vec<Vec<Vec<RawPersonClick>>>, u64, f64)> {
                 let t_clicks_start = std::time::Instant::now();
@@ -1968,6 +1966,7 @@ fn run_fast_path_pipeline(
                         let campaign_to_idx = &campaign_to_idx;
                         let direct_campaigns = &direct_campaigns;
                         let ids = &ids;
+                        let simple_users = &simple_users;
 
                         handles.push(c_scope.spawn(move || -> Result<(Vec<Vec<FastClick>>, u64)> {
                             let cpu_start = thread_cpu_time_ns();
@@ -2018,14 +2017,15 @@ fn run_fast_path_pipeline(
                                     if is_valid {
                                         let click_id = CompactId::from_bytes(click_id_bytes);
                                         let user_bytes = fields[1].unwrap();
-                                        let (person, p_shard) = ids.get_compact_with_shard(user_bytes);
+                                        let (person, p_shard) = simple_users.resolve(user_bytes, ids);
 
-                                        if click_id_bytes.len() > 1 && (click_id_bytes[0] == b'k' || click_id_bytes[0] == b'K') {
+                                        if let Some(id_case) = fast_records::id_case(click_id_bytes, b'k') {
                                             if let Some(val) = decode_b36(&click_id_bytes[1..]) {
-                                                let cid_num = unscramble(val, keys.click_key) as u32;
-                                                if cid_num < max_click_id {
+                                                let cid_num = unscramble(val, keys.click_key);
+                                                if val <= SCRAMBLE_MASK && cid_num < u64::from(max_click_id) {
+                                                    let cid_num = cid_num as u32;
                                                     let c_shard = (cid_num & 63) as usize;
-                                                    let local_cid = cid_num >> 6;
+                                                    let local_cid = (cid_num >> 6) * 2 + id_case;
                                                     local_shards[c_shard].push(FastClick {
                                                         local_cid,
                                                         ts_ms: ts_ms.unwrap(),
@@ -2126,7 +2126,7 @@ fn run_fast_path_pipeline(
             let next_chunk = Arc::new(AtomicUsize::new(0));
             let cancelled = Arc::new(AtomicBool::new(false));
 
-            let (worker_event_shards, events_parse_cpu_ns): (Vec<Vec<Vec<FastEvent>>>, u64) = std::thread::scope(|e_scope| {
+            let (worker_event_shards, worker_extra_people, events_parse_cpu_ns) = std::thread::scope(|e_scope| {
                 let mut handles = Vec::new();
                 for _ in 0..workers_count {
                     let event_chunks = Arc::clone(&event_chunks);
@@ -2135,8 +2135,9 @@ fn run_fast_path_pipeline(
                     let products_map = &products_map;
                     let direct_products = &direct_products;
                     let ids = &ids;
+                    let simple_users = &simple_users;
 
-                    handles.push(e_scope.spawn(move || -> Result<(Vec<Vec<FastEvent>>, u64)> {
+                    handles.push(e_scope.spawn(move || -> Result<(Vec<Vec<FastEvent>>, Vec<(CompactId, u8)>, u64)> {
                         let cpu_start = thread_cpu_time_ns();
                         let has_avx2 = {
                             #[cfg(target_arch = "x86_64")]
@@ -2151,6 +2152,7 @@ fn run_fast_path_pipeline(
                             { false }
                         };
                         let mut date_cache = LocalDateCache::default();
+                        let mut extra_people = Vec::new();
                         let mut local_shards: Vec<Vec<FastEvent>> =
                             (0..NUM_EVENT_SHARDS).map(|_| Vec::with_capacity(2048)).collect();
 
@@ -2201,30 +2203,30 @@ fn run_fast_path_pipeline(
                                     unknown_idx
                                 };
 
-                                let (person, p_shard) = if let Some(user_bytes) = fields[1] {
-                                    ids.get_compact_with_shard(user_bytes)
+                                let person_idx = if !is_valid {
+                                    0 // Invalid winners still participate in global dedup.
+                                } else if let Some(u) = simple_users.index(fields[1].unwrap()) {
+                                    u
                                 } else {
-                                    (CompactId::default(), 0u8)
+                                    let person = ids.get_compact_with_shard(fields[1].unwrap());
+                                    if extra_people.len() >= EXTRA_PERSON as usize { return Err(Box::new(InvalidIngest)); }
+                                    let idx = EXTRA_PERSON | extra_people.len() as u32;
+                                    extra_people.push(person);
+                                    idx
                                 };
 
-                                if event_id_bytes.len() > 1 && (event_id_bytes[0] == b'e' || event_id_bytes[0] == b'E') {
+                                if let Some(id_case) = fast_records::id_case(event_id_bytes, b'e') {
                                     if let Some(val) = decode_b36(&event_id_bytes[1..]) {
-                                        let eid_num = unscramble(val, keys.event_key) as u32;
-                                        if eid_num < max_event_id {
+                                        let eid_num = unscramble(val, keys.event_key);
+                                        if val <= SCRAMBLE_MASK && eid_num < u64::from(max_event_id) {
+                                            let eid_num = eid_num as u32;
                                             let e_shard = (eid_num & 63) as usize;
-                                            let local_eid = eid_num >> 6;
+                                            let local_eid = (eid_num >> 6) * 2 + id_case;
                                             let flags = (if is_purchase { PURCHASE } else { 0 })
                                                 | (if is_valid { VALID } else { 0 });
-                                            local_shards[e_shard].push(FastEvent {
-                                                local_eid,
-                                                ingest_ms,
-                                                ts_ms: ts_ms_opt.unwrap_or(i64::MIN),
-                                                person,
-                                                price_cents: price_cents.unwrap_or(0) as i32,
-                                                p_shard,
-                                                cat_idx: category_idx,
-                                                flags,
-                                            });
+                                            local_shards[e_shard].push(FastEvent::new(local_eid, person_idx, ingest_ms,
+                                                ts_ms_opt.unwrap_or(window_start), price_cents.unwrap_or(0) as u32,
+                                                category_idx, flags & VALID != 0, window_start).ok_or(InvalidIngest)?);
                                         } else {
                                             return Err(Box::new(InvalidIngest));
                                         }
@@ -2238,16 +2240,18 @@ fn run_fast_path_pipeline(
                             })?;
                         }
                         let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
-                        Ok((local_shards, cpu_ns))
+                        Ok((local_shards, extra_people, cpu_ns))
                     }));
                 }
                 let mut results = Vec::new();
                 for h in handles {
                     results.push(h.join().unwrap()?);
                 }
-                let total_cpu: u64 = results.iter().map(|(_, c)| *c).sum();
-                let shards: Vec<Vec<Vec<FastEvent>>> = results.into_iter().map(|(s, _)| s).collect();
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((shards, total_cpu))
+                let total_cpu: u64 = results.iter().map(|(_, _, c)| *c).sum();
+                let mut shards = Vec::new();
+                let mut extra_people = Vec::new();
+                for (s, people, _) in results { shards.push(s); extra_people.push(people); }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((shards, extra_people, total_cpu))
             })?;
 
             let t_events_parse_elapsed = t_events_parse_start.elapsed().as_secs_f64() * 1000.0;
@@ -2257,18 +2261,20 @@ fn run_fast_path_pipeline(
 
             // Array-based deduplication of events
             let t_events_dedup_start = std::time::Instant::now();
-            let (worker_person_events, events_dedup_cpu_ns): (Vec<Vec<Vec<RawPersonEvent>>>, u64) = std::thread::scope(|e_scope| -> Result<(Vec<Vec<Vec<RawPersonEvent>>>, u64)> {
+            let (worker_person_events, events_dedup_cpu_ns): (Vec<Vec<Vec<FastEvent>>>, u64) = std::thread::scope(|e_scope| -> Result<(Vec<Vec<Vec<FastEvent>>>, u64)> {
                 let jobs = Arc::new(ShardJobs::new((0..NUM_EVENT_SHARDS).map(|shard|
                     worker_event_shards.iter().map(|worker| worker[shard].len()).sum()).collect()));
                 let mut handles = Vec::new();
                 let worker_event_shards = &worker_event_shards;
+                let worker_extra_people = &worker_extra_people;
+                let simple_users = &simple_users;
 
                 for _ in 0..workers_count {
                     let jobs = Arc::clone(&jobs);
 
-                    handles.push(e_scope.spawn(move || -> Result<(Vec<Vec<RawPersonEvent>>, u64)> {
+                    handles.push(e_scope.spawn(move || -> Result<(Vec<Vec<FastEvent>>, u64)> {
                         let cpu_start = thread_cpu_time_ns();
-                        let mut local_person_shards: Vec<Vec<RawPersonEvent>> =
+                        let mut local_person_shards: Vec<Vec<FastEvent>> =
                             (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect();
 
                         let mut slots: Vec<DedupSlot> = vec![DedupSlot { ingest_ms: i64::MAX, worker_idx: 0, ev_idx: 0 }; max_local_eid];
@@ -2278,18 +2284,18 @@ fn run_fast_path_pipeline(
                             for (w_idx, worker_shards) in worker_event_shards.iter().enumerate() {
                                 let shard_events = &worker_shards[shard_idx];
                                 for (ev_idx, ev) in shard_events.iter().enumerate() {
-                                    let idx = ev.local_eid as usize;
+                                    let idx = ev.local_eid() as usize;
                                     if idx >= max_local_eid {
                                         return Err(Box::new(InvalidIngest));
                                     }
                                     let slot = &mut slots[idx];
                                     if slot.ingest_ms == i64::MAX {
                                         seen_indices.push(idx as u32);
-                                        slot.ingest_ms = ev.ingest_ms;
+                                        slot.ingest_ms = ev.ingest_ms(window_start);
                                         slot.worker_idx = w_idx as u16;
                                         slot.ev_idx = ev_idx as u32;
-                                    } else if ev.ingest_ms < slot.ingest_ms {
-                                        slot.ingest_ms = ev.ingest_ms;
+                                    } else if ev.ingest_ms(window_start) < slot.ingest_ms {
+                                        slot.ingest_ms = ev.ingest_ms(window_start);
                                         slot.worker_idx = w_idx as u16;
                                         slot.ev_idx = ev_idx as u32;
                                     }
@@ -2300,14 +2306,12 @@ fn run_fast_path_pipeline(
                                 let idx = idx_u32 as usize;
                                 let slot = slots[idx];
                                 let ev = &worker_event_shards[slot.worker_idx as usize][shard_idx][slot.ev_idx as usize];
-                                if ev.flags & VALID != 0 && ev.ts_ms != i64::MIN && slot.ingest_ms.saturating_sub(ev.ts_ms) <= 86_400_000 {
-                                    local_person_shards[ev.p_shard as usize].push(RawPersonEvent {
-                                        person: ev.person,
-                                        ts_ms: ev.ts_ms,
-                                        price_cents: ev.price_cents,
-                                        cat_idx: ev.cat_idx,
-                                        is_purchase: ev.flags & PURCHASE != 0,
-                                    });
+                                if ev.valid() && slot.ingest_ms.saturating_sub(ev.ts_ms(window_start)) <= 86_400_000 {
+                                    let token = ev.person_idx();
+                                    let (_, p_shard) = if token & EXTRA_PERSON != 0 {
+                                        worker_extra_people[slot.worker_idx as usize][(token & (EXTRA_PERSON - 1)) as usize]
+                                    } else { simple_users.person(token) };
+                                    local_person_shards[p_shard as usize].push(ev.with_worker(slot.worker_idx));
                                 }
                                 slots[idx].ingest_ms = i64::MAX;
                             }
@@ -2331,7 +2335,7 @@ fn run_fast_path_pipeline(
             eprintln!("[events_dedup] wall: {:.3}ms, cpu: {:.3}ms", t_events_dedup_elapsed, (events_dedup_cpu_ns as f64) / 1_000_000.0);
 
             let (worker_person_clicks, clicks_cpu_ns, t_clicks_elapsed) = click_handle.join().unwrap()?;
-            Ok((worker_person_events, worker_person_clicks, clicks_cpu_ns, events_parse_cpu_ns, events_dedup_cpu_ns, t_events_parse_elapsed, t_events_dedup_elapsed, t_clicks_elapsed, total_raw_events))
+            Ok((worker_person_events, worker_extra_people, worker_person_clicks, clicks_cpu_ns, events_parse_cpu_ns, events_dedup_cpu_ns, t_events_parse_elapsed, t_events_dedup_elapsed, t_clicks_elapsed, total_raw_events))
         })?;
 
     // Analytics sessions & sort across person shards
@@ -2346,6 +2350,8 @@ fn run_fast_path_pipeline(
                 + worker_person_clicks.iter().map(|worker| worker[shard].len()).sum::<usize>()).collect()));
             let mut handles = Vec::new();
             let worker_person_events = &worker_person_events;
+            let worker_extra_people = &worker_extra_people;
+            let simple_users = &simple_users;
             let worker_person_clicks = &worker_person_clicks;
             let category_names = &category_names;
             let campaign_count = campaign_names.len();
@@ -2378,7 +2384,10 @@ fn run_fast_path_pipeline(
                     let mut shard_person_map: HashMap<CompactId, u32, FastBuildHasher> =
                         HashMap::with_capacity_and_hasher(32768, FastBuildHasher);
                     let mut shard_person_names: Vec<CompactId> = Vec::with_capacity(32768);
+                    // Each simple user is routed to exactly one person shard.
+                    let mut simple_to_local = vec![u32::MAX; simple_users.len()];
                     let mut local_events: Vec<LocalEvent> = Vec::with_capacity(131072);
+                    let mut event_scratch = Vec::new();
                     let mut local_clicks: Vec<LocalClick> = Vec::with_capacity(32768);
 
                     while let Some(shard_idx) = jobs.next() {
@@ -2393,24 +2402,31 @@ fn run_fast_path_pipeline(
 
                         for w_events in worker_person_events {
                             for ev in &w_events[shard_idx] {
-                                let p_idx = if cache_valid && cache_person == ev.person {
-                                    cache_pidx
+                                let token = ev.person_idx();
+                                let simple = token & EXTRA_PERSON == 0;
+                                let p_idx = if simple && simple_to_local[token as usize] != u32::MAX {
+                                    simple_to_local[token as usize]
                                 } else {
-                                    let idx = match shard_person_map.get(&ev.person) {
-                                        Some(&idx) => idx,
-                                        None => {
-                                            let idx = shard_person_names.len() as u32;
-                                            shard_person_names.push(ev.person);
-                                            shard_person_map.insert(ev.person, idx);
-                                            idx
-                                        }
+                                    let (person, _) = if simple { simple_users.person(token) } else {
+                                        worker_extra_people[ev.worker() as usize][(token & (EXTRA_PERSON-1)) as usize]
                                     };
-                                    cache_person = ev.person;
+                                    let idx = if cache_valid && cache_person == person { cache_pidx } else {
+                                        *shard_person_map.entry(person).or_insert_with(|| {
+                                            let idx = shard_person_names.len() as u32;
+                                            shard_person_names.push(person);
+                                            idx
+                                        })
+                                    };
+                                    cache_person = person;
                                     cache_pidx = idx;
                                     cache_valid = true;
+                                    if simple { simple_to_local[token as usize] = idx; }
                                     idx
                                 };
-                                local_events.push(LocalEvent::new(ev, p_idx));
+                                local_events.push(LocalEvent {
+                                    ts_ms: ev.ts_ms(window_start), p_idx,
+                                    price_category: ev.price() | (u32::from(ev.category()) << 24),
+                                });
                             }
                         }
 
@@ -2439,18 +2455,8 @@ fn run_fast_path_pipeline(
                         }
 
                         let sort_started = profiling.then(std::time::Instant::now);
-                        if window_end.abs_diff(window_start) <= u64::from(u32::MAX) + 1 {
-                            local_events.sort_unstable_by_key(|e| {
-                                (u64::from(e.p_idx) << 32) | (e.ts_ms - window_start) as u64
-                            });
-                        } else {
-                            local_events.sort_unstable_by_key(|e| (e.p_idx, e.ts_ms));
-                        }
-                        local_clicks.sort_unstable_by(|a, b| {
-                            (a.p_idx, a.ts_ms)
-                                .cmp(&(b.p_idx, b.ts_ms))
-                                .then_with(|| a.click_id.as_bytes().cmp(b.click_id.as_bytes()))
-                        });
+                        click_index::sort_events(&mut local_events, &mut event_scratch, shard_person_names.len());
+                        let click_index = click_index::ClickIndex::build(&local_clicks, shard_person_names.len());
                         if let Some(started) = sort_started { sort_time += started.elapsed(); }
 
                         let attribution_started = profiling.then(std::time::Instant::now);
@@ -2466,9 +2472,10 @@ fn run_fast_path_pipeline(
                                 map: &mut sparse_map,
                             }
                         };
-                        let u_part = execute_shard_local(
+                        let u_part = execute_shard_indexed(
                             &local_events,
-                            &local_clicks,
+                            &click_index.clicks,
+                            Some(&click_index.offsets),
                             &shard_person_names,
                             category_names,
                             &mut sink,
@@ -3487,6 +3494,17 @@ fn execute_shard_local(
     category_names: &[String],
     campaign_sink: &mut CampaignDailySink,
 ) -> Vec<UserDailyRow> {
+    execute_shard_indexed(events, clicks, None, person_names, category_names, campaign_sink)
+}
+
+fn execute_shard_indexed(
+    events: &[LocalEvent],
+    clicks: &[LocalClick],
+    click_offsets: Option<&[usize]>,
+    person_names: &[CompactId],
+    category_names: &[String],
+    campaign_sink: &mut CampaignDailySink,
+) -> Vec<UserDailyRow> {
     let mut user_rows = Vec::new();
 
     let mut ev_start = 0;
@@ -3500,15 +3518,14 @@ fn execute_shard_local(
         }
         let person_events = &events[ev_start..ev_end];
 
-        // Advance click cursor to this person's p_idx
-        while cl_cursor < clicks.len() && clicks[cl_cursor].p_idx < p_idx {
-            cl_cursor += 1;
-        }
-        let cl_start = cl_cursor;
-        while cl_cursor < clicks.len() && clicks[cl_cursor].p_idx == p_idx {
-            cl_cursor += 1;
-        }
-        let person_clicks = &clicks[cl_start..cl_cursor];
+        let person_clicks = if let Some(offsets) = click_offsets {
+            &clicks[offsets[p_idx as usize]..offsets[p_idx as usize + 1]]
+        } else {
+            while cl_cursor < clicks.len() && clicks[cl_cursor].p_idx < p_idx { cl_cursor += 1; }
+            let cl_start = cl_cursor;
+            while cl_cursor < clicks.len() && clicks[cl_cursor].p_idx == p_idx { cl_cursor += 1; }
+            &clicks[cl_start..cl_cursor]
+        };
 
         // Process sessions for this person with zero-allocation scalar day aggregation
         let person = person_names[p_idx as usize];
@@ -4424,6 +4441,16 @@ mod tests {
 
         let bad_line2 = b"e1,u1,1,2,3,4,5,too,many\n";
         assert!(!super::parse_csv_line(bad_line2, &mut fields));
+    }
+
+    #[test]
+    fn direct_lookup_numbers_preserve_exact_strings_and_reject_overflow() {
+        assert_eq!(parse_product_num(b"p0"), Some(0));
+        assert_eq!(parse_product_num(b"p01"), None);
+        assert_eq!(parse_product_num(b"p999999999999999999999999999"), None);
+        assert_eq!(parse_campaign_num(b"c_0"), Some(0));
+        assert_eq!(parse_campaign_num(b"c_01"), None);
+        assert_eq!(parse_campaign_num(b"c_999999999999999999999999999"), None);
     }
 
     #[test]

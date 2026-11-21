@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import shutil
 import statistics
+import sys
+import time
 import subprocess
 import tempfile
 
@@ -131,6 +133,26 @@ def build(repo, scratch, variants):
 def measure(binary, data, output, workers):
     env = os.environ.copy()
     env.pop('NATIVE_PROFILE', None)
+    if sys.platform == 'darwin':
+        # wait4 measures this process, including key recovery and every worker.
+        # macOS time -l needs sysctl access unavailable in restricted environments.
+        with tempfile.TemporaryFile(mode='w+') as log:
+            started = time.perf_counter()
+            process = subprocess.Popen([str(binary), '--data-dir', str(data), '--output-dir',
+                str(output), '--workers', str(workers)], stdout=subprocess.DEVNULL, stderr=log, env=env)
+            _, status, usage = os.wait4(process.pid, 0)
+            process.returncode = os.waitstatus_to_exitcode(status)
+            wall = time.perf_counter() - started
+            log.seek(0)
+            stderr = log.read()
+        if process.returncode:
+            raise RuntimeError(stderr)
+        count = re.search(r'total_events: (\d+)', stderr)
+        return dict(user_seconds=usage.ru_utime, system_seconds=usage.ru_stime,
+                    cpu_seconds=usage.ru_utime + usage.ru_stime, wall_seconds=wall,
+                    peak_rss_bytes=usage.ru_maxrss, major_faults=usage.ru_majflt,
+                    minor_faults=usage.ru_minflt,
+                    parsed_event_copies=int(count[1]) if count else None, stderr=stderr)
     process = subprocess.run(['/usr/bin/time', '-f', 'CPU_MEASURE %U %S %e %M %F %R',
         str(binary), '--data-dir', str(data), '--output-dir', str(output), '--workers', str(workers)],
         capture_output=True, text=True, env=env)
