@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Shopping Sessions: DuckDB starter
 
 This repository is a working skeleton, not a complete solution. It builds a `linux/amd64` image with DuckDB, runs inside the scorer's container limits, reads the inputs, and writes both output tables with the right schema. Both tables are empty, so the checker marks this skeleton incorrect until you implement the rules in `rules.md`.

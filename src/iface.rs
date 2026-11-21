@@ -56,6 +56,7 @@ pub const BATCH_ALIGN: usize = NB * 8;
 pub const SCRATCH: usize = 256;
 pub const SCRATCH_INIT: u64 = 0x2C2C_2C2C_2C2C_2C2C;
 pub const SCRATCH_ZERO: core::ops::Range<usize> = 2..4;
+pub const SCRATCH_UNMATCH: (usize, u64) = (48 * 4 + 1, ((b',' ^ b'-') as u64) << 8);
 
 #[repr(C, align(512))]
 pub struct EvBatch {
@@ -83,6 +84,7 @@ impl EvBatch {
         let mut b: Box<EvBatch> = unsafe { Box::new(core::mem::zeroed()) };
         b.scratch = [SCRATCH_INIT; SCRATCH];
         b.scratch[SCRATCH_ZERO].fill(0);
+        b.scratch[SCRATCH_UNMATCH.0] ^= SCRATCH_UNMATCH.1;
         b
     }
     #[inline(always)]
@@ -96,6 +98,7 @@ impl CkBatch {
         let mut b: Box<CkBatch> = unsafe { Box::new(core::mem::zeroed()) };
         b.scratch = [SCRATCH_INIT; SCRATCH];
         b.scratch[SCRATCH_ZERO].fill(0);
+        b.scratch[SCRATCH_UNMATCH.0] ^= SCRATCH_UNMATCH.1;
         b
     }
     #[inline(always)]

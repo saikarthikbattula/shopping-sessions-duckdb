@@ -2,7 +2,6 @@
 name = "pipeline"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.95"
 publish = false
 
 [[bin]]
@@ -15,6 +14,7 @@ knobs = []
 testkeys = []
 pmu = []
 tl = []
+sp = []
 
 [dependencies]
 

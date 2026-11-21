@@ -16,7 +16,7 @@ chmod 777 "$OUT" "$SCRATCH"
 release() {
   if [ -n "$(find "$OUT" "$SCRATCH" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]; then
     docker run --rm --platform "$PLATFORM" --network none --user 1000:1000 \
-      -v "$OUT":/output:z -v "$SCRATCH":/scratch:z --entrypoint chmod "$IMAGE" \
+      -v "$OUT":/output:z -v "$SCRATCH":/scratch:z --entrypoint chmod busybox:1.37.0-musl \
       -R a+rwX /output /scratch >/dev/null 2>&1 || true
   fi
   rm -rf "$SCRATCH" 2>/dev/null || true

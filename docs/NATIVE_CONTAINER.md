@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Rust-only runtime image
 
 The root Dockerfile builds native/ingest with Rust 1.85.0 on Alpine/musl, checks

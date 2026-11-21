@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 > Historical workstream record. Python/staging commands below are retired.
 > Use the current README.md and DATA_CONTRACT.md for the Rust-only runtime.
 

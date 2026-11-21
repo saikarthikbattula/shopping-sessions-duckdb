@@ -1,3 +1,6 @@
+target
+
+# Keep pre-existing local datasets, environments and Git metadata out of builds.
 .git
 .venv
 **/__pycache__

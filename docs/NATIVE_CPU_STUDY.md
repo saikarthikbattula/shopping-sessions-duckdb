@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Native CPU study at bb16596
 
 Baseline: `bb16596f59e601fc3b231e4608ace144a7949e42`.

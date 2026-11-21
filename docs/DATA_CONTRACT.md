@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Rust input/output contract
 
 The user-requested Rust-only migration retires PreparedInputs, the Python

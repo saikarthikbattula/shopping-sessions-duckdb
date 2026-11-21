@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Repeatable Rust measurements
 
 Use an immutable existing dataset and two already built executables. Python is a

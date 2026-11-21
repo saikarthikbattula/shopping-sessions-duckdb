@@ -290,6 +290,10 @@ pub fn shard(pkey: u64) -> usize {
 
 fn main() {
     let t0 = Instant::now();
+    #[cfg(feature = "sp")]
+    let sp_t0 = sys::sp::ns();
+    #[cfg(feature = "sp")]
+    sys::sp::snap("t0");
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("--generic") {
         let (data, outdir) = dirs(&args, 1);
@@ -349,12 +353,21 @@ fn main() {
     if let Ok(v) = std::env::var("XL_RGREL") {
         out::REGION_UNMAP.store(v == "1", std::sync::atomic::Ordering::Relaxed);
     }
+    #[cfg(feature = "sp")]
+    parse::SPTOUCH.store(std::env::var("XL_SPTOUCH").is_ok(), std::sync::atomic::Ordering::Relaxed);
+    if std::env::var("XL_HOLD").is_ok_and(|v| v == "1") {
+        parse::HOLD_FREE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     if std::env::var("XL_PPARTS").is_ok_and(|v| v == "0") {
         sys::SETUP_PARTS.store(false, std::sync::atomic::Ordering::Relaxed);
     }
+    #[cfg(feature = "sp")]
+    sys::sp::snap("init");
     if std::env::var("XL_POOL").map_or(true, |v| v == "1") {
         sys::pool_start(nt);
     }
+    #[cfg(feature = "sp")]
+    sys::sp::snap("pool");
     let knob = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v == "1");
     unsafe {
         parse::NT = knob("XL_NT", true);
@@ -399,6 +412,9 @@ fn main() {
     lap("parse");
     links::stage2(g);
     lap("st2sort");
+    if std::env::var("XL_OVL").map_or(true, |v| v != "0") {
+        out::s3_init(g, &outdir);
+    }
     events::stage3(g);
     lap("ev3b");
     if std::env::var("XL_OVL").map_or(true, |v| v != "0") {
@@ -488,6 +504,14 @@ fn main() {
     }
     if timing {
         eprintln!("[v2b] exit at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
+    #[cfg(feature = "sp")]
+    {
+        sys::sp::snap("endrel");
+        sys::sp::report();
+        let r = sys::sp::ru(0);
+        eprintln!("[sp] at report: user {:.2} sys {:.2} minflt {} t {:.2}", r[0] as f64 / 1e3, r[1] as f64 / 1e3, r[2], t0.elapsed().as_secs_f64() * 1e3);
+        eprintln!("[sp] mono {} {}", sp_t0, sys::sp::ns());
     }
     #[cfg(feature = "tl")]
     unsafe {

@@ -13,10 +13,17 @@ import tempfile
 import time
 import math
 
-if __package__:
-    from .benchmark_cpu_candidate import compare_outputs
-else:
-    from benchmark_cpu_candidate import compare_outputs
+import duckdb
+
+
+def compare_outputs(left, right):
+    with duckdb.connect() as connection:
+        connection.execute("SET memory_limit = '512MB'")
+        connection.execute('SET threads = 2')
+        for table in ('user_daily','campaign_daily'):
+            paths=[str(root/table/'**/*.parquet') for root in (left,right)]
+            count=connection.execute('WITH a AS (SELECT * FROM read_parquet(?)), b AS (SELECT * FROM read_parquet(?))\n                SELECT count(*) FROM ((SELECT * FROM a EXCEPT ALL SELECT * FROM b)\n                UNION ALL (SELECT * FROM b EXCEPT ALL SELECT * FROM a))',paths).fetchone()[0]
+            if count: raise RuntimeError(f'{table}: {count} differing rows')
 
 
 def measure(binary, data, output, workers, spin):

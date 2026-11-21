@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Cache-efficient native records
 
 Baseline: `023349d4990b88ecd2238e93364804b976131f6f` (shared main).

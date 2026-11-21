@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Current implementation plan
 
 Production is a complete Rust CSV-to-Parquet executable. The former Python

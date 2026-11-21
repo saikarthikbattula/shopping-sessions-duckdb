@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Simple-user identity and compact sessionization
 
 This increment starts from `origin/main` at `4d3547d4f98344f45a882a71527645d66bc6212f`.

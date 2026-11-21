@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Karthik handoff: DuckDB analytics and output tables
 
 Status: analytics implemented at `92e2fe3` (merged PR #3), integrated with ingestion and validated on `codex/integration-validation` (PR #5). The shared contract is unchanged. The prompt below is the original assignment, retained for reference rather than a new implementation request. See [validation status](../VALIDATION.md).

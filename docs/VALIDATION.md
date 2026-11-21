@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Rust-only migration status
 
 Local portable-runtime checks after removing the Python production pipeline:

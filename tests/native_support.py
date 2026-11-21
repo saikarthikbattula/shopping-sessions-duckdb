@@ -5,7 +5,7 @@ import subprocess
 
 
 def native_binary():
-    binary = Path(os.environ.get('RUST_INGEST_BIN', 'native/ingest/target/release/shopping-ingest')).resolve()
+    binary = Path(os.environ.get('RUST_INGEST_BIN', 'target/release/pipeline')).resolve()
     if not binary.is_file():
         raise FileNotFoundError(f'Build the Rust executable first: make native-ingest ({binary})')
     return binary
@@ -13,7 +13,7 @@ def native_binary():
 
 def run_native(data, output, *, workers=2):
     env = dict(os.environ, NCPU=str(workers))
-    if env.get('NATIVE_CLI_STYLE', 'named') == 'positional':
+    if env.get('NATIVE_CLI_STYLE', 'positional') == 'positional':
         command = [str(native_binary()), str(data), str(output)]
     else:
         command = [str(native_binary()), '--data-dir', str(data), '--output-dir', str(output), '--workers', str(workers)]

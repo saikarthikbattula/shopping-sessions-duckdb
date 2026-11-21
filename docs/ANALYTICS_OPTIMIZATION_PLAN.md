@@ -1,17 +1,20 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 > Historical workstream record. Python/staging commands below are retired.
 > Use the current README.md and DATA_CONTRACT.md for the Rust-only runtime.
 
 # DuckDB Analytics Optimization Plan
 
-**Owner:** Karthik  
-**Source:** Profiling evidence from Step 6 (`inline:rust-optimization#step-6`)  
+**Owner:** Karthik<br>
+**Source:** Profiling evidence from Step 6 (`inline:rust-optimization#step-6`)<br>
 **Prerequisites:** Rust ingestion default (PR #10 merged into `main`)
 
 ---
 
 ## 1. Goal and Context
 
-With the parallel Rust ingestion engine promoted to default, data preparation time dropped by **10–14x** (from ~28–36s down to ~2.1–2.5s on 5M datasets). 
+With the parallel Rust ingestion engine promoted to default, data preparation time dropped by **10–14x** (from ~28–36s down to ~2.1–2.5s on 5M datasets).
 
 As a result, **DuckDB analytics is now the dominant pipeline component**, taking **52% to 68% of total wall-clock time**.
 

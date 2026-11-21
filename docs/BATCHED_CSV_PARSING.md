@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Batched native CSV parsing
 
 Baseline: shared main `0c5093ddc36073c3fecf089b7c6dfe24c082371b`, the merged

@@ -195,6 +195,7 @@ pub struct Core {
     pub rev: Col<i32>,
     pub cat: Col<u8>,
     pub n_sess: u64,
+    pub s3w: usize,
     sess: Vec<Sess>,
     stamp: Vec<u32>,
     serial: u32,
@@ -248,6 +249,7 @@ impl Core {
             rev: Col::new(row_cap),
             cat: Col::new(row_cap),
             n_sess: 0,
+            s3w: 0,
             sess: Vec::new(),
             stamp: vec![0; nc + 1],
             serial: 0,
@@ -466,6 +468,9 @@ impl Core {
     }
 
     pub fn abort(&mut self, st: &St) {
+        if st.mark < self.s3w {
+            fallback("abort below written rows");
+        }
         let mut m = st.catmask;
         while m != 0 {
             self.catsum[m.trailing_zeros() as usize] = 0;

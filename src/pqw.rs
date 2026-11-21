@@ -1666,10 +1666,13 @@ pub struct UserFile {
 }
 impl UserFile {
     pub fn create(path: &Path, limit: usize) -> io::Result<UserFile> {
+        Self::create_cap(path, limit, limit + BLOCK * 64)
+    }
+    pub fn create_cap(path: &Path, limit: usize, cap: usize) -> io::Result<UserFile> {
         let _pv = prof::sw(prof::CREATE);
         let f = File::create(path)?;
         prof::sw(_pv);
-        let mut o = Out { buf: Vec::with_capacity(limit + BLOCK * 64), flushed: 0, file: Some(f), limit };
+        let mut o = Out { buf: Vec::with_capacity(cap), flushed: 0, file: Some(f), limit };
         o.put(b"PAR1");
         Ok(UserFile { o, groups: Vec::new(), rows: 0 })
     }

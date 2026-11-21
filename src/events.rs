@@ -233,12 +233,13 @@ fn slab_settle(core: &mut crate::core::Core) {
 #[inline(always)]
 unsafe fn scatter_chunk(p: *const Rec, n: usize, slots: *mut Rec, gen: u64, nextc: *const i8) {
     let gv = _mm_set_epi64x(gen as i64, 0);
+    let keep = _mm_set_epi64x(!0xFFFFi64, -1);
     let put = |r: *const Rec| {
         let w1 = (*r).w1;
         let s = slots.add((w1 & (BSIZE as u64 - 1)) as usize);
         let old = (*s).w1;
-        if old as u16 != w1.wrapping_add(gen) as u16 || ((w1 >> 16) & ING_MAX) < ((old >> 16) & ING_MAX) {
-            _mm_storeu_si128(s as *mut __m128i, _mm_add_epi64(_mm_loadu_si128(r as *const __m128i), gv));
+        if old as u16 != gen as u16 || ((w1 >> 16) & ING_MAX) < ((old >> 16) & ING_MAX) {
+            _mm_storeu_si128(s as *mut __m128i, _mm_add_epi64(_mm_and_si128(_mm_loadu_si128(r as *const __m128i), keep), gv));
         }
     };
     if PF_CHUNK {
@@ -261,15 +262,25 @@ unsafe fn scatter_chunk(p: *const Rec, n: usize, slots: *mut Rec, gen: u64, next
     }
 }
 
+#[cold]
+#[inline(never)]
+unsafe fn put_dup(e: *const u8, s: *mut Rec, x: __m128i) {
+    let q = (e as *const u64).read_unaligned();
+    let old = (*s).w1;
+    if ((q >> 16) & ING_MAX) < ((old >> 16) & ING_MAX) {
+        _mm_storeu_si128(s as *mut __m128i, x);
+    }
+}
+
 #[inline(always)]
 unsafe fn scatter_chunk12(p: *const u8, n: usize, slots: *mut Rec, gen: u64, nextc: *const i8) {
     let gv = _mm_set_epi64x(gen as i64, 0);
-    let sel = _mm_set_epi64x(crate::parse::R12_M59 as i64, (u64::MAX << 32) as i64);
+    let sel = _mm_set_epi64x((crate::parse::R12_M59 & !0xFFFF) as i64, (u64::MAX << 32) as i64);
     let put1 = |e: *const u8| {
         let q = (e as *const u64).read_unaligned();
-        let s = slots.add((q & (BSIZE as u64 - 1)) as usize);
+        let s = opaque(slots.add((q & (BSIZE as u64 - 1)) as usize) as *const u8) as *mut Rec;
         let old = (*s).w1;
-        if old as u16 != q.wrapping_add(gen) as u16 || ((q >> 16) & ING_MAX) < ((old >> 16) & ING_MAX) {
+        if old as u16 != gen as u16 || ((q >> 16) & ING_MAX) < ((old >> 16) & ING_MAX) {
             let x = _mm_loadu_si128(e as *const __m128i);
             let sh = _mm_shuffle_epi32::<0b01_00_10_11>(x);
             let a = _mm_maskz_srli_epi64::<59>(1, x);
@@ -277,39 +288,63 @@ unsafe fn scatter_chunk12(p: *const u8, n: usize, slots: *mut Rec, gen: u64, nex
             _mm_storeu_si128(s as *mut __m128i, _mm_add_epi64(r, gv));
         }
     };
-    let gv2 = _mm256_setr_epi64x(0, gen as i64, 0, gen as i64);
-    let sel2 = _mm256_setr_epi64x((u64::MAX << 32) as i64, crate::parse::R12_M59 as i64, (u64::MAX << 32) as i64, crate::parse::R12_M59 as i64);
-    let pidx = _mm256_setr_epi32(0, 2, 0, 1, 0, 5, 3, 4);
-    let put2 = |e: *const u8| {
+    let gv2 = _mm256_setr_epi32(0, 0, gen as i32, 0, 0, 0, gen as i32, 0);
+    let keep2 = _mm256_setr_epi32(-1, -1, 0xFFFF_0000u32 as i32, (crate::parse::R12_M59 >> 32) as i32, -1, -1, 0xFFFF_0000u32 as i32, (crate::parse::R12_M59 >> 32) as i32);
+    let sh2 = _mm256_setr_epi32(27, 0, 0, 0, 27, 0, 0, 0);
+    let pidx = _mm256_setr_epi32(1, 2, 0, 1, 4, 5, 3, 4);
+    let put2 = |b: *const u8, o: usize, hi: bool| {
+        let e = b.add(o + if hi { 24 } else { 0 });
         let y: __m256i;
-        std::arch::asm!("vmovdqu {y}, ymmword ptr [{e}]", y = out(ymm_reg) y, e = in(reg) e, options(pure, readonly, nostack, preserves_flags));
-        let yp = _mm256_permutevar8x32_epi32(y, pidx);
-        let a = _mm256_maskz_shuffle_epi32::<2>(0x11, _mm256_srli_epi64::<59>(yp));
-        let r = _mm256_add_epi64(_mm256_ternarylogic_epi64::<0xCA>(sel2, yp, a), gv2);
-        let q0 = (e as *const u64).read_unaligned();
-        let q1 = (e.add(12) as *const u64).read_unaligned();
-        let s0 = slots.add((q0 & (BSIZE as u64 - 1)) as usize);
-        let old0 = (*s0).w1;
-        if old0 as u16 != q0.wrapping_add(gen) as u16 || ((q0 >> 16) & ING_MAX) < ((old0 >> 16) & ING_MAX) {
-            _mm_storeu_si128(s0 as *mut __m128i, _mm256_castsi256_si128(r));
+        if hi {
+            std::arch::asm!("vmovdqu {y}, ymmword ptr [{b} + {o} + 24]", y = out(ymm_reg) y, b = in(reg) b, o = in(reg) o, options(pure, readonly, nostack, preserves_flags));
+        } else {
+            std::arch::asm!("vmovdqu {y}, ymmword ptr [{b} + {o}]", y = out(ymm_reg) y, b = in(reg) b, o = in(reg) o, options(pure, readonly, nostack, preserves_flags));
         }
-        let s1 = slots.add((q1 & (BSIZE as u64 - 1)) as usize);
-        let old1 = (*s1).w1;
-        if old1 as u16 != q1.wrapping_add(gen) as u16 || ((q1 >> 16) & ING_MAX) < ((old1 >> 16) & ING_MAX) {
-            _mm_storeu_si128(s1 as *mut __m128i, _mm256_extracti128_si256::<1>(r));
-        }
+        let yp = _mm256_srlv_epi32(_mm256_permutevar8x32_epi32(y, pidx), sh2);
+        let r = _mm256_ternarylogic_epi32::<0xEA>(yp, keep2, gv2);
+        let s0 = slots.add(((e as *const u16).read_unaligned() as usize) & (BSIZE - 1));
+        std::arch::asm!(
+            "cmp word ptr [{s} + 8], {g:x}",
+            "je {l}",
+            "vmovdqu xmmword ptr [{s}], {r}",
+            s = in(reg) s0, g = in(reg) gen, r = in(xmm_reg) _mm256_castsi256_si128(r),
+            l = label { unsafe { put_dup(e, s0, _mm256_castsi256_si128(r)) } },
+            options(nostack)
+        );
+        let s1 = slots.add(((e.add(12) as *const u16).read_unaligned() as usize) & (BSIZE - 1));
+        std::arch::asm!(
+            "cmp word ptr [{s} + 8], {g:x}",
+            "je {l}",
+            "vextracti128 xmmword ptr [{s}], {r}, 1",
+            s = in(reg) s1, g = in(reg) gen, r = in(ymm_reg) r,
+            l = label { unsafe { put_dup(e.add(12), s1, _mm256_extracti128_si256::<1>(r)) } },
+            options(nostack)
+        );
     };
     if PF_CHUNK {
         _mm_prefetch::<_MM_HINT_T0>(nextc.wrapping_add(crate::parse::LINK_OFF));
     }
     let mut i = 0usize;
+    let end = 12 * (n & !3);
+    let mut o = 0usize;
+    while DEC2 && o < end {
+        if PF_CHUNK {
+            _mm_prefetch::<_MM_HINT_T0>(nextc.wrapping_add(o));
+        }
+        put2(p, o, false);
+        put2(p, o, true);
+        o += 48;
+    }
+    if DEC2 {
+        i = n & !3;
+    }
     while i + 4 <= n {
         if PF_CHUNK {
             _mm_prefetch::<_MM_HINT_T0>(nextc.wrapping_add(i * 12));
         }
         if DEC2 {
-            put2(p.add(12 * i));
-            put2(p.add(12 * i + 24));
+            put2(p, 12 * i, false);
+            put2(p, 12 * i, true);
         } else {
             put1(p.add(12 * i));
             put1(p.add(12 * i + 12));
@@ -832,6 +867,7 @@ fn xp_report(nev: u64) {
     let mut tot = [0u64; NEVT + 1];
     eprintln!("XPROF rusage of stage 3a threads: user {:.1} ms, system {:.1} ms, minor faults {}, major {}", XRU[0].load(Ordering::Relaxed) as f64 / 1e3, XRU[1].load(Ordering::Relaxed) as f64 / 1e3, XRU[2].load(Ordering::Relaxed), XRU[3].load(Ordering::Relaxed));
     eprintln!("XCNT runs light0/light/heavy {} {} {} | clicks light/heavy {} {} | sessions light0/light/heavy {} {} {} | scalar runs {} recs {} | n-hist {:?}", XCNT[0].load(Ordering::Relaxed), XCNT[1].load(Ordering::Relaxed), XCNT[2].load(Ordering::Relaxed), XCNT[3].load(Ordering::Relaxed), XCNT[4].load(Ordering::Relaxed), XCNT[5].load(Ordering::Relaxed), XCNT[6].load(Ordering::Relaxed), XCNT[7].load(Ordering::Relaxed), XCNT[25].load(Ordering::Relaxed), XCNT[26].load(Ordering::Relaxed), (8..25).map(|i| XCNT[i].load(Ordering::Relaxed)).collect::<Vec<_>>());
+    eprintln!("XCNT2 edge-copy recs {} | process_run recs {} special {} complex {} extra {}", XCNT[27].load(Ordering::Relaxed), XCNT[28].load(Ordering::Relaxed), XCNT[29].load(Ordering::Relaxed), XCNT[30].load(Ordering::Relaxed), XCNT[31].load(Ordering::Relaxed));
     eprintln!("XH heavy bins n<=16(not all in class),<=32,<=64,<=128,<=512,more: runs {:?} clicks {:?} sessions {:?} n*m {:?}", (0..6).map(|i| XH[i].load(Ordering::Relaxed)).collect::<Vec<_>>(), (6..12).map(|i| XH[i].load(Ordering::Relaxed)).collect::<Vec<_>>(), (12..18).map(|i| XH[i].load(Ordering::Relaxed)).collect::<Vec<_>>(), (18..24).map(|i| XH[i].load(Ordering::Relaxed)).collect::<Vec<_>>());
     eprintln!("XPROF per kept event (n={nev}): phase thread-ms | instr cycles uops L1Dmiss L2miss brmiss");
     for p in 0..=NPH {
@@ -1928,7 +1964,6 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
         let dig_min = DIG_MIN.load(Ordering::Relaxed);
         let ev_idx = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
         let od_idx = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
-        let iota8q = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
         let iota16 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
         loop {
             let b = g.next.fetch_add(1, Ordering::Relaxed);
@@ -1972,15 +2007,13 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                 let m16 = _mm512_set1_epi64(0xFFFF);
                 let m15 = _mm512_set1_epi64(15);
                 let pmask = _mm512_set1_epi64((0xFF_FFFFu64 << 9) as i64);
-                let eight = _mm512_set1_epi64(8);
-                let mut tagv = _mm512_add_epi64(iota8q, _mm512_set1_epi64(gen as i64));
-                let mut step = |blk: usize, k: &mut usize, tagv: &mut __m512i| {
+                let tagv = _mm512_set1_epi64(gen as i64);
+                let mut step = |blk: usize, k: &mut usize| {
                     let r0 = _mm512_loadu_si512(slots.add(8 * blk) as *const _);
                     let r1 = _mm512_loadu_si512(slots.add(8 * blk + 4) as *const _);
                     let w0 = _mm512_permutex2var_epi64(r0, ev_idx, r1);
                     let w1 = _mm512_permutex2var_epi64(r0, od_idx, r1);
-                    let occ = _mm512_testn_epi64_mask(_mm512_sub_epi64(w1, *tagv), m16);
-                    *tagv = _mm512_add_epi64(*tagv, eight);
+                    let occ = _mm512_testn_epi64_mask(_mm512_xor_si512(w1, tagv), m16);
                     let tsq = _mm512_srli_epi64(w0, 33);
                     let valid = _mm512_mask_cmpneq_epu64_mask(occ, tsq, inv);
                     let odd = valid & _mm512_movepi64_mask(w1);
@@ -1999,8 +2032,8 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                 const _: () = assert!((BSIZE / 8) % 2 == 0);
                 let mut blk = 0usize;
                 while blk < BSIZE / 8 {
-                    step(blk, &mut k, &mut tagv);
-                    step(blk + 1, &mut k, &mut tagv);
+                    step(blk, &mut k);
+                    step(blk + 1, &mut k);
                     blk += 2;
                 }
                 *blkk.add(BSIZE / 8) = k as u16;
@@ -2113,12 +2146,18 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                         info.n = 2;
                     }
                 } else if r == 0 {
+                    xc(27, (e - a) as u64);
                     info.first = edge_copy_k(tid, u, &mut fx, a, e - a);
                     info.n = 1;
                 } else if r + 1 == nrun {
+                    xc(27, (e - a) as u64);
                     info.last = edge_copy_k(tid, u, &mut fx, a, e - a);
                     info.n = 2;
                 } else {
+                    xc(28, (e - a) as u64);
+                    xc(29, special as u64);
+                    xc(30, (tv & COMPLEX != 0) as u64);
+                    xc(31, (tv & EXTRA != 0) as u64);
                     flush_names(&fx, &mut t.core, g.ukey, row_cap, &mut wk.nm_np, &mut wk.nm_na);
                     let mut buf = std::mem::take(&mut t.runbuf);
                     buf.clear();
@@ -2257,6 +2296,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
             t.prof[0] += (tb - ta).as_nanos() as u64;
             t.prof[1] += (tc - tb).as_nanos() as u64;
             t.prof[2] += (td - tc).as_nanos() as u64;
+            crate::out::s3_bucket(g, tid, &mut t.core);
         }
         xp.done();
         slab_settle(&mut t.core);

@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Native pipeline experiments
 
 Karthik owns this work. The scorer reference is PR #19 at 4.78 seconds, with a

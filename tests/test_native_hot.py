@@ -14,7 +14,7 @@ from tests.native_support import run_native
 
 class NativeHotPersonTests(unittest.TestCase):
     def native_binary(self):
-        binary = Path(os.environ.get("RUST_INGEST_BIN", "native/ingest/target/release/shopping-ingest")).resolve()
+        binary = Path(os.environ.get("RUST_INGEST_BIN", "target/release/pipeline")).resolve()
         if not binary.is_file():
             if os.environ.get("REQUIRE_RUST_INGEST") == "1":
                 self.fail("Required native executable is missing")

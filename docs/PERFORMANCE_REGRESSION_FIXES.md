@@ -1,3 +1,6 @@
+> Historical project record from before the root-engine replacement.
+> Current build/run instructions are in the root README.md.
+
 # Native performance regression investigation
 
 Reference: production commit `f5f40eb6e1f19e4ecf7763eb4b07e36e555eff93`.
