@@ -1,6 +1,7 @@
 """CPU study uses isolated transformations and whole-process measurements."""
 import importlib.util
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -47,11 +48,16 @@ class CpuProfileTests(unittest.TestCase):
 
     def test_scratch_transformations_are_separate_and_fail_on_anchor_drift(self):
         source = (ROOT / 'native/ingest/src/analytics.rs').read_text()
-        for variant in profile.VARIANTS:
-            with self.subTest(variant=variant):
-                changed = profile.ablate(source, variant)
-                self.assertNotEqual(changed, source)
-                self.assertEqual((ROOT / 'native/ingest/src/analytics.rs').read_text(), source)
+        baseline = subprocess.run(['git', '-C', str(ROOT), 'show', f'{profile.BASELINE}:native/ingest/src/analytics.rs'],
+                                  capture_output=True, text=True)
+        sources = {'current': source}
+        if baseline.returncode == 0:
+            sources['baseline'] = baseline.stdout
+        for name, text in sources.items():
+            for variant in profile.VARIANTS:
+                with self.subTest(source=name, variant=variant):
+                    self.assertNotEqual(profile.ablate(text, variant), text)
+        self.assertEqual((ROOT / 'native/ingest/src/analytics.rs').read_text(), source)
         with self.assertRaises(ValueError):
             profile.ablate('', 'raw_user')
         with self.assertRaises(ValueError):
