@@ -1,6 +1,7 @@
 """Ingestion acceptance checks, independent of downstream analytical filtering."""
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -231,7 +232,10 @@ class StagingTests(unittest.TestCase):
         for batch_rows in (0, -1, True, 1.5):
             with self.assertRaises(ValueError):
                 prepare_inputs(self.data, self.scratch, batch_rows=batch_rows)
-        with patch('pipeline.ingest_python.pq.ParquetWriter', side_effect=OSError('disk full')):
+        # This assertion is Python-backend-specific: force the Python backend so
+        # the writer patch is exercised regardless of the current default.
+        with patch('pipeline.ingest_python.pq.ParquetWriter', side_effect=OSError('disk full')), \
+                patch.dict('os.environ', {'INGEST_BACKEND': 'python'}):
             with self.assertRaisesRegex(OSError, 'disk full'):
                 prepare_inputs(self.data, self.scratch)
         self.write('manifest.json', '{"window_start":"bad","window_end":"bad"}')

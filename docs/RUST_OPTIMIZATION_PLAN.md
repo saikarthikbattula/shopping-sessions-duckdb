@@ -51,9 +51,23 @@ Status: planned; validation accompanies every increment.
 
 ## Step 5 — Conditional promotion
 
-Status: planned, after correctness and packaging gates.
+Status: implemented. Gates passed; Rust is now the default backend.
 
-Benchmark matched 1M and 5M multi-seed/skewed datasets. Make Rust default only if all correctness gates pass and median 5M end-to-end runtime is at least 2x faster than Python within resource limits. Otherwise keep Python default and retain the evidence. Provide a validated candidate commit for practice timing without deleting the baseline or earlier submissions.
+Matched 1M and 5M multi-seed benchmarks all passed correctness gates (status: ok). Median
+wall-time speedups on the ARM64 development Mac at NCPU=8, MEM_GB=4:
+
+| Dataset | Speedup |
+| --- | --- |
+| 1M seed-1 | 4.40x |
+| 1M seed-2 | 4.57x |
+| 5M seed-1 | 6.01x |
+| 5M seed-2 | 4.32x |
+
+All runs exceeded the ≥2x gate. `INGEST_BACKEND` now defaults to `rust` in both
+`pipeline/ingest.py` and `run.sh`. The Python reference remains available via
+`INGEST_BACKEND=python`. Validated candidate SHA: `df00ea2` (PR #9, `codex/rust-container`,
+the last merged increment before promotion). Submitted baseline
+`7637e570c8221001a7dc8ce7233d9443dfc2d947` and all prior history are preserved.
 
 ## Step 6 — Profile-driven next plan
 
