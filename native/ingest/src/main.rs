@@ -1,3 +1,4 @@
+mod analytics;
 mod identity;
 mod parsing;
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
@@ -209,13 +210,61 @@ struct Args {
     batch: usize,
     workers: usize,
 }
-fn args() -> std::result::Result<Args, String> {
+enum Mode {
+    Stage(Args),
+    Pipeline {
+        data: PathBuf,
+        output: PathBuf,
+        start: Option<i64>,
+        end: Option<i64>,
+        workers: usize,
+    },
+}
+fn cli_mode() -> std::result::Result<Mode, String> {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.is_empty() {
+        let data_env = std::env::var("DATA_DIR").ok();
+        let out_env = std::env::var("OUTPUT_DIR").ok();
+        if let (Some(d), Some(o)) = (data_env, out_env) {
+            let workers = std::env::var("NCPU")
+                .ok()
+                .and_then(|w| w.parse::<usize>().ok())
+                .unwrap_or(8)
+                .max(1);
+            return Ok(Mode::Pipeline {
+                data: PathBuf::from(d),
+                output: PathBuf::from(o),
+                start: None,
+                end: None,
+                workers,
+            });
+        }
+        return Err("missing arguments".into());
+    }
+
+    if raw_args.len() == 2 && !raw_args[0].starts_with('-') && !raw_args[1].starts_with('-') {
+        let workers = std::env::var("NCPU")
+            .ok()
+            .and_then(|w| w.parse::<usize>().ok())
+            .unwrap_or(8)
+            .max(1);
+        return Ok(Mode::Pipeline {
+            data: PathBuf::from(&raw_args[0]),
+            output: PathBuf::from(&raw_args[1]),
+            start: None,
+            end: None,
+            workers,
+        });
+    }
+
     let mut values = HashMap::new();
-    let mut it = std::env::args().skip(1);
+    let mut it = raw_args.into_iter();
     while let Some(key) = it.next() {
         if ![
             "--data-dir",
             "--stage-dir",
+            "--output-dir",
+            "--scratch-dir",
             "--window-start-ms",
             "--window-end-ms",
             "--batch-rows",
@@ -232,31 +281,53 @@ fn args() -> std::result::Result<Args, String> {
             return Err("duplicate option".into());
         }
     }
-    let get = |k: &str| values.get(k).ok_or_else(|| format!("missing {k}"));
-    let start = get("--window-start-ms")?
-        .parse::<i64>()
-        .map_err(|e| e.to_string())?;
-    let end = get("--window-end-ms")?
-        .parse::<i64>()
-        .map_err(|e| e.to_string())?;
-    let batch = get("--batch-rows")?
-        .parse::<u64>()
-        .map_err(|e| e.to_string())?;
+
     let workers = values
         .get("--workers")
-        .map_or(Ok(1), |v| v.parse::<usize>())
+        .map_or(Ok(8), |v| v.parse::<usize>())
         .map_err(|e| e.to_string())?;
-    if start >= end || batch == 0 || workers == 0 {
-        return Err("invalid window or batch size".into());
+    if workers == 0 {
+        return Err("invalid workers count".into());
     }
-    Ok(Args {
-        data: PathBuf::from(get("--data-dir")?),
-        stage: PathBuf::from(get("--stage-dir")?),
-        start,
-        end,
-        batch: batch.min(MAX_ROWS as u64) as usize,
-        workers,
-    })
+
+    if let Some(stage_str) = values.get("--stage-dir") {
+        let get = |k: &str| values.get(k).ok_or_else(|| format!("missing {k}"));
+        let start = get("--window-start-ms")?
+            .parse::<i64>()
+            .map_err(|e| e.to_string())?;
+        let end = get("--window-end-ms")?
+            .parse::<i64>()
+            .map_err(|e| e.to_string())?;
+        let batch = get("--batch-rows")?
+            .parse::<u64>()
+            .map_err(|e| e.to_string())?;
+        if start >= end || batch == 0 {
+            return Err("invalid window or batch size".into());
+        }
+        return Ok(Mode::Stage(Args {
+            data: PathBuf::from(get("--data-dir")?),
+            stage: PathBuf::from(stage_str),
+            start,
+            end,
+            batch: batch.min(MAX_ROWS as u64) as usize,
+            workers,
+        }));
+    }
+
+    if let Some(output_str) = values.get("--output-dir") {
+        let data_str = values.get("--data-dir").ok_or_else(|| "missing --data-dir".to_string())?;
+        let start = values.get("--window-start-ms").and_then(|v| v.parse::<i64>().ok());
+        let end = values.get("--window-end-ms").and_then(|v| v.parse::<i64>().ok());
+        return Ok(Mode::Pipeline {
+            data: PathBuf::from(data_str),
+            output: PathBuf::from(output_str),
+            start,
+            end,
+            workers,
+        });
+    }
+
+    Err("either --stage-dir or --output-dir is required".into())
 }
 /// Every descriptor starts and ends at a physical record boundary. Planning reads
 /// only each header and the suffix after a target offset, not entire input files.
@@ -527,14 +598,24 @@ fn run(a: Args) -> Result<()> {
     Ok(())
 }
 fn main() {
-    let a = match args() {
-        Ok(a) => a,
+    let mode = match cli_mode() {
+        Ok(m) => m,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(64)
+            std::process::exit(64);
         }
     };
-    if let Err(e) = run(a) {
+    let res = match mode {
+        Mode::Stage(a) => run(a),
+        Mode::Pipeline {
+            data,
+            output,
+            start,
+            end,
+            workers,
+        } => analytics::run_pipeline(&data, &output, start, end, workers),
+    };
+    if let Err(e) = res {
         eprintln!("{e}");
         std::process::exit(if e.downcast_ref::<InvalidIngest>().is_some() {
             2
