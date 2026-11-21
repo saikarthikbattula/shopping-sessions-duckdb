@@ -63,13 +63,6 @@ pub struct CampaignDailyRow {
     pub assisted_sessions: i64,
 }
 
-#[derive(Default)]
-struct UserDailyAccumulator {
-    sessions: i64,
-    events: i64,
-    revenue_cents: i64,
-    category_revenue: HashMap<u8, i64>,
-}
 
 #[derive(Default)]
 struct CampaignDailyAccumulator {
@@ -106,9 +99,9 @@ impl CompactId {
     }
 }
 
-// 88-byte compact RawEvent with sentinel fields
+// 72-byte compact RawEvent with 128-bit event ID hash and sentinel fields
 struct RawEvent {
-    event_id: CompactId,
+    eid_hash: u128,
     user_id: CompactId, // len == 0 if None
     ingest_ms: i64,
     ts_ms: i64, // i64::MIN if None
@@ -182,6 +175,12 @@ impl Hasher for FastHasher {
             self.0 = (self.0.wrapping_mul(1099511628211)) ^ u64::from(b);
         }
     }
+    #[inline(always)]
+    fn write_u128(&mut self, i: u128) {
+        let lo = i as u64;
+        let hi = (i >> 64) as u64;
+        self.0 = (self.0.wrapping_mul(1099511628211) ^ lo).wrapping_mul(1099511628211) ^ hi;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -201,6 +200,18 @@ fn get_shard_bytes(key: &[u8]) -> usize {
     let mut hasher = FastBuildHasher.build_hasher();
     hasher.write(key);
     (hasher.finish() as usize) % NUM_SHARDS
+}
+
+#[inline(always)]
+fn hash_event_id_128(bytes: &[u8]) -> (u128, usize) {
+    let mut h1 = 14695981039346656037u64;
+    let mut h2 = 1099511628211u64;
+    for &b in bytes {
+        h1 = (h1.wrapping_mul(1099511628211)) ^ u64::from(b);
+        h2 = (h2.wrapping_mul(14695981039346656037)) ^ u64::from(b);
+    }
+    let shard = (h1 as usize) % NUM_SHARDS;
+    (((h1 as u128) << 64) | (h2 as u128), shard)
 }
 
 pub struct FrozenIdentity {
@@ -397,7 +408,40 @@ fn civil_to_days(y: i64, m: i64, d: i64) -> Option<i64> {
 }
 
 #[inline(always)]
+fn parse_f1_fast(b: &[u8]) -> Option<i64> {
+    if b.len() != 20 {
+        return None;
+    }
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
+        return None;
+    }
+    let d = |i: usize| -> Option<i64> {
+        let c = b[i];
+        if c.is_ascii_digit() {
+            Some((c - b'0') as i64)
+        } else {
+            None
+        }
+    };
+    let y = d(0)? * 1000 + d(1)? * 100 + d(2)? * 10 + d(3)?;
+    let m = d(5)? * 10 + d(6)?;
+    let day = d(8)? * 10 + d(9)?;
+    let h = d(11)? * 10 + d(12)?;
+    let mi = d(14)? * 10 + d(15)?;
+    let s = d(17)? * 10 + d(18)?;
+
+    if h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let days = civil_to_days(y, m, day)?;
+    Some((days * 86400 + h * 3600 + mi * 60 + s) * 1000)
+}
+
+#[inline(always)]
 fn parse_ts_bytes(b: &[u8]) -> Option<i64> {
+    if let Some(ms) = parse_f1_fast(b) {
+        return Some(ms);
+    }
     if b.is_empty() {
         return None;
     }
@@ -707,7 +751,7 @@ pub fn run_pipeline(
 
     let unknown_idx = get_or_insert_category("unknown", &mut category_names, &mut category_to_idx);
 
-    let mut products_map: HashMap<CompactId, u8, FastBuildHasher> = HashMap::with_hasher(FastBuildHasher);
+    let mut products_map: HashMap<Box<[u8]>, u8, FastBuildHasher> = HashMap::with_hasher(FastBuildHasher);
     if data_dir.join("products.csv").exists() {
         let bytes = fs::read(data_dir.join("products.csv"))?;
         let mut fields = [None; 2];
@@ -721,7 +765,7 @@ pub fn run_pipeline(
                 if let (Some(pid), Some(cat)) = (fields[0], fields[1]) {
                     if let Ok(cat_str) = std::str::from_utf8(cat) {
                         let cat_idx = get_or_insert_category(cat_str, &mut category_names, &mut category_to_idx);
-                        products_map.insert(CompactId::from_bytes(pid), cat_idx);
+                        products_map.insert(pid.to_vec().into_boxed_slice(), cat_idx);
                     }
                 }
             }
@@ -800,17 +844,16 @@ pub fn run_pipeline(
                             && (!is_purchase || price_cents.is_some());
 
                         let category_idx = if let Some(pid) = fields[5] {
-                            products_map.get(&CompactId::from_bytes(pid)).copied().unwrap_or(unknown_idx)
+                            products_map.get(pid).copied().unwrap_or(unknown_idx)
                         } else {
                             unknown_idx
                         };
 
-                        let event_id = CompactId::from_bytes(event_id_bytes);
-                        let shard_idx = get_shard_bytes(event_id.as_bytes());
+                        let (eid_hash, shard_idx) = hash_event_id_128(event_id_bytes);
                         let user_id = fields[1].map(CompactId::from_bytes).unwrap_or_default();
 
                         local_shards[shard_idx].push(RawEvent {
-                            event_id,
+                            eid_hash,
                             user_id,
                             ingest_ms,
                             ts_ms: ts_ms_opt.unwrap_or(i64::MIN),
@@ -850,7 +893,7 @@ pub fn run_pipeline(
                 let mut local_person_shards: Vec<Vec<RawPersonEvent>> =
                     (0..NUM_SHARDS).map(|_| Vec::new()).collect();
 
-                let mut dedup_map: HashMap<CompactId, EventDedupEntry, FastBuildHasher> =
+                let mut dedup_map: HashMap<u128, EventDedupEntry, FastBuildHasher> =
                     HashMap::with_capacity_and_hasher(16384, FastBuildHasher);
 
                 for shard_idx in start_shard..end_shard {
@@ -858,7 +901,7 @@ pub fn run_pipeline(
 
                     for worker_shards in worker_event_shards {
                         for ev in &worker_shards[shard_idx] {
-                            match dedup_map.get_mut(&ev.event_id) {
+                            match dedup_map.get_mut(&ev.eid_hash) {
                                 Some(existing) => {
                                     if ev.ingest_ms < existing.ingest_ms {
                                         *existing = EventDedupEntry {
@@ -874,7 +917,7 @@ pub fn run_pipeline(
                                 }
                                 None => {
                                     dedup_map.insert(
-                                        ev.event_id,
+                                        ev.eid_hash,
                                         EventDedupEntry {
                                             ingest_ms: ev.ingest_ms,
                                             user_id: ev.user_id,
@@ -1191,12 +1234,66 @@ fn execute_shard_local(
         }
         let person_clicks = &clicks[cl_start..cl_cursor];
 
-        // Process sessions for this person
-        let mut user_daily_map: HashMap<i32, UserDailyAccumulator> = HashMap::new();
+        // Process sessions for this person with zero-allocation scalar day aggregation
+        let person_name = person_names[p_idx as usize].as_str();
+        let mut curr_day: i32 = -1;
+        let mut day_sessions: i64 = 0;
+        let mut day_events: i64 = 0;
+        let mut day_revenue: i64 = 0;
+        let mut day_has_purchases = false;
+        let mut cat_rev = [0i64; 256];
+
         let mut session_start_idx = 0;
         let mut prev_ts = person_events[0].ts_ms;
         let mut click_left = 0usize;
         let mut click_right = 0usize;
+
+        let flush_day = |day: i32,
+                         sessions: i64,
+                         events: i64,
+                         revenue: i64,
+                         has_purchases: bool,
+                         cat_rev: &[i64; 256],
+                         category_names: &[String],
+                         person_name: &str,
+                         user_rows: &mut Vec<UserDailyRow>| {
+            let top_category = if !has_purchases {
+                None
+            } else {
+                let mut best_cat: Option<u8> = None;
+                let mut best_rev: i64 = 0;
+                for cat in 0..category_names.len() as u8 {
+                    let rev = cat_rev[cat as usize];
+                    if rev > 0 {
+                        match best_cat {
+                            None => {
+                                best_cat = Some(cat);
+                                best_rev = rev;
+                            }
+                            Some(prev) => {
+                                if rev > best_rev
+                                    || (rev == best_rev
+                                        && category_names[cat as usize].as_bytes()
+                                            < category_names[prev as usize].as_bytes())
+                                {
+                                    best_cat = Some(cat);
+                                    best_rev = rev;
+                                }
+                            }
+                        }
+                    }
+                }
+                best_cat.map(|c| category_names[c as usize].clone())
+            };
+            user_rows.push(UserDailyRow {
+                user_id: person_name.to_string(),
+                day,
+                sessions,
+                events,
+                revenue_cents: revenue,
+                top_category,
+            });
+        };
 
         for i in 1..person_events.len() {
             let curr_ts = person_events[i].ts_ms;
@@ -1206,8 +1303,17 @@ fn execute_shard_local(
                     person_clicks,
                     &mut click_left,
                     &mut click_right,
-                    &mut user_daily_map,
+                    &mut curr_day,
+                    &mut day_sessions,
+                    &mut day_events,
+                    &mut day_revenue,
+                    &mut day_has_purchases,
+                    &mut cat_rev,
                     &mut campaign_daily_map,
+                    category_names,
+                    person_name,
+                    &mut user_rows,
+                    &flush_day,
                 );
                 session_start_idx = i;
             }
@@ -1218,35 +1324,31 @@ fn execute_shard_local(
             person_clicks,
             &mut click_left,
             &mut click_right,
-            &mut user_daily_map,
+            &mut curr_day,
+            &mut day_sessions,
+            &mut day_events,
+            &mut day_revenue,
+            &mut day_has_purchases,
+            &mut cat_rev,
             &mut campaign_daily_map,
+            category_names,
+            person_name,
+            &mut user_rows,
+            &flush_day,
         );
 
-        let person_name = person_names[p_idx as usize].as_str();
-
-        for (day, acc) in user_daily_map {
-            let top_category = if acc.category_revenue.is_empty() {
-                None
-            } else {
-                acc.category_revenue
-                    .iter()
-                    .max_by(|(cat_idx_a, rev_a), (cat_idx_b, rev_b)| {
-                        let name_a = &category_names[**cat_idx_a as usize];
-                        let name_b = &category_names[**cat_idx_b as usize];
-                        rev_a
-                            .cmp(rev_b)
-                            .then_with(|| name_b.as_bytes().cmp(name_a.as_bytes()))
-                    })
-                    .map(|(cat_idx, _)| category_names[*cat_idx as usize].clone())
-            };
-            user_rows.push(UserDailyRow {
-                user_id: person_name.to_string(),
-                day,
-                sessions: acc.sessions,
-                events: acc.events,
-                revenue_cents: acc.revenue_cents,
-                top_category,
-            });
+        if curr_day != -1 {
+            flush_day(
+                curr_day,
+                day_sessions,
+                day_events,
+                day_revenue,
+                day_has_purchases,
+                &cat_rev,
+                category_names,
+                person_name,
+                &mut user_rows,
+            );
         }
 
         ev_start = ev_end;
@@ -1261,14 +1363,45 @@ fn process_person_session(
     person_clicks: &[LocalClick],
     click_left: &mut usize,
     click_right: &mut usize,
-    user_daily_map: &mut HashMap<i32, UserDailyAccumulator>,
+    curr_day: &mut i32,
+    day_sessions: &mut i64,
+    day_events: &mut i64,
+    day_revenue: &mut i64,
+    day_has_purchases: &mut bool,
+    cat_rev: &mut [i64; 256],
     campaign_daily_map: &mut HashMap<(u16, i32), CampaignDailyAccumulator>,
+    category_names: &[String],
+    person_name: &str,
+    user_rows: &mut Vec<UserDailyRow>,
+    flush_day: &impl Fn(i32, i64, i64, i64, bool, &[i64; 256], &[String], &str, &mut Vec<UserDailyRow>),
 ) {
     let start_ms = session_events[0].ts_ms;
     let day = epoch_days(start_ms);
 
-    let user_entry = user_daily_map.entry(day).or_default();
-    user_entry.sessions += 1;
+    if *curr_day != day {
+        if *curr_day != -1 {
+            flush_day(
+                *curr_day,
+                *day_sessions,
+                *day_events,
+                *day_revenue,
+                *day_has_purchases,
+                cat_rev,
+                category_names,
+                person_name,
+                user_rows,
+            );
+            cat_rev.fill(0);
+            *day_sessions = 0;
+            *day_events = 0;
+            *day_revenue = 0;
+            *day_has_purchases = false;
+        }
+        *curr_day = day;
+    }
+
+    *day_sessions += 1;
+    *day_events += session_events.len() as i64;
 
     let mut session_revenue = 0i64;
     let mut session_purchases = 0i64;
@@ -1277,11 +1410,11 @@ fn process_person_session(
         if ev.is_purchase {
             session_purchases += 1;
             session_revenue += i64::from(ev.price_cents);
-            *user_entry.category_revenue.entry(ev.cat_idx).or_default() += i64::from(ev.price_cents);
+            cat_rev[ev.cat_idx as usize] += i64::from(ev.price_cents);
+            *day_has_purchases = true;
         }
     }
-    user_entry.events += session_events.len() as i64;
-    user_entry.revenue_cents += session_revenue;
+    *day_revenue += session_revenue;
 
     // Sliding window boundaries:
     // start_ms - 604_800_000 <= ts_ms <= start_ms
