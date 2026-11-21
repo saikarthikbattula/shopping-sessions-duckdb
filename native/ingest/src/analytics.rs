@@ -681,6 +681,7 @@ struct LocalDateCache {
 /// and all 12 digits simultaneously with zero stack spills, and validates the 4-byte tail.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
+#[allow(unsafe_op_in_unsafe_fn)]
 #[inline]
 unsafe fn parse_f1_sse41(b: &[u8], date_cache: &mut LocalDateCache) -> Option<i64> {
     use std::arch::x86_64::*;
@@ -700,9 +701,9 @@ unsafe fn parse_f1_sse41(b: &[u8], date_cache: &mut LocalDateCache) -> Option<i6
     // Digits at positions 0..3 (year), 5..6 (month), 8..9 (day), 11..12 (hour), 14..15 (minute)
     let digit_mask = _mm_setr_epi8(-1, -1, -1, -1, 0, -1, -1, 0, -1, -1, 0, -1, -1, 0, -1, -1);
     let zero_v = _mm_set1_epi8(b'0' as i8);
-    let sub_zero = _mm_sub_epi8(v, zero_v); // wrapping sub: non-digits wrap to > 9
-    let gt9 = _mm_cmpgt_epi8(sub_zero, _mm_set1_epi8(9));
-    let digits_bad = _mm_and_si128(gt9, digit_mask);
+    let sub_zero = _mm_sub_epi8(v, zero_v); // wrapping sub: '0'..='9' -> 0..=9, non-digits -> 10..=255
+    let saturated = _mm_subs_epu8(sub_zero, _mm_set1_epi8(9)); // unsigned saturating sub: 0 if <= 9, > 0 if > 9
+    let digits_bad = _mm_and_si128(saturated, digit_mask);
 
     let any_bad = _mm_or_si128(sep_bad, digits_bad);
     if _mm_testz_si128(any_bad, any_bad) == 0 {
@@ -734,12 +735,12 @@ unsafe fn parse_f1_sse41(b: &[u8], date_cache: &mut LocalDateCache) -> Option<i6
     let days = if p8 == date_cache.p8 && p2 == date_cache.p2 {
         date_cache.days
     } else {
-        let y = (b[0] - b'0') as i64 * 1000
-            + (b[1] - b'0') as i64 * 100
-            + (b[2] - b'0') as i64 * 10
-            + (b[3] - b'0') as i64;
-        let m = (b[5] - b'0') as i64 * 10 + (b[6] - b'0') as i64;
-        let day = (b[8] - b'0') as i64 * 10 + (b[9] - b'0') as i64;
+        let y = (b[0].wrapping_sub(b'0') as i64) * 1000
+            + (b[1].wrapping_sub(b'0') as i64) * 100
+            + (b[2].wrapping_sub(b'0') as i64) * 10
+            + (b[3].wrapping_sub(b'0') as i64);
+        let m = (b[5].wrapping_sub(b'0') as i64) * 10 + (b[6].wrapping_sub(b'0') as i64);
+        let day = (b[8].wrapping_sub(b'0') as i64) * 10 + (b[9].wrapping_sub(b'0') as i64);
         let computed = civil_to_days(y, m, day)?;
         date_cache.p8 = p8;
         date_cache.p2 = p2;
@@ -940,6 +941,7 @@ fn parse_unsigned_bytes(b: Option<&[u8]>, maximum: i64) -> Option<i64> {
 /// Returns (comma_count, has_quote). Comma positions written into `splits`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn csv_scan_avx2(line: &[u8], splits: &mut [usize], max_splits: usize) -> (usize, bool) {
     use std::arch::x86_64::*;
     let comma_v = _mm256_set1_epi8(b',' as i8);
