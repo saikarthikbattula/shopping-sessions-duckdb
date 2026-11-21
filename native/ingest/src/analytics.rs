@@ -729,8 +729,8 @@ unsafe fn parse_f1_sse41(b: &[u8], date_cache: &mut LocalDateCache) -> Option<i6
         return None;
     }
 
-    let p8 = u64::from_le_bytes(b[0..8].try_into().unwrap());
-    let p2 = u16::from_le_bytes(b[8..10].try_into().unwrap());
+    let p8 = _mm_cvtsi128_si64(v) as u64;
+    let p2 = (b.as_ptr().add(8) as *const u16).read_unaligned().to_le();
     let days = if p8 == date_cache.p8 && p2 == date_cache.p2 {
         date_cache.days
     } else {
@@ -773,8 +773,8 @@ fn parse_f1_scalar(b: &[u8], date_cache: &mut LocalDateCache) -> Option<i64> {
         return None;
     }
 
-    let p8 = u64::from_le_bytes(b[0..8].try_into().unwrap());
-    let p2 = u16::from_le_bytes(b[8..10].try_into().unwrap());
+    let p8 = unsafe { (b.as_ptr() as *const u64).read_unaligned().to_le() };
+    let p2 = unsafe { (b.as_ptr().add(8) as *const u16).read_unaligned().to_le() };
     let days = if p8 == date_cache.p8 && p2 == date_cache.p2 {
         date_cache.days
     } else {
@@ -1364,7 +1364,7 @@ pub fn run_pipeline(
         let click_handle = scope.spawn(|| -> Result<(Vec<Vec<Vec<RawPersonClick>>>, u64, f64)> {
             let t_clicks_start = std::time::Instant::now();
             let click_files = list_csv_files(&data_dir.join("clicks"))?;
-            let click_chunks = Arc::new(plan_chunks(&click_files, 8 * 1024 * 1024)?);
+            let click_chunks = Arc::new(plan_chunks(&click_files, 2 * 1024 * 1024)?);
             let next_chunk = Arc::new(AtomicUsize::new(0));
             let cancelled = Arc::new(AtomicBool::new(false));
             let click_workers_count = (workers_count / 2).clamp(1, 4);
@@ -1551,7 +1551,7 @@ pub fn run_pipeline(
         // Event Parsing
         let t_events_parse_start = std::time::Instant::now();
         let event_files = list_csv_files(&data_dir.join("events"))?;
-        let event_chunks = Arc::new(plan_chunks(&event_files, 8 * 1024 * 1024)?);
+        let event_chunks = Arc::new(plan_chunks(&event_files, 2 * 1024 * 1024)?);
         let next_chunk = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
 
