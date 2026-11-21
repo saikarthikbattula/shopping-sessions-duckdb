@@ -16,7 +16,6 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use crate::identity::Identity;
-use crate::parsing;
 use crate::{InvalidIngest, Result};
 
 pub fn epoch_days(ts_ms: i64) -> i32 {
@@ -81,56 +80,85 @@ struct CampaignDailyAccumulator {
     assisted_sessions: i64,
 }
 
-#[derive(Clone)]
-pub struct ValidEvent {
-    pub ts_ms: i64,
-    pub is_purchase: bool,
-    pub price_cents: i64,
-    pub category_idx: u8,
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct CompactId {
+    pub len: u8,
+    pub bytes: [u8; 31],
 }
 
-#[derive(Clone)]
-pub struct ValidClick {
-    pub ts_ms: i64,
-    pub click_id: String,
-    pub campaign_id: String,
+impl CompactId {
+    #[inline(always)]
+    pub fn from_bytes(b: &[u8]) -> Self {
+        let len = b.len().min(31);
+        let mut bytes = [0u8; 31];
+        bytes[..len].copy_from_slice(&b[..len]);
+        CompactId {
+            len: len as u8,
+            bytes,
+        }
+    }
+    #[inline(always)]
+    pub fn as_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.bytes[..self.len as usize]) }
+    }
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
 }
 
 struct RawEvent {
-    event_id: Box<str>,
-    user_id: Option<Box<str>>,
+    event_id: CompactId,
+    user_id: Option<CompactId>,
     ingest_ms: i64,
     ts_ms: Option<i64>,
-    price_cents: i64,
-    category_idx: u8,
+    price_cents: i32,
+    cat_idx: u8,
     is_purchase: bool,
     is_valid: bool,
 }
 
 struct RawClick {
-    click_id: Box<str>,
-    user_id: Box<str>,
-    campaign_id: Box<str>,
+    click_id: CompactId,
+    user_id: CompactId,
+    camp_idx: u16,
     ts_ms: i64,
 }
 
 struct EventDedupEntry {
     ingest_ms: i64,
-    user_id: Option<Box<str>>,
+    user_id: Option<CompactId>,
     ts_ms: Option<i64>,
-    price_cents: i64,
-    category_idx: u8,
+    price_cents: i32,
+    cat_idx: u8,
     is_purchase: bool,
     is_valid: bool,
 }
 
+#[derive(Clone)]
+struct RawPersonEvent {
+    person: CompactId,
+    ts_ms: i64,
+    price_cents: i32,
+    cat_idx: u8,
+    is_purchase: bool,
+}
+
+#[derive(Clone)]
+struct RawPersonClick {
+    person: CompactId,
+    ts_ms: i64,
+    camp_idx: u16,
+    click_id: CompactId,
+}
+
 struct FastHasher(u64);
 impl Hasher for FastHasher {
-    #[inline]
+    #[inline(always)]
     fn finish(&self) -> u64 {
         self.0
     }
-    #[inline]
+    #[inline(always)]
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.0 = (self.0.wrapping_mul(1099511628211)) ^ u64::from(b);
@@ -142,7 +170,7 @@ impl Hasher for FastHasher {
 struct FastBuildHasher;
 impl BuildHasher for FastBuildHasher {
     type Hasher = FastHasher;
-    #[inline]
+    #[inline(always)]
     fn build_hasher(&self) -> FastHasher {
         FastHasher(14695981039346656037)
     }
@@ -150,32 +178,172 @@ impl BuildHasher for FastBuildHasher {
 
 const NUM_SHARDS: usize = 256;
 
-#[inline]
-fn get_shard(key: &str) -> usize {
+#[inline(always)]
+fn get_shard_bytes(key: &[u8]) -> usize {
     let mut hasher = FastBuildHasher.build_hasher();
-    hasher.write(key.as_bytes());
+    hasher.write(key);
     (hasher.finish() as usize) % NUM_SHARDS
 }
 
-fn read_csv_rows(
-    path: &Path,
-    count: usize,
-    mut consume: impl FnMut(&[Option<&str>]) -> Result<()>,
-) -> Result<()> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut buf = Vec::new();
-    reader.read_until(b'\n', &mut buf)?;
-    loop {
-        buf.clear();
-        if reader.read_until(b'\n', &mut buf)? == 0 {
-            break;
+#[inline(always)]
+fn civil_to_days(y: i64, m: i64, d: i64) -> Option<i64> {
+    if y == 0 || !(1..=12).contains(&m) {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    if d < 1 || d > mdays[(m - 1) as usize] {
+        return None;
+    }
+    let prior = y - 1;
+    let ordinal = 365 * prior + prior / 4 - prior / 100
+        + prior / 400
+        + mdays[..(m - 1) as usize].iter().sum::<i64>()
+        + d;
+    Some(ordinal - 719163)
+}
+
+#[inline(always)]
+fn parse_ts_bytes(b: &[u8]) -> Option<i64> {
+    if b.is_empty() {
+        return None;
+    }
+    if b.iter().all(u8::is_ascii_digit) {
+        let mut n = 0i64;
+        for &c in b {
+            n = n.checked_mul(10)?.checked_add(i64::from(c - b'0'))?;
         }
-        let text = std::str::from_utf8(&buf)?;
-        if let Some(row) = parsing::line(text, count) {
-            consume(&row)?;
+        return Some(n);
+    }
+    if b.len() != 20 && b.len() != 25 {
+        return None;
+    }
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let number = |a: usize, z: usize| -> Option<i64> {
+        let mut n = 0i64;
+        for &v in &b[a..z] {
+            if !v.is_ascii_digit() {
+                return None;
+            }
+            n = n * 10 + i64::from(v - b'0');
+        }
+        Some(n)
+    };
+    let y = number(0, 4)?;
+    let m = number(5, 7)?;
+    let d = number(8, 10)?;
+    let h = number(11, 13)?;
+    let mi = number(14, 16)?;
+    let se = number(17, 19)?;
+    if h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    let offset_min = if b.len() == 20 {
+        if b[19] != b'Z' {
+            return None;
+        }
+        0
+    } else {
+        if (b[19] != b'+' && b[19] != b'-') || b[22] != b':' {
+            return None;
+        }
+        let (oh, om) = (number(20, 22)?, number(23, 25)?);
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        (oh * 60 + om) * if b[19] == b'+' { 1 } else { -1 }
+    };
+    let days = civil_to_days(y, m, d)?;
+    Some((days * 86400 + h * 3600 + mi * 60 + se - offset_min * 60) * 1000)
+}
+
+#[inline(always)]
+fn parse_window_ts_bytes(b: Option<&[u8]>, start: i128, end: i128) -> Option<i64> {
+    let ts = parse_ts_bytes(b?)?;
+    let ts_i128 = i128::from(ts);
+    if ts_i128 >= start && ts_i128 < end {
+        Some(ts)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn parse_unsigned_bytes(b: Option<&[u8]>, maximum: i64) -> Option<i64> {
+    let s = b?;
+    if s.is_empty() {
+        return None;
+    }
+    let mut n = 0i64;
+    for &c in s {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add(i64::from(c - b'0'))?;
+        if n > maximum {
+            return None;
         }
     }
-    Ok(())
+    Some(n)
+}
+
+#[inline(always)]
+fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [u8]>; N]) -> bool {
+    let line = if !line.is_empty() && line[line.len() - 1] == b'\n' {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    if line.is_empty() {
+        return false;
+    }
+
+    let mut count = 0;
+    let mut start = 0;
+    let len = line.len();
+
+    while start <= len {
+        if count >= N {
+            return false;
+        }
+        let mut end = start;
+        while end < len && line[end] != b',' {
+            end += 1;
+        }
+        let raw = &line[start..end];
+        let val = if raw.is_empty() {
+            None
+        } else if raw[0] == b'"' {
+            if raw.len() >= 2 && raw[raw.len() - 1] == b'"' {
+                let inner = &raw[1..raw.len() - 1];
+                if inner.contains(&b'"') {
+                    return false;
+                }
+                if inner.is_empty() { None } else { Some(inner) }
+            } else {
+                return false;
+            }
+        } else {
+            if raw.contains(&b'"') {
+                return false;
+            }
+            Some(raw)
+        };
+        fields[count] = val;
+        count += 1;
+        if end == len {
+            break;
+        }
+        start = end + 1;
+    }
+
+    count == N
 }
 
 fn list_csv_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -230,16 +398,17 @@ fn plan_chunks(paths: &[PathBuf], size: u64) -> Result<Vec<Chunk>> {
     Ok(result)
 }
 
-fn parse_chunk_rows(
+fn for_each_chunk_line(
     chunk: &Chunk,
-    count: usize,
     cancelled: &AtomicBool,
-    mut consume: impl FnMut(&[Option<&str>]) -> Result<()>,
+    mut consume: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
-    let mut reader = BufReader::new(File::open(&chunk.path)?);
-    reader.seek(SeekFrom::Start(chunk.start))?;
+    let mut file = File::open(&chunk.path)?;
+    file.seek(SeekFrom::Start(chunk.start))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut position = chunk.start;
     let mut buffer = Vec::new();
+
     while position < chunk.end && !cancelled.load(Ordering::Relaxed) {
         buffer.clear();
         let read = reader.read_until(b'\n', &mut buffer)?;
@@ -247,9 +416,7 @@ fn parse_chunk_rows(
             return Err("input changed or was truncated while parsing".into());
         }
         position += read as u64;
-        if let Some(row) = parsing::line(std::str::from_utf8(&buffer)?, count) {
-            consume(&row)?;
-        }
+        consume(&buffer)?;
     }
     Ok(())
 }
@@ -275,8 +442,8 @@ pub fn run_pipeline(
             let e_str = manifest["window_end"]
                 .as_str()
                 .ok_or("manifest missing window_end")?;
-            let s = parsing::timestamp(Some(s_str)).ok_or("invalid manifest window_start")?;
-            let e = parsing::timestamp(Some(e_str)).ok_or("invalid manifest window_end")?;
+            let s = parse_ts_bytes(s_str.as_bytes()).ok_or("invalid manifest window_start")?;
+            let e = parse_ts_bytes(e_str.as_bytes()).ok_or("invalid manifest window_end")?;
             (s, e)
         }
     };
@@ -287,10 +454,17 @@ pub fn run_pipeline(
     // 2. Identity resolution from links/
     let mut ids = Identity::default();
     for file in list_csv_files(&data_dir.join("links"))? {
-        read_csv_rows(&file, 2, |r| {
-            ids.union(r[0], r[1]);
-            Ok(())
-        })?;
+        let bytes = fs::read(&file)?;
+        let mut fields = [None; 2];
+        for line in bytes.split(|&b| b == b'\n') {
+            if parse_csv_line(line, &mut fields) {
+                if let (Some(a), Some(b)) = (fields[0], fields[1]) {
+                    if let (Ok(sa), Ok(sb)) = (std::str::from_utf8(a), std::str::from_utf8(b)) {
+                        ids.union(Some(sa), Some(sb));
+                    }
+                }
+            }
+        }
     }
     let ids = ids.freeze();
 
@@ -311,28 +485,51 @@ pub fn run_pipeline(
 
     let unknown_idx = get_or_insert_category("unknown", &mut category_names, &mut category_to_idx);
 
-    let mut products_map: HashMap<String, u8> = HashMap::new();
+    let mut products_map: HashMap<CompactId, u8, FastBuildHasher> = HashMap::with_hasher(FastBuildHasher);
     if data_dir.join("products.csv").exists() {
-        read_csv_rows(&data_dir.join("products.csv"), 2, |r| {
-            if let (Some(pid), Some(cat)) = (r[0], r[1]) {
-                let cat_idx = get_or_insert_category(cat, &mut category_names, &mut category_to_idx);
-                products_map.insert(pid.to_string(), cat_idx);
+        let bytes = fs::read(data_dir.join("products.csv"))?;
+        let mut fields = [None; 2];
+        let mut first = true;
+        for line in bytes.split(|&b| b == b'\n') {
+            if first {
+                first = false;
+                continue;
             }
-            Ok(())
-        })?;
+            if parse_csv_line(line, &mut fields) {
+                if let (Some(pid), Some(cat)) = (fields[0], fields[1]) {
+                    if let Ok(cat_str) = std::str::from_utf8(cat) {
+                        let cat_idx = get_or_insert_category(cat_str, &mut category_names, &mut category_to_idx);
+                        products_map.insert(CompactId::from_bytes(pid), cat_idx);
+                    }
+                }
+            }
+        }
     }
 
-    // 4. Campaigns lookup: campaign_id -> channel
-    let mut campaign_channels: HashMap<String, String> = HashMap::new();
-    let mut valid_campaigns: HashSet<String> = HashSet::new();
+    // 4. Campaigns lookup: campaign_id -> camp_idx
+    let mut campaign_names = Vec::new();
+    let mut campaign_channels = Vec::new();
+    let mut campaign_to_idx: HashMap<CompactId, u16, FastBuildHasher> = HashMap::with_hasher(FastBuildHasher);
+
     if data_dir.join("campaigns.csv").exists() {
-        read_csv_rows(&data_dir.join("campaigns.csv"), 2, |r| {
-            if let (Some(cid), Some(chan)) = (r[0], r[1]) {
-                campaign_channels.insert(cid.to_string(), chan.to_string());
-                valid_campaigns.insert(cid.to_string());
+        let bytes = fs::read(data_dir.join("campaigns.csv"))?;
+        let mut fields = [None; 2];
+        let mut first = true;
+        for line in bytes.split(|&b| b == b'\n') {
+            if first {
+                first = false;
+                continue;
             }
-            Ok(())
-        })?;
+            if parse_csv_line(line, &mut fields) {
+                if let (Some(cid), Some(chan)) = (fields[0], fields[1]) {
+                    let compact_cid = CompactId::from_bytes(cid);
+                    let idx = campaign_names.len() as u16;
+                    campaign_names.push(compact_cid);
+                    campaign_channels.push(std::str::from_utf8(chan).unwrap_or("").to_string());
+                    campaign_to_idx.insert(compact_cid, idx);
+                }
+            }
+        }
     }
 
     // 5. Parallel Lock-Free Parsing of Events into Worker-Local Shards
@@ -351,44 +548,48 @@ pub fn run_pipeline(
 
             handles.push(scope.spawn(move || -> Result<Vec<Vec<RawEvent>>> {
                 let mut local_shards: Vec<Vec<RawEvent>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-
                 while !cancelled.load(Ordering::Relaxed) {
                     let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
                     let Some(chunk) = event_chunks.get(idx) else {
                         break;
                     };
-                    parse_chunk_rows(chunk, 7, &cancelled, |r| {
-                        let Some(event_id) = r[0] else {
+                    for_each_chunk_line(chunk, &cancelled, |line| {
+                        let mut fields = [None; 7];
+                        if !parse_csv_line(line, &mut fields) {
+                            return Ok(());
+                        }
+                        let Some(event_id_bytes) = fields[0] else {
                             return Ok(());
                         };
-                        let ingest_ms = parsing::timestamp(r[3]).ok_or(InvalidIngest)?;
-                        let ts_ms = parsing::window(r[2], i128::from(window_start), i128::from(window_end));
-                        let is_purchase = r[4] == Some("purchase");
+                        let ingest_ms = parse_ts_bytes(fields[3].unwrap_or(&[])).ok_or(InvalidIngest)?;
+                        let ts_ms = parse_window_ts_bytes(fields[2], i128::from(window_start), i128::from(window_end));
+                        let is_purchase = fields[4] == Some(b"purchase");
                         let price_cents = if is_purchase {
-                            parsing::unsigned(r[6], 10000000).filter(|v| *v > 0)
+                            parse_unsigned_bytes(fields[6], 10000000).filter(|v| *v > 0)
                         } else {
                             None
                         };
-                        let is_valid = r[1].is_some()
+                        let is_valid = fields[1].is_some()
                             && ts_ms.is_some()
-                            && r[5].is_some()
-                            && matches!(r[4], Some("view" | "cart" | "purchase"))
+                            && fields[5].is_some()
+                            && matches!(fields[4], Some(b"view" | b"cart" | b"purchase"))
                             && (!is_purchase || price_cents.is_some());
 
-                        let category_idx = if let Some(pid) = r[5] {
-                            products_map.get(pid).copied().unwrap_or(unknown_idx)
+                        let category_idx = if let Some(pid) = fields[5] {
+                            products_map.get(&CompactId::from_bytes(pid)).copied().unwrap_or(unknown_idx)
                         } else {
                             unknown_idx
                         };
 
-                        let shard_idx = get_shard(event_id);
+                        let event_id = CompactId::from_bytes(event_id_bytes);
+                        let shard_idx = get_shard_bytes(event_id.as_bytes());
                         local_shards[shard_idx].push(RawEvent {
-                            event_id: Box::from(event_id),
-                            user_id: r[1].map(Box::from),
+                            event_id,
+                            user_id: fields[1].map(CompactId::from_bytes),
                             ingest_ms,
                             ts_ms,
-                            price_cents: price_cents.unwrap_or(0),
-                            category_idx,
+                            price_cents: price_cents.unwrap_or(0) as i32,
+                            cat_idx: category_idx,
                             is_purchase,
                             is_valid,
                         });
@@ -406,7 +607,7 @@ pub fn run_pipeline(
     })?;
 
     // 6. Lock-Free Parallel Deduplication of Events and Routing to Person Shards
-    let worker_person_events: Vec<Vec<Vec<(String, ValidEvent)>>> = std::thread::scope(|scope| {
+    let worker_person_events: Vec<Vec<Vec<RawPersonEvent>>> = std::thread::scope(|scope| {
         let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
         let mut handles = Vec::new();
         let worker_event_shards = &worker_event_shards;
@@ -416,11 +617,11 @@ pub fn run_pipeline(
             let start_shard = worker_idx * shards_per_worker;
             let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
 
-            handles.push(scope.spawn(move || -> Vec<Vec<(String, ValidEvent)>> {
-                let mut local_person_shards: Vec<Vec<(String, ValidEvent)>> =
+            handles.push(scope.spawn(move || -> Vec<Vec<RawPersonEvent>> {
+                let mut local_person_shards: Vec<Vec<RawPersonEvent>> =
                     (0..NUM_SHARDS).map(|_| Vec::new()).collect();
 
-                let mut dedup_map: HashMap<Box<str>, EventDedupEntry, FastBuildHasher> =
+                let mut dedup_map: HashMap<CompactId, EventDedupEntry, FastBuildHasher> =
                     HashMap::with_hasher(FastBuildHasher);
 
                 for shard_idx in start_shard..end_shard {
@@ -433,10 +634,10 @@ pub fn run_pipeline(
                                     if ev.ingest_ms < existing.ingest_ms {
                                         *existing = EventDedupEntry {
                                             ingest_ms: ev.ingest_ms,
-                                            user_id: ev.user_id.clone(),
+                                            user_id: ev.user_id,
                                             ts_ms: ev.ts_ms,
                                             price_cents: ev.price_cents,
-                                            category_idx: ev.category_idx,
+                                            cat_idx: ev.cat_idx,
                                             is_purchase: ev.is_purchase,
                                             is_valid: ev.is_valid,
                                         };
@@ -444,13 +645,13 @@ pub fn run_pipeline(
                                 }
                                 None => {
                                     dedup_map.insert(
-                                        ev.event_id.clone(),
+                                        ev.event_id,
                                         EventDedupEntry {
                                             ingest_ms: ev.ingest_ms,
-                                            user_id: ev.user_id.clone(),
+                                            user_id: ev.user_id,
                                             ts_ms: ev.ts_ms,
                                             price_cents: ev.price_cents,
-                                            category_idx: ev.category_idx,
+                                            cat_idx: ev.cat_idx,
                                             is_purchase: ev.is_purchase,
                                             is_valid: ev.is_valid,
                                         },
@@ -464,18 +665,19 @@ pub fn run_pipeline(
                         if entry.is_valid {
                             let ts = entry.ts_ms.unwrap();
                             if entry.ingest_ms - ts <= 86_400_000 {
-                                let user = entry.user_id.as_deref().unwrap();
-                                let person_id = ids.get(user).map_or_else(|| user.to_string(), String::clone);
-                                let p_shard = get_shard(&person_id);
-                                local_person_shards[p_shard].push((
-                                    person_id,
-                                    ValidEvent {
-                                        ts_ms: ts,
-                                        is_purchase: entry.is_purchase,
-                                        price_cents: entry.price_cents,
-                                        category_idx: entry.category_idx,
-                                    },
-                                ));
+                                let user = entry.user_id.unwrap();
+                                let person_compact = match ids.get(user.as_str()) {
+                                    Some(canonical) => CompactId::from_bytes(canonical.as_bytes()),
+                                    None => user,
+                                };
+                                let p_shard = get_shard_bytes(person_compact.as_bytes());
+                                local_person_shards[p_shard].push(RawPersonEvent {
+                                    person: person_compact,
+                                    ts_ms: ts,
+                                    price_cents: entry.price_cents,
+                                    cat_idx: entry.cat_idx,
+                                    is_purchase: entry.is_purchase,
+                                });
                             }
                         }
                     }
@@ -498,35 +700,38 @@ pub fn run_pipeline(
             let click_chunks = Arc::clone(&click_chunks);
             let next_chunk = Arc::clone(&next_chunk);
             let cancelled = Arc::clone(&cancelled);
-            let valid_campaigns = &valid_campaigns;
+            let campaign_to_idx = &campaign_to_idx;
 
             handles.push(scope.spawn(move || -> Result<Vec<Vec<RawClick>>> {
                 let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-
                 while !cancelled.load(Ordering::Relaxed) {
                     let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
                     let Some(chunk) = click_chunks.get(idx) else {
                         break;
                     };
-                    parse_chunk_rows(chunk, 4, &cancelled, |r| {
-                        let Some(click_id) = r[0] else {
+                    for_each_chunk_line(chunk, &cancelled, |line| {
+                        let mut fields = [None; 4];
+                        if !parse_csv_line(line, &mut fields) {
+                            return Ok(());
+                        }
+                        let Some(click_id_bytes) = fields[0] else {
                             return Ok(());
                         };
-                        let ts_ms = parsing::window(
-                            r[3],
+                        let ts_ms = parse_window_ts_bytes(
+                            fields[3],
                             i128::from(window_start) - 604_800_000,
                             i128::from(window_end),
                         );
-                        let is_valid = r[1].is_some()
-                            && ts_ms.is_some()
-                            && r[2].is_some_and(|c| valid_campaigns.contains(c));
+                        let camp_idx_opt = fields[2].and_then(|c| campaign_to_idx.get(&CompactId::from_bytes(c)).copied());
+                        let is_valid = fields[1].is_some() && ts_ms.is_some() && camp_idx_opt.is_some();
 
                         if is_valid {
-                            let shard_idx = get_shard(click_id);
+                            let click_id = CompactId::from_bytes(click_id_bytes);
+                            let shard_idx = get_shard_bytes(click_id.as_bytes());
                             local_shards[shard_idx].push(RawClick {
-                                click_id: Box::from(click_id),
-                                user_id: Box::from(r[1].unwrap()),
-                                campaign_id: Box::from(r[2].unwrap()),
+                                click_id,
+                                user_id: CompactId::from_bytes(fields[1].unwrap()),
+                                camp_idx: camp_idx_opt.unwrap(),
                                 ts_ms: ts_ms.unwrap(),
                             });
                         }
@@ -544,7 +749,7 @@ pub fn run_pipeline(
     })?;
 
     // 8. Lock-Free Parallel Deduplication of Clicks and Routing to Person Shards
-    let worker_person_clicks: Vec<Vec<Vec<(String, ValidClick)>>> = std::thread::scope(|scope| {
+    let worker_person_clicks: Vec<Vec<Vec<RawPersonClick>>> = std::thread::scope(|scope| {
         let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
         let mut handles = Vec::new();
         let worker_click_shards = &worker_click_shards;
@@ -554,28 +759,29 @@ pub fn run_pipeline(
             let start_shard = worker_idx * shards_per_worker;
             let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
 
-            handles.push(scope.spawn(move || -> Vec<Vec<(String, ValidClick)>> {
-                let mut local_person_shards: Vec<Vec<(String, ValidClick)>> =
+            handles.push(scope.spawn(move || -> Vec<Vec<RawPersonClick>> {
+                let mut local_person_shards: Vec<Vec<RawPersonClick>> =
                     (0..NUM_SHARDS).map(|_| Vec::new()).collect();
 
-                let mut seen_clicks: HashSet<Box<str>, FastBuildHasher> = HashSet::with_hasher(FastBuildHasher);
+                let mut seen_clicks: HashSet<CompactId, FastBuildHasher> = HashSet::with_hasher(FastBuildHasher);
 
                 for shard_idx in start_shard..end_shard {
                     seen_clicks.clear();
 
                     for worker_shards in worker_click_shards {
                         for cl in &worker_shards[shard_idx] {
-                            if seen_clicks.insert(cl.click_id.clone()) {
-                                let person_id = ids.get(cl.user_id.as_ref()).map_or_else(|| cl.user_id.to_string(), String::clone);
-                                let p_shard = get_shard(&person_id);
-                                local_person_shards[p_shard].push((
-                                    person_id,
-                                    ValidClick {
-                                        ts_ms: cl.ts_ms,
-                                        click_id: cl.click_id.to_string(),
-                                        campaign_id: cl.campaign_id.to_string(),
-                                    },
-                                ));
+                            if seen_clicks.insert(cl.click_id) {
+                                let person_compact = match ids.get(cl.user_id.as_str()) {
+                                    Some(canonical) => CompactId::from_bytes(canonical.as_bytes()),
+                                    None => cl.user_id,
+                                };
+                                let p_shard = get_shard_bytes(person_compact.as_bytes());
+                                local_person_shards[p_shard].push(RawPersonClick {
+                                    person: person_compact,
+                                    ts_ms: cl.ts_ms,
+                                    camp_idx: cl.camp_idx,
+                                    click_id: cl.click_id,
+                                });
                             }
                         }
                     }
@@ -587,7 +793,7 @@ pub fn run_pipeline(
     });
 
     // 9. Parallel Execution of Analytics across Person Shards
-    let partial_results: Vec<(Vec<UserDailyRow>, HashMap<(String, i32), CampaignDailyAccumulator>)> =
+    let partial_results: Vec<(Vec<UserDailyRow>, HashMap<(u16, i32), CampaignDailyAccumulator>)> =
         std::thread::scope(|scope| {
             let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
             let mut handles = Vec::new();
@@ -601,25 +807,24 @@ pub fn run_pipeline(
 
                 handles.push(scope.spawn(move || {
                     let mut user_rows = Vec::new();
-                    let mut campaign_daily_map: HashMap<(String, i32), CampaignDailyAccumulator> = HashMap::new();
+                    let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
 
                     for shard_idx in start_shard..end_shard {
-                        let mut person_events: HashMap<String, Vec<ValidEvent>> = HashMap::new();
-                        let mut person_clicks: HashMap<String, Vec<ValidClick>> = HashMap::new();
+                        let mut total_events = Vec::new();
+                        let mut total_clicks = Vec::new();
 
                         for w_events in worker_person_events {
-                            for (p, ev) in &w_events[shard_idx] {
-                                person_events.entry(p.clone()).or_default().push(ev.clone());
-                            }
+                            total_events.extend_from_slice(&w_events[shard_idx]);
                         }
-
                         for w_clicks in worker_person_clicks {
-                            for (p, cl) in &w_clicks[shard_idx] {
-                                person_clicks.entry(p.clone()).or_default().push(cl.clone());
-                            }
+                            total_clicks.extend_from_slice(&w_clicks[shard_idx]);
                         }
 
-                        let (u_part, c_part) = execute_shard(person_events, person_clicks, category_names);
+                        // Parallel-friendly sort
+                        total_events.sort_unstable_by(|a, b| (a.person.as_bytes(), a.ts_ms).cmp(&(b.person.as_bytes(), b.ts_ms)));
+                        total_clicks.sort_unstable_by(|a, b| (a.person.as_bytes(), a.ts_ms, a.click_id.as_bytes()).cmp(&(b.person.as_bytes(), b.ts_ms, b.click_id.as_bytes())));
+
+                        let (u_part, c_part) = execute_sorted_shard(&total_events, &total_clicks, category_names);
                         user_rows.extend(u_part);
                         for (k, acc) in c_part {
                             let entry = campaign_daily_map.entry(k).or_default();
@@ -637,7 +842,7 @@ pub fn run_pipeline(
 
     // Combine user rows and merge campaign accumulators
     let mut total_user_rows = Vec::new();
-    let mut merged_campaign_map: HashMap<(String, i32), CampaignDailyAccumulator> = HashMap::new();
+    let mut merged_campaign_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
 
     for (u_rows, c_map) in partial_results {
         total_user_rows.extend(u_rows);
@@ -651,15 +856,15 @@ pub fn run_pipeline(
     }
 
     // Format CampaignDaily rows
+    let organic_camp_idx = u16::MAX;
     let mut campaign_rows = Vec::with_capacity(merged_campaign_map.len());
-    for ((campaign_id, day), acc) in merged_campaign_map {
-        let channel = if campaign_id == "organic" {
-            "organic".to_string()
+    for ((camp_idx, day), acc) in merged_campaign_map {
+        let (campaign_id, channel) = if camp_idx == organic_camp_idx {
+            ("organic".to_string(), "organic".to_string())
         } else {
-            campaign_channels
-                .get(&campaign_id)
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string())
+            let cid = campaign_names[camp_idx as usize].as_str().to_string();
+            let chan = campaign_channels[camp_idx as usize].clone();
+            (cid, chan)
         };
         campaign_rows.push(CampaignDailyRow {
             campaign_id,
@@ -679,45 +884,48 @@ pub fn run_pipeline(
     Ok(())
 }
 
-fn execute_shard(
-    person_events: HashMap<String, Vec<ValidEvent>>,
-    person_clicks: HashMap<String, Vec<ValidClick>>,
+fn execute_sorted_shard(
+    events: &[RawPersonEvent],
+    clicks: &[RawPersonClick],
     category_names: &[String],
-) -> (Vec<UserDailyRow>, HashMap<(String, i32), CampaignDailyAccumulator>) {
-    let mut user_daily_map: HashMap<(String, i32), UserDailyAccumulator> = HashMap::new();
-    let mut campaign_daily_map: HashMap<(String, i32), CampaignDailyAccumulator> = HashMap::new();
+) -> (Vec<UserDailyRow>, HashMap<(u16, i32), CampaignDailyAccumulator>) {
+    let mut user_rows = Vec::new();
+    let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
 
-    for (person, events) in person_events {
-        if events.is_empty() {
-            continue;
+    let mut ev_start = 0;
+    let mut cl_cursor = 0;
+
+    while ev_start < events.len() {
+        let person = events[ev_start].person;
+        let mut ev_end = ev_start + 1;
+        while ev_end < events.len() && events[ev_end].person == person {
+            ev_end += 1;
         }
+        let person_events = &events[ev_start..ev_end];
 
-        let mut sorted_events = events;
-        sorted_events.sort_unstable_by_key(|e| e.ts_ms);
+        // Advance click cursor to this person
+        while cl_cursor < clicks.len() && clicks[cl_cursor].person.as_bytes() < person.as_bytes() {
+            cl_cursor += 1;
+        }
+        let cl_start = cl_cursor;
+        while cl_cursor < clicks.len() && clicks[cl_cursor].person == person {
+            cl_cursor += 1;
+        }
+        let person_clicks = &clicks[cl_start..cl_cursor];
 
-        let clicks = person_clicks.get(&person);
-        let mut sorted_clicks: Vec<&ValidClick> = match clicks {
-            Some(c) => c.iter().collect(),
-            None => Vec::new(),
-        };
-        sorted_clicks.sort_unstable_by(|a, b| {
-            a.ts_ms
-                .cmp(&b.ts_ms)
-                .then_with(|| a.click_id.as_bytes().cmp(b.click_id.as_bytes()))
-        });
-
+        // Process sessions for this person
+        let mut user_daily_map: HashMap<i32, UserDailyAccumulator> = HashMap::new();
         let mut session_start_idx = 0;
-        let mut prev_ts = sorted_events[0].ts_ms;
+        let mut prev_ts = person_events[0].ts_ms;
         let mut click_left = 0usize;
         let mut click_right = 0usize;
 
-        for i in 1..sorted_events.len() {
-            let curr_ts = sorted_events[i].ts_ms;
+        for i in 1..person_events.len() {
+            let curr_ts = person_events[i].ts_ms;
             if curr_ts - prev_ts > 1_800_000 {
-                process_session_sliding(
-                    &person,
-                    &sorted_events[session_start_idx..i],
-                    &sorted_clicks,
+                process_person_session(
+                    &person_events[session_start_idx..i],
+                    person_clicks,
                     &mut click_left,
                     &mut click_right,
                     &mut user_daily_map,
@@ -727,62 +935,59 @@ fn execute_shard(
             }
             prev_ts = curr_ts;
         }
-        process_session_sliding(
-            &person,
-            &sorted_events[session_start_idx..],
-            &sorted_clicks,
+        process_person_session(
+            &person_events[session_start_idx..],
+            person_clicks,
             &mut click_left,
             &mut click_right,
             &mut user_daily_map,
             &mut campaign_daily_map,
         );
-    }
 
-    let mut user_rows = Vec::with_capacity(user_daily_map.len());
-    for ((user_id, day), acc) in user_daily_map {
-        let top_category = if acc.category_revenue.is_empty() {
-            None
-        } else {
-            acc.category_revenue
-                .iter()
-                .max_by(|(cat_idx_a, rev_a), (cat_idx_b, rev_b)| {
-                    let name_a = &category_names[**cat_idx_a as usize];
-                    let name_b = &category_names[**cat_idx_b as usize];
-                    rev_a
-                        .cmp(rev_b)
-                        .then_with(|| name_b.as_bytes().cmp(name_a.as_bytes()))
-                })
-                .map(|(cat_idx, _)| category_names[*cat_idx as usize].clone())
-        };
-        user_rows.push(UserDailyRow {
-            user_id,
-            day,
-            sessions: acc.sessions,
-            events: acc.events,
-            revenue_cents: acc.revenue_cents,
-            top_category,
-        });
+        for (day, acc) in user_daily_map {
+            let top_category = if acc.category_revenue.is_empty() {
+                None
+            } else {
+                acc.category_revenue
+                    .iter()
+                    .max_by(|(cat_idx_a, rev_a), (cat_idx_b, rev_b)| {
+                        let name_a = &category_names[**cat_idx_a as usize];
+                        let name_b = &category_names[**cat_idx_b as usize];
+                        rev_a
+                            .cmp(rev_b)
+                            .then_with(|| name_b.as_bytes().cmp(name_a.as_bytes()))
+                    })
+                    .map(|(cat_idx, _)| category_names[*cat_idx as usize].clone())
+            };
+            user_rows.push(UserDailyRow {
+                user_id: person.as_str().to_string(),
+                day,
+                sessions: acc.sessions,
+                events: acc.events,
+                revenue_cents: acc.revenue_cents,
+                top_category,
+            });
+        }
+
+        ev_start = ev_end;
     }
 
     (user_rows, campaign_daily_map)
 }
 
-#[inline]
-fn process_session_sliding(
-    person: &str,
-    session_events: &[ValidEvent],
-    sorted_clicks: &[&ValidClick],
+#[inline(always)]
+fn process_person_session(
+    session_events: &[RawPersonEvent],
+    person_clicks: &[RawPersonClick],
     click_left: &mut usize,
     click_right: &mut usize,
-    user_daily_map: &mut HashMap<(String, i32), UserDailyAccumulator>,
-    campaign_daily_map: &mut HashMap<(String, i32), CampaignDailyAccumulator>,
+    user_daily_map: &mut HashMap<i32, UserDailyAccumulator>,
+    campaign_daily_map: &mut HashMap<(u16, i32), CampaignDailyAccumulator>,
 ) {
     let start_ms = session_events[0].ts_ms;
     let day = epoch_days(start_ms);
 
-    let user_entry = user_daily_map
-        .entry((person.to_string(), day))
-        .or_default();
+    let user_entry = user_daily_map.entry(day).or_default();
     user_entry.sessions += 1;
 
     let mut session_revenue = 0i64;
@@ -791,47 +996,43 @@ fn process_session_sliding(
     for ev in session_events {
         if ev.is_purchase {
             session_purchases += 1;
-            session_revenue += ev.price_cents;
-            *user_entry.category_revenue.entry(ev.category_idx).or_default() += ev.price_cents;
+            session_revenue += i64::from(ev.price_cents);
+            *user_entry.category_revenue.entry(ev.cat_idx).or_default() += i64::from(ev.price_cents);
         }
     }
     user_entry.events += session_events.len() as i64;
     user_entry.revenue_cents += session_revenue;
 
     // Sliding window boundaries:
-    // eligible clicks have: start_ms - 604_800_000 <= ts_ms <= start_ms
+    // start_ms - 604_800_000 <= ts_ms <= start_ms
     let window_start = start_ms.saturating_sub(604_800_000);
 
-    while *click_right < sorted_clicks.len() && sorted_clicks[*click_right].ts_ms <= start_ms {
+    while *click_right < person_clicks.len() && person_clicks[*click_right].ts_ms <= start_ms {
         *click_right += 1;
     }
-    while *click_left < *click_right && sorted_clicks[*click_left].ts_ms < window_start {
+    while *click_left < *click_right && person_clicks[*click_left].ts_ms < window_start {
         *click_left += 1;
     }
 
     let left = *click_left;
     let right = *click_right;
 
-    let winner = if left < right {
-        let max_ts = sorted_clicks[right - 1].ts_ms;
-        let mut best = sorted_clicks[right - 1];
+    let winning_camp_idx = if left < right {
+        let max_ts = person_clicks[right - 1].ts_ms;
+        let mut best = &person_clicks[right - 1];
         let mut idx = right - 1;
-        while idx > left && sorted_clicks[idx - 1].ts_ms == max_ts {
+        while idx > left && person_clicks[idx - 1].ts_ms == max_ts {
             idx -= 1;
-            if sorted_clicks[idx].click_id.as_bytes() < best.click_id.as_bytes() {
-                best = sorted_clicks[idx];
+            if person_clicks[idx].click_id.as_bytes() < best.click_id.as_bytes() {
+                best = &person_clicks[idx];
             }
         }
-        Some(best)
+        best.camp_idx
     } else {
-        None
+        u16::MAX // organic
     };
 
-    let winning_campaign = winner.map_or("organic", |w| w.campaign_id.as_str());
-
-    let credited_entry = campaign_daily_map
-        .entry((winning_campaign.to_string(), day))
-        .or_default();
+    let credited_entry = campaign_daily_map.entry((winning_camp_idx, day)).or_default();
     credited_entry.sessions += 1;
     if session_purchases > 0 {
         credited_entry.purchasing_sessions += 1;
@@ -841,27 +1042,23 @@ fn process_session_sliding(
     if left < right {
         let count = right - left;
         if count <= 8 {
-            let mut seen: [&str; 8] = [""; 8];
+            let mut seen: [u16; 8] = [0; 8];
             let mut seen_len = 0;
             for i in left..right {
-                let camp = sorted_clicks[i].campaign_id.as_str();
-                if camp != "organic" && !seen[..seen_len].contains(&camp) {
+                let camp = person_clicks[i].camp_idx;
+                if !seen[..seen_len].contains(&camp) {
                     seen[seen_len] = camp;
                     seen_len += 1;
-                    let assist_entry = campaign_daily_map
-                        .entry((camp.to_string(), day))
-                        .or_default();
+                    let assist_entry = campaign_daily_map.entry((camp, day)).or_default();
                     assist_entry.assisted_sessions += 1;
                 }
             }
         } else {
-            let mut seen: HashSet<&str> = HashSet::new();
+            let mut seen: HashSet<u16, FastBuildHasher> = HashSet::with_hasher(FastBuildHasher);
             for i in left..right {
-                let camp = sorted_clicks[i].campaign_id.as_str();
-                if camp != "organic" && seen.insert(camp) {
-                    let assist_entry = campaign_daily_map
-                        .entry((camp.to_string(), day))
-                        .or_default();
+                let camp = person_clicks[i].camp_idx;
+                if seen.insert(camp) {
+                    let assist_entry = campaign_daily_map.entry((camp, day)).or_default();
                     assist_entry.assisted_sessions += 1;
                 }
             }
