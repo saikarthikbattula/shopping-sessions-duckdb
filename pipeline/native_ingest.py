@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -27,32 +28,56 @@ def _validate(stage, start, end):
     _ordinary(marker)
     try:
         value = json.loads(marker.read_text(encoding='utf-8'))
-        expected = {'protocol_version': 1, 'window_start_ms': start, 'window_end_ms': end}
+        expected = {'window_start_ms': start, 'window_end_ms': end}
         if not isinstance(value, dict):
             raise ValueError('marker must be an object')
+        version = value.get('protocol_version')
+        if type(version) is not int or version not in (1, 2):
+            raise ValueError('invalid protocol_version')
         for key, number in expected.items():
             if type(value.get(key)) is not int or value[key] != number:
                 raise ValueError(f'invalid {key}')
         counts = value['rows']
         if not isinstance(counts, dict) or set(counts) != {'events', 'clicks', 'products', 'campaigns'}:
             raise ValueError('invalid row-count tables')
-        for name, path, schema in [
-            ('events', stage / 'events/part-0.parquet', EVENTS_SCHEMA),
-            ('clicks', stage / 'clicks/part-0.parquet', CLICKS_SCHEMA),
-            ('products', stage / 'products.parquet', PRODUCTS_SCHEMA),
-            ('campaigns', stage / 'campaigns.parquet', CAMPAIGNS_SCHEMA),
+        inventories = value.get('parts')
+        if version == 2 and (not isinstance(inventories, dict) or set(inventories) != {'events', 'clicks'}):
+            raise ValueError('invalid part inventory tables')
+        for name, schema in [
+            ('events', EVENTS_SCHEMA), ('clicks', CLICKS_SCHEMA),
+            ('products', PRODUCTS_SCHEMA), ('campaigns', CAMPAIGNS_SCHEMA),
         ]:
             count = counts[name]
             if type(count) is not int or count < 0:
                 raise ValueError(f'invalid {name} row count')
             if name in ('events', 'clicks'):
-                _ordinary(path.parent, directory=True)
-                if set(path.parent.iterdir()) != {path}:
+                directory = stage / name
+                _ordinary(directory, directory=True)
+                entries = inventories[name] if version == 2 else [{'name': 'part-0.parquet', 'rows': count}]
+                if not isinstance(entries, list) or not entries:
+                    raise ValueError(f'{name} needs a nonempty part inventory')
+                files = {}
+                for entry in entries:
+                    if not isinstance(entry, dict) or set(entry) != {'name', 'rows'}:
+                        raise ValueError(f'invalid {name} part entry')
+                    filename, rows = entry['name'], entry['rows']
+                    if not isinstance(filename, str) or re.fullmatch(r'part-[0-9]+\.parquet', filename) is None:
+                        raise ValueError(f'invalid {name} part filename')
+                    if filename in files or type(rows) is not int or rows < 0:
+                        raise ValueError(f'invalid {name} part count or duplicate filename')
+                    files[filename] = rows
+                if sum(files.values()) != count:
+                    raise ValueError(f'{name} aggregate row count mismatch')
+                paths = [(directory / filename, rows) for filename, rows in files.items()]
+                if set(directory.iterdir()) != {path for path, _ in paths}:
                     raise ValueError(f'{name} contains unexpected native output files')
-            _ordinary(path)
-            with pq.ParquetFile(path) as parquet:
-                if parquet.schema_arrow != schema or parquet.metadata.num_rows != count:
-                    raise ValueError(f'{name} schema or row count mismatch')
+            else:
+                paths = [(stage / f'{name}.parquet', count)]
+            for path, rows in paths:
+                _ordinary(path)
+                with pq.ParquetFile(path) as parquet:
+                    if parquet.schema_arrow != schema or parquet.metadata.num_rows != rows:
+                        raise ValueError(f'{name} schema or row count mismatch')
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise RuntimeError(f'invalid native ingestion success protocol: {error}') from error
 
@@ -62,6 +87,10 @@ def prepare_inputs(
 ) -> PreparedInputs:
     if isinstance(batch_rows, bool) or not isinstance(batch_rows, int) or batch_rows <= 0:
         raise ValueError('batch_rows must be a positive integer')
+    ncpu = os.environ.get('NCPU', str(os.cpu_count() or 1))
+    if re.fullmatch(r'[0-9]+', ncpu) is None or int(ncpu) <= 0:
+        raise ValueError('NCPU must be a positive integer')
+    workers = int(ncpu)
     manifest = json.loads((data_dir / 'manifest.json').read_text(encoding='utf-8'))
     start = parse_timestamp(manifest['window_start'])
     end = parse_timestamp(manifest['window_end'])
@@ -74,6 +103,7 @@ def prepare_inputs(
         process = subprocess.Popen([
             binary, '--data-dir', str(data_dir), '--stage-dir', str(stage),
             '--window-start-ms', str(start), '--window-end-ms', str(end),
+            '--workers', str(workers),
             '--batch-rows', str(min(batch_rows, 65536)),
         ], stdout=subprocess.PIPE, start_new_session=True)
         try:
