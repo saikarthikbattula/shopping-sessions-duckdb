@@ -89,7 +89,7 @@ pub struct CampaignDailyRow {
 }
 
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct CampaignDailyAccumulator {
     sessions: i64,
     purchasing_sessions: i64,
@@ -1405,6 +1405,7 @@ pub fn run_pipeline(
             let worker_person_events = &worker_person_events;
             let worker_person_clicks = &worker_person_clicks;
             let category_names = &category_names;
+            let campaign_count = campaign_names.len();
 
             for worker_idx in 0..workers_count {
                 let start_shard = worker_idx * shards_per_worker;
@@ -1417,7 +1418,19 @@ pub fn run_pipeline(
                     let worker_started = profiling.then(std::time::Instant::now);
                     let mut sort_time = std::time::Duration::ZERO;
                     let mut attribution_time = std::time::Duration::ZERO;
-                    let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher> =
+
+                    let min_day = epoch_days(window_start);
+                    let max_day = epoch_days(window_end);
+                    let num_days = (max_day - min_day + 1).max(1) as usize;
+                    let total_slots = (campaign_count + 1) * num_days;
+                    let use_dense = total_slots <= 131_072 && campaign_count > 0;
+
+                    let mut dense_table = if use_dense {
+                        vec![CampaignDailyAccumulator::default(); total_slots]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut sparse_map: HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher> =
                         HashMap::with_hasher(FastBuildHasher);
 
                     let mut shard_person_map: HashMap<CompactId, u32, FastBuildHasher> =
@@ -1432,14 +1445,15 @@ pub fn run_pipeline(
                         local_events.clear();
                         local_clicks.clear();
 
-                        let mut last_person = CompactId::default();
-                        let mut last_pidx = 0u32;
-                        let mut has_last = false;
+                        let mut cache_person = [CompactId::default(); 16];
+                        let mut cache_pidx = [0u32; 16];
+                        let mut cache_valid = [false; 16];
 
                         for w_events in worker_person_events {
                             for ev in &w_events[shard_idx] {
-                                let p_idx = if has_last && ev.person == last_person {
-                                    last_pidx
+                                let slot = (ev.person.bytes[0] as usize ^ ev.person.bytes[7] as usize) & 15;
+                                let p_idx = if cache_valid[slot] && cache_person[slot] == ev.person {
+                                    cache_pidx[slot]
                                 } else {
                                     let idx = match shard_person_map.get(&ev.person) {
                                         Some(&idx) => idx,
@@ -1450,28 +1464,27 @@ pub fn run_pipeline(
                                             idx
                                         }
                                     };
-                                    last_person = ev.person;
-                                    last_pidx = idx;
-                                    has_last = true;
+                                    cache_person[slot] = ev.person;
+                                    cache_pidx[slot] = idx;
+                                    cache_valid[slot] = true;
                                     idx
                                 };
                                 local_events.push(LocalEvent::new(ev, p_idx));
                             }
                         }
 
-                        let mut last_cl_person = CompactId::default();
-                        let mut last_cl_pidx = None;
-                        let mut has_cl_last = false;
-
                         for w_clicks in worker_person_clicks {
                             for cl in &w_clicks[shard_idx] {
-                                let p_opt = if has_cl_last && cl.person == last_cl_person {
-                                    last_cl_pidx
+                                let slot = (cl.person.bytes[0] as usize ^ cl.person.bytes[7] as usize) & 15;
+                                let p_opt = if cache_valid[slot] && cache_person[slot] == cl.person {
+                                    Some(cache_pidx[slot])
                                 } else {
                                     let opt = shard_person_map.get(&cl.person).copied();
-                                    last_cl_person = cl.person;
-                                    last_cl_pidx = opt;
-                                    has_cl_last = true;
+                                    if let Some(idx) = opt {
+                                        cache_person[slot] = cl.person;
+                                        cache_pidx[slot] = idx;
+                                        cache_valid[slot] = true;
+                                    }
                                     opt
                                 };
                                 if let Some(p_idx) = p_opt {
@@ -1499,22 +1512,46 @@ pub fn run_pipeline(
                         if let Some(started) = sort_started { sort_time += started.elapsed(); }
 
                         let attribution_started = profiling.then(std::time::Instant::now);
-                        let (u_part, c_part) = execute_shard_local(
+                        let mut sink = if use_dense {
+                            CampaignDailySink::Dense {
+                                table: &mut dense_table,
+                                min_day,
+                                num_days,
+                                campaign_count,
+                            }
+                        } else {
+                            CampaignDailySink::Sparse {
+                                map: &mut sparse_map,
+                            }
+                        };
+                        let u_part = execute_shard_local(
                             &local_events,
                             &local_clicks,
                             &shard_person_names,
                             category_names,
+                            &mut sink,
                         );
                         user_rows.extend(u_part);
                         if let Some(started) = attribution_started { attribution_time += started.elapsed(); }
-                        for (k, acc) in c_part {
-                            let entry = campaign_daily_map.entry(k).or_default();
-                            entry.sessions += acc.sessions;
-                            entry.purchasing_sessions += acc.purchasing_sessions;
-                            entry.revenue_cents += acc.revenue_cents;
-                            entry.assisted_sessions += acc.assisted_sessions;
-                        }
                     }
+
+                    let campaign_daily_map = if use_dense {
+                        let mut map = HashMap::with_capacity_and_hasher(4096, FastBuildHasher);
+                        for c_idx in 0..=campaign_count {
+                            let camp_key = if c_idx == campaign_count { u16::MAX } else { c_idx as u16 };
+                            let base = c_idx * num_days;
+                            for d_off in 0..num_days {
+                                let acc = dense_table[base + d_off];
+                                if acc.sessions > 0 || acc.assisted_sessions > 0 {
+                                    let day = min_day + d_off as i32;
+                                    map.insert((camp_key, day), acc);
+                                }
+                            }
+                        }
+                        map
+                    } else {
+                        sparse_map
+                    };
 
                     let parquet_started = profiling.then(std::time::Instant::now);
                     if worker_idx == 0 || !user_rows.is_empty() {
@@ -1601,15 +1638,67 @@ pub fn run_pipeline(
     Ok(())
 }
 
+enum CampaignDailySink<'a> {
+    Dense {
+        table: &'a mut [CampaignDailyAccumulator],
+        min_day: i32,
+        num_days: usize,
+        campaign_count: usize,
+    },
+    Sparse {
+        map: &'a mut HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>,
+    },
+}
+
+impl<'a> CampaignDailySink<'a> {
+    #[inline(always)]
+    fn record_credit(&mut self, camp_idx: u16, day: i32, purchases: i64, revenue: i64) {
+        match self {
+            Self::Dense { table, min_day, num_days, campaign_count } => {
+                let c_idx = if camp_idx == u16::MAX { *campaign_count } else { camp_idx as usize };
+                let d_off = (day - *min_day) as usize;
+                let slot = c_idx * *num_days + d_off;
+                let entry = &mut table[slot];
+                entry.sessions += 1;
+                if purchases > 0 {
+                    entry.purchasing_sessions += 1;
+                }
+                entry.revenue_cents += revenue;
+            }
+            Self::Sparse { map } => {
+                let entry = map.entry((camp_idx, day)).or_default();
+                entry.sessions += 1;
+                if purchases > 0 {
+                    entry.purchasing_sessions += 1;
+                }
+                entry.revenue_cents += revenue;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn record_assist(&mut self, camp_idx: u16, day: i32) {
+        match self {
+            Self::Dense { table, min_day, num_days, .. } => {
+                let d_off = (day - *min_day) as usize;
+                let slot = (camp_idx as usize) * *num_days + d_off;
+                table[slot].assisted_sessions += 1;
+            }
+            Self::Sparse { map } => {
+                map.entry((camp_idx, day)).or_default().assisted_sessions += 1;
+            }
+        }
+    }
+}
+
 fn execute_shard_local(
     events: &[LocalEvent],
     clicks: &[LocalClick],
     person_names: &[CompactId],
     category_names: &[String],
-) -> (Vec<UserDailyRow>, HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>) {
+    campaign_sink: &mut CampaignDailySink,
+) -> Vec<UserDailyRow> {
     let mut user_rows = Vec::new();
-    let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher> =
-        HashMap::with_hasher(FastBuildHasher);
 
     let mut ev_start = 0;
     let mut cl_cursor = 0;
@@ -1707,7 +1796,7 @@ fn execute_shard_local(
                     &mut day_revenue,
                     &mut day_has_purchases,
                     &mut cat_rev,
-                    &mut campaign_daily_map,
+                    campaign_sink,
                     category_names,
                     person,
                     &mut user_rows,
@@ -1728,7 +1817,7 @@ fn execute_shard_local(
             &mut day_revenue,
             &mut day_has_purchases,
             &mut cat_rev,
-            &mut campaign_daily_map,
+            campaign_sink,
             category_names,
             person,
             &mut user_rows,
@@ -1752,7 +1841,7 @@ fn execute_shard_local(
         ev_start = ev_end;
     }
 
-    (user_rows, campaign_daily_map)
+    user_rows
 }
 
 #[inline(always)]
@@ -1767,7 +1856,7 @@ fn process_person_session(
     day_revenue: &mut i64,
     day_has_purchases: &mut bool,
     cat_rev: &mut [i64; 256],
-    campaign_daily_map: &mut HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>,
+    campaign_sink: &mut CampaignDailySink,
     category_names: &[String],
     person: CompactId,
     user_rows: &mut Vec<UserDailyRow>,
@@ -1843,25 +1932,19 @@ fn process_person_session(
         u16::MAX // organic
     };
 
-    let credited_entry = campaign_daily_map.entry((winning_camp_idx, day)).or_default();
-    credited_entry.sessions += 1;
-    if session_purchases > 0 {
-        credited_entry.purchasing_sessions += 1;
-    }
-    credited_entry.revenue_cents += session_revenue;
+    campaign_sink.record_credit(winning_camp_idx, day, session_purchases, session_revenue);
 
     if left < right {
         let count = right - left;
-        if count <= 8 {
-            let mut seen: [u16; 8] = [0; 8];
+        if count <= 32 {
+            let mut seen: [u16; 32] = [0; 32];
             let mut seen_len = 0;
             for i in left..right {
                 let camp = person_clicks[i].camp_idx;
                 if !seen[..seen_len].contains(&camp) {
                     seen[seen_len] = camp;
                     seen_len += 1;
-                    let assist_entry = campaign_daily_map.entry((camp, day)).or_default();
-                    assist_entry.assisted_sessions += 1;
+                    campaign_sink.record_assist(camp, day);
                 }
             }
         } else {
@@ -1869,8 +1952,7 @@ fn process_person_session(
             for i in left..right {
                 let camp = person_clicks[i].camp_idx;
                 if seen.insert(camp) {
-                    let assist_entry = campaign_daily_map.entry((camp, day)).or_default();
-                    assist_entry.assisted_sessions += 1;
+                    campaign_sink.record_assist(camp, day);
                 }
             }
         }
