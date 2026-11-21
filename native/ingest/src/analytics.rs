@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{BuildHasher, Hasher};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -271,13 +271,6 @@ struct DedupWinner {
     event_idx: u32,
 }
 
-#[derive(Clone, Copy)]
-struct UserCacheSlot {
-    len: u8,
-    bytes: [u8; 31],
-    person: CompactId,
-    p_shard: u8,
-}
 
 #[derive(Clone)]
 struct RawPersonEvent {
@@ -395,6 +388,23 @@ impl BuildHasher for FastBuildHasher {
 
 
 const NUM_SHARDS: usize = 64;
+
+struct ShardJobs {
+    order: Vec<usize>,
+    next: AtomicUsize,
+}
+
+impl ShardJobs {
+    fn new(weights: Vec<usize>) -> Self {
+        let mut order: Vec<usize> = (0..weights.len()).collect();
+        order.sort_unstable_by_key(|&index| (std::cmp::Reverse(weights[index]), index));
+        Self { order, next: AtomicUsize::new(0) }
+    }
+
+    fn next(&self) -> Option<usize> {
+        self.order.get(self.next.fetch_add(1, Ordering::Relaxed)).copied()
+    }
+}
 
 #[inline(always)]
 fn get_shard_bytes(key: &[u8]) -> usize {
@@ -1191,6 +1201,10 @@ fn plan_chunks(paths: &[PathBuf], size: u64) -> Result<Vec<Chunk>> {
     Ok(result)
 }
 
+fn bounded_chunk_reader<R: Read>(reader: R, length: u64) -> BufReader<std::io::Take<R>> {
+    BufReader::with_capacity(512 * 1024, reader.take(length))
+}
+
 fn for_each_chunk_line(
     chunk: &Chunk,
     cancelled: &AtomicBool,
@@ -1198,7 +1212,7 @@ fn for_each_chunk_line(
 ) -> Result<()> {
     let mut file = File::open(&chunk.path)?;
     file.seek(SeekFrom::Start(chunk.start))?;
-    let mut reader = BufReader::with_capacity(512 * 1024, file);
+    let mut reader = bounded_chunk_reader(file, chunk.end - chunk.start);
     let mut position = chunk.start;
     let mut carry = Vec::new();
 
@@ -1404,12 +1418,6 @@ pub fn run_pipeline(
                         };
                         let mut date_cache = LocalDateCache::default();
                         let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(1024)).collect();
-                        let mut user_cache = [UserCacheSlot {
-                            len: 0,
-                            bytes: [0u8; 31],
-                            person: CompactId::default(),
-                            p_shard: 0,
-                        }; 256];
                         let mut last_camp_bytes = [0u8; 32];
                         let mut last_camp_len = 0usize;
                         let mut last_camp_idx: Option<u16> = None;
@@ -1453,26 +1461,7 @@ pub fn run_pipeline(
                                     let click_id = CompactId::from_bytes(click_id_bytes);
                                     let shard_idx = get_shard_bytes(click_id.as_bytes());
                                     let user_bytes = fields[1].unwrap();
-                                    let (person, p_shard) = if !user_bytes.is_empty() && user_bytes.len() <= 31 {
-                                        let slot = ((user_bytes[0] as usize)
-                                            ^ ((user_bytes[user_bytes.len() - 1] as usize) << 2)
-                                            ^ (user_bytes.len() << 5))
-                                            & 255;
-                                        if user_cache[slot].len == user_bytes.len() as u8
-                                            && &user_cache[slot].bytes[..user_bytes.len()] == user_bytes
-                                        {
-                                            (user_cache[slot].person, user_cache[slot].p_shard)
-                                        } else {
-                                            let (p, s) = ids.get_compact_with_shard(user_bytes);
-                                            user_cache[slot].len = user_bytes.len() as u8;
-                                            user_cache[slot].bytes[..user_bytes.len()].copy_from_slice(user_bytes);
-                                            user_cache[slot].person = p;
-                                            user_cache[slot].p_shard = s;
-                                            (p, s)
-                                        }
-                                    } else {
-                                        ids.get_compact_with_shard(user_bytes)
-                                    };
+                                    let (person, p_shard) = ids.get_compact_with_shard(user_bytes);
                                     local_shards[shard_idx].push(RawClick {
                                         click_id,
                                         person,
@@ -1499,13 +1488,13 @@ pub fn run_pipeline(
 
             // Deduplication of clicks
             let (worker_person_clicks, dedup_cpu): (Vec<Vec<Vec<RawPersonClick>>>, u64) = std::thread::scope(|c_scope| {
-                let shards_per_worker = (NUM_SHARDS + click_workers_count - 1) / click_workers_count;
+                let jobs = Arc::new(ShardJobs::new((0..NUM_SHARDS).map(|shard|
+                    worker_click_shards.iter().map(|worker| worker[shard].len()).sum()).collect()));
                 let mut handles = Vec::new();
                 let worker_click_shards = &worker_click_shards;
 
-                for worker_idx in 0..click_workers_count {
-                    let start_shard = worker_idx * shards_per_worker;
-                    let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
+                for _ in 0..click_workers_count {
+                    let jobs = Arc::clone(&jobs);
 
                     handles.push(c_scope.spawn(move || -> (Vec<Vec<RawPersonClick>>, u64) {
                         let cpu_start = thread_cpu_time_ns();
@@ -1515,7 +1504,7 @@ pub fn run_pipeline(
                         let mut seen_clicks: HashSet<CompactId, FastBuildHasher> =
                             HashSet::with_capacity_and_hasher(4096, FastBuildHasher);
 
-                        for shard_idx in start_shard..end_shard {
+                        while let Some(shard_idx) = jobs.next() {
                             seen_clicks.clear();
 
                             for worker_shards in worker_click_shards {
@@ -1594,12 +1583,6 @@ pub fn run_pipeline(
                         shards: (0..NUM_SHARDS).map(|_| Vec::with_capacity(16384)).collect(),
                         wide_times: Vec::new(),
                     };
-                    let mut user_cache = [UserCacheSlot {
-                        len: 0,
-                        bytes: [0u8; 31],
-                        person: CompactId::default(),
-                        p_shard: 0,
-                    }; 256];
 
                     while !cancelled.load(Ordering::Relaxed) {
                         let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -1669,26 +1652,7 @@ pub fn run_pipeline(
 
                             let (eid_hash, shard_idx) = hash_event_id_128(event_id_bytes);
                             let (person, p_shard) = if let Some(user_bytes) = fields[1] {
-                                if !user_bytes.is_empty() && user_bytes.len() <= 31 {
-                                    let slot = ((user_bytes[0] as usize)
-                                        ^ ((user_bytes[user_bytes.len() - 1] as usize) << 2)
-                                        ^ (user_bytes.len() << 5))
-                                        & 255;
-                                    if user_cache[slot].len == user_bytes.len() as u8
-                                        && &user_cache[slot].bytes[..user_bytes.len()] == user_bytes
-                                    {
-                                        (user_cache[slot].person, user_cache[slot].p_shard)
-                                    } else {
-                                        let (p, s) = ids.get_compact_with_shard(user_bytes);
-                                        user_cache[slot].len = user_bytes.len() as u8;
-                                        user_cache[slot].bytes[..user_bytes.len()].copy_from_slice(user_bytes);
-                                        user_cache[slot].person = p;
-                                        user_cache[slot].p_shard = s;
-                                        (p, s)
-                                    }
-                                } else {
-                                    ids.get_compact_with_shard(user_bytes)
-                                }
+                                ids.get_compact_with_shard(user_bytes)
                             } else {
                                 (CompactId::default(), 0u8)
                             };
@@ -1731,13 +1695,13 @@ pub fn run_pipeline(
         // 6. Lock-Free Parallel Deduplication of Events and Routing to Person Shards
         let t_events_dedup_start = std::time::Instant::now();
         let (worker_person_events, events_dedup_cpu_ns): (Vec<Vec<Vec<RawPersonEvent>>>, u64) = std::thread::scope(|e_scope| {
-            let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
+            let jobs = Arc::new(ShardJobs::new((0..NUM_SHARDS).map(|shard|
+                worker_event_shards.iter().map(|worker| worker.shards[shard].len()).sum()).collect()));
             let mut handles = Vec::new();
             let worker_event_shards = &worker_event_shards;
 
-            for worker_idx in 0..workers_count {
-                let start_shard = worker_idx * shards_per_worker;
-                let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
+            for _ in 0..workers_count {
+                let jobs = Arc::clone(&jobs);
 
                 handles.push(e_scope.spawn(move || -> (Vec<Vec<RawPersonEvent>>, u64) {
                     let cpu_start = thread_cpu_time_ns();
@@ -1747,7 +1711,7 @@ pub fn run_pipeline(
                     let mut dedup_map: HashMap<u128, DedupWinner, FastBuildHasher> =
                         HashMap::with_capacity_and_hasher(131072, FastBuildHasher);
 
-                    for shard_idx in start_shard..end_shard {
+                    while let Some(shard_idx) = jobs.next() {
                         dedup_map.clear();
 
                         for (w_idx, worker_shards) in worker_event_shards.iter().enumerate() {
@@ -1818,7 +1782,9 @@ pub fn run_pipeline(
 
     let partial_results: Vec<Result<(HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>, u64)>> =
         std::thread::scope(|scope| {
-            let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
+            let jobs = Arc::new(ShardJobs::new((0..NUM_SHARDS).map(|shard|
+                worker_person_events.iter().map(|worker| worker[shard].len()).sum::<usize>()
+                + worker_person_clicks.iter().map(|worker| worker[shard].len()).sum::<usize>()).collect()));
             let mut handles = Vec::new();
             let worker_person_events = &worker_person_events;
             let worker_person_clicks = &worker_person_clicks;
@@ -1826,8 +1792,7 @@ pub fn run_pipeline(
             let campaign_count = campaign_names.len();
 
             for worker_idx in 0..workers_count {
-                let start_shard = worker_idx * shards_per_worker;
-                let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
+                let jobs = Arc::clone(&jobs);
 
                 handles.push(scope.spawn(move || -> Result<(HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>, u64)> {
                     let cpu_start = thread_cpu_time_ns();
@@ -1857,25 +1822,20 @@ pub fn run_pipeline(
                     let mut local_events: Vec<LocalEvent> = Vec::with_capacity(131072);
                     let mut local_clicks: Vec<LocalClick> = Vec::with_capacity(32768);
 
-                    for shard_idx in start_shard..end_shard {
+                    while let Some(shard_idx) = jobs.next() {
                         shard_person_map.clear();
                         shard_person_names.clear();
                         local_events.clear();
                         local_clicks.clear();
 
-                        let mut cache_person = [CompactId::default(); 256];
-                        let mut cache_pidx = [0u32; 256];
-                        let mut cache_valid = [false; 256];
+                        let mut cache_person = CompactId::default();
+                        let mut cache_pidx = 0u32;
+                        let mut cache_valid = false;
 
                         for w_events in worker_person_events {
                             for ev in &w_events[shard_idx] {
-                                let last_idx = (ev.person.len.min(31) as usize).saturating_sub(1);
-                                let slot = ((ev.person.bytes[0] as usize)
-                                    ^ ((ev.person.bytes[last_idx] as usize) << 2)
-                                    ^ ((ev.person.len as usize) << 5))
-                                    & 255;
-                                let p_idx = if cache_valid[slot] && cache_person[slot] == ev.person {
-                                    cache_pidx[slot]
+                                let p_idx = if cache_valid && cache_person == ev.person {
+                                    cache_pidx
                                 } else {
                                     let idx = match shard_person_map.get(&ev.person) {
                                         Some(&idx) => idx,
@@ -1886,9 +1846,9 @@ pub fn run_pipeline(
                                             idx
                                         }
                                     };
-                                    cache_person[slot] = ev.person;
-                                    cache_pidx[slot] = idx;
-                                    cache_valid[slot] = true;
+                                    cache_person = ev.person;
+                                    cache_pidx = idx;
+                                    cache_valid = true;
                                     idx
                                 };
                                 local_events.push(LocalEvent::new(ev, p_idx));
@@ -1897,19 +1857,14 @@ pub fn run_pipeline(
 
                         for w_clicks in worker_person_clicks {
                             for cl in &w_clicks[shard_idx] {
-                                let last_idx = (cl.person.len.min(31) as usize).saturating_sub(1);
-                                let slot = ((cl.person.bytes[0] as usize)
-                                    ^ ((cl.person.bytes[last_idx] as usize) << 2)
-                                    ^ ((cl.person.len as usize) << 5))
-                                    & 255;
-                                let p_opt = if cache_valid[slot] && cache_person[slot] == cl.person {
-                                    Some(cache_pidx[slot])
+                                let p_opt = if cache_valid && cache_person == cl.person {
+                                    Some(cache_pidx)
                                 } else {
                                     let opt = shard_person_map.get(&cl.person).copied();
                                     if let Some(idx) = opt {
-                                        cache_person[slot] = cl.person;
-                                        cache_pidx[slot] = idx;
-                                        cache_valid[slot] = true;
+                                        cache_person = cl.person;
+                                        cache_pidx = idx;
+                                        cache_valid = true;
                                     }
                                     opt
                                 };
@@ -2546,6 +2501,37 @@ pub fn write_campaign_daily(output_dir: &Path, rows: Vec<CampaignDailyRow>) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chunk_buffer_cannot_read_past_assigned_bytes() {
+        use std::io::{BufRead, Cursor};
+        let mut reader = super::bounded_chunk_reader(Cursor::new(vec![b'x'; 1024 * 1024]), 13);
+        assert_eq!(reader.fill_buf().unwrap().len(), 13);
+        assert_eq!(reader.get_ref().get_ref().position(), 13);
+        reader.consume(13);
+        assert!(reader.fill_buf().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shard_queue_orders_heavy_work_and_assigns_each_job_once() {
+        let ordered = super::ShardJobs::new(vec![3, 20, 20, 0]);
+        assert_eq!(ordered.order, vec![1, 2, 0, 3]);
+        for workers in [1, 2, 8] {
+            let jobs = std::sync::Arc::new(super::ShardJobs::new(vec![1; 64]));
+            let counts = std::sync::Arc::new((0..64).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let jobs = jobs.clone();
+                    let counts = counts.clone();
+                    scope.spawn(move || {
+                        while let Some(index) = jobs.next() {
+                            counts[index].fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            assert!(counts.iter().all(|count| count.load(Ordering::Relaxed) == 1));
+        }
+    }
     #[test]
     fn local_event_is_sixteen_bytes_and_preserves_validated_values() {
         assert_eq!(std::mem::size_of::<super::LocalEvent>(), 16);

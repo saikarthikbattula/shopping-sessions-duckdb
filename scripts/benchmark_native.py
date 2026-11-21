@@ -32,9 +32,10 @@ def main():
     parser.add_argument("candidate", type=Path)
     parser.add_argument("data", type=Path)
     parser.add_argument("report", type=Path)
+    parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
-    if sys.platform != "darwin":
-        parser.error("This harness uses macOS time -l for peak RSS")
+    if sys.platform not in ("darwin", "linux") or args.workers < 1:
+        parser.error("macOS/Linux and a positive worker count are required")
     environment = os.environ.copy()
     environment.pop("NATIVE_PROFILE", None)
     fingerprint = input_fingerprint(args.data)
@@ -51,14 +52,18 @@ def main():
                 output = root / f"{round_number}-{arm}"
                 started = time.perf_counter()
                 process = subprocess.run(
-                    ["/usr/bin/time", "-l", str(binary), "--data-dir", str(args.data.resolve()),
-                     "--output-dir", str(output), "--workers", "8"],
+                    ["/usr/bin/time", "-l" if sys.platform == "darwin" else "-v",
+                     str(binary), "--data-dir", str(args.data.resolve()),
+                     "--output-dir", str(output), "--workers", str(args.workers)],
                     capture_output=True, text=True, check=True, env=environment)
                 wall = time.perf_counter() - started
                 cpu = re.search(r"cpu_sum: ([0-9.]+)ms", process.stderr)
-                rss = re.search(r"([0-9]+)\s+maximum resident set size", process.stderr)
+                rss_pattern = (r"([0-9]+)\s+maximum resident set size" if sys.platform == "darwin"
+                               else r"Maximum resident set size \(kbytes\):\s*([0-9]+)")
+                rss = re.search(rss_pattern, process.stderr)
                 results.append(dict(arm=arm, round=round_number, wall_seconds=wall,
-                                    cpu_ms=float(cpu[1]), rss_bytes=int(rss[1]), stderr=process.stderr))
+                                    cpu_ms=float(cpu[1]), rss_bytes=int(rss[1]) * (1 if sys.platform == "darwin" else 1024),
+                                    stderr=process.stderr))
             subprocess.run([sys.executable, "scripts/compare.py",
                             str(root / f"{round_number}-baseline"),
                             str(root / f"{round_number}-candidate")], check=True)
@@ -71,7 +76,7 @@ def main():
                 raise RuntimeError("Benchmark executable changed during measurement")
         if input_fingerprint(args.data) != fingerprint:
             raise RuntimeError("Benchmark inputs changed during measurement")
-        json.dump(dict(data=str(args.data.resolve()), workers=8, binary_sha256=hashes,
+        json.dump(dict(data=str(args.data.resolve()), workers=args.workers, binary_sha256=hashes,
                        input_sha256=fingerprint,
                        platform=platform.platform(), profiling=False,
                        input_bytes=sum(p.stat().st_size for p in args.data.rglob("*") if p.is_file()),
