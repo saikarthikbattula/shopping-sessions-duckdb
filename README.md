@@ -29,6 +29,7 @@ The handoffs below record the original assignments to Pranav's Cursor Mobile ses
 - [Native Linux container packaging](docs/NATIVE_CONTAINER.md)
 - [Incremental Rust optimization plan](docs/RUST_OPTIMIZATION_PLAN.md)
 - [Repeatable baseline benchmark](docs/BENCHMARKING.md)
+- [Simple-user bypass, compact sessionization, and measured results](docs/SIMPLE_USER_FASTPATH.md)
 - [Pranav: strict parsing and identity resolution](docs/handoffs/PRANAV.md)
 - [Karthik: DuckDB analytics and output tables](docs/handoffs/KARTHIK.md)
 

@@ -1,12 +1,12 @@
 # Native pipeline experiments
 
 Karthik owns this work. The scorer reference is PR #19 at 4.78 seconds, with a
-0.59-second target. Independent patches under docs/experiments apply to
-63a4fc2, the merge of PR #19. They contain the implemented experiments for
-review and reproduction. Apply one patch at a time to a clean task branch with
-`git apply --recount docs/experiments/NAME.patch`. Patch context blank lines are
-stored without trailing spaces. All three patches passed this apply check
-against the reference source.
+0.59-second target. The retired attribution, balance, and references patches apply to
+63a4fc2, the merge of PR #19. They remain available in Git history for
+review and reproduction, rather than in the current source tree. On a clean
+experiment branch at that baseline, retrieve one with
+`git show 4d3547d:docs/experiments/NAME.patch | git apply --recount`.
+All three patches passed this apply check against that reference source.
 
 ## Results and selection
 

@@ -21,3 +21,4 @@ scratch-*
 **/target
 *.profraw
 *.profdata
+gen_*
