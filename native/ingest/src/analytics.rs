@@ -377,7 +377,7 @@ impl BuildHasher for FastBuildHasher {
     }
 }
 
-const NUM_SHARDS: usize = 256;
+const NUM_SHARDS: usize = 64;
 
 #[inline(always)]
 fn get_shard_bytes(key: &[u8]) -> usize {
@@ -1382,7 +1382,7 @@ pub fn run_pipeline(
                             }
                         };
                         let mut date_cache = LocalDateCache::default();
-                        let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(512)).collect();
+                        let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(1024)).collect();
                         let mut user_cache = [UserCacheSlot {
                             len: 0,
                             bytes: [0u8; 31],
@@ -1570,7 +1570,7 @@ pub fn run_pipeline(
                     };
                     let mut date_cache = LocalDateCache::default();
                     let mut parsed = ParsedEvents {
-                        shards: (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect(),
+                        shards: (0..NUM_SHARDS).map(|_| Vec::with_capacity(16384)).collect(),
                         wide_times: Vec::new(),
                     };
                     let mut user_cache = [UserCacheSlot {
@@ -1721,10 +1721,10 @@ pub fn run_pipeline(
                 handles.push(e_scope.spawn(move || -> (Vec<Vec<RawPersonEvent>>, u64) {
                     let cpu_start = thread_cpu_time_ns();
                     let mut local_person_shards: Vec<Vec<RawPersonEvent>> =
-                        (0..NUM_SHARDS).map(|_| Vec::with_capacity(1024)).collect();
+                        (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect();
 
                     let mut dedup_map: HashMap<u128, DedupWinner, FastBuildHasher> =
-                        HashMap::with_capacity_and_hasher(65536, FastBuildHasher);
+                        HashMap::with_capacity_and_hasher(131072, FastBuildHasher);
 
                     for shard_idx in start_shard..end_shard {
                         dedup_map.clear();
@@ -1831,10 +1831,10 @@ pub fn run_pipeline(
                         HashMap::with_hasher(FastBuildHasher);
 
                     let mut shard_person_map: HashMap<CompactId, u32, FastBuildHasher> =
-                        HashMap::with_capacity_and_hasher(16384, FastBuildHasher);
-                    let mut shard_person_names: Vec<CompactId> = Vec::with_capacity(16384);
-                    let mut local_events: Vec<LocalEvent> = Vec::with_capacity(65536);
-                    let mut local_clicks: Vec<LocalClick> = Vec::with_capacity(16384);
+                        HashMap::with_capacity_and_hasher(32768, FastBuildHasher);
+                    let mut shard_person_names: Vec<CompactId> = Vec::with_capacity(32768);
+                    let mut local_events: Vec<LocalEvent> = Vec::with_capacity(131072);
+                    let mut local_clicks: Vec<LocalClick> = Vec::with_capacity(32768);
 
                     for shard_idx in start_shard..end_shard {
                         shard_person_map.clear();
