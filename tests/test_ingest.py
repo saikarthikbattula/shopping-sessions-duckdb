@@ -173,10 +173,12 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(self.read(prepared.products_path)[1], {'product_id': ' p', 'category': ' category\t'})
         self.assertEqual(self.read(prepared.campaigns_path)[1], {'campaign_id': ' c', 'channel': 'channel\r'})
         for path in (prepared.events_dir, prepared.clicks_dir):
+            row_groups = 0
             for file in path.glob('*.parquet'):
                 metadata = pq.ParquetFile(file).metadata
-                self.assertGreater(metadata.num_row_groups, 1)
+                row_groups += metadata.num_row_groups
                 self.assertTrue(all(metadata.row_group(i).num_rows <= 2 for i in range(metadata.num_row_groups)))
+            self.assertGreater(row_groups, 1)
         self.check_duckdb(prepared)
 
     def test_empty_tables_and_repeated_calls_have_independent_paths(self):

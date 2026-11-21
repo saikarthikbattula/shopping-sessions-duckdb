@@ -7,11 +7,14 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fs::{self, File},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const MAX_ROWS: usize = 65536;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug)]
@@ -204,6 +207,7 @@ struct Args {
     start: i64,
     end: i64,
     batch: usize,
+    workers: usize,
 }
 fn args() -> std::result::Result<Args, String> {
     let mut values = HashMap::new();
@@ -215,6 +219,7 @@ fn args() -> std::result::Result<Args, String> {
             "--window-start-ms",
             "--window-end-ms",
             "--batch-rows",
+            "--workers",
         ]
         .contains(&key.as_str())
         {
@@ -237,7 +242,11 @@ fn args() -> std::result::Result<Args, String> {
     let batch = get("--batch-rows")?
         .parse::<u64>()
         .map_err(|e| e.to_string())?;
-    if start >= end || batch == 0 {
+    let workers = values
+        .get("--workers")
+        .map_or(Ok(1), |v| v.parse::<usize>())
+        .map_err(|e| e.to_string())?;
+    if start >= end || batch == 0 || workers == 0 {
         return Err("invalid window or batch size".into());
     }
     Ok(Args {
@@ -246,8 +255,219 @@ fn args() -> std::result::Result<Args, String> {
         start,
         end,
         batch: batch.min(MAX_ROWS as u64) as usize,
+        workers,
     })
 }
+/// Every descriptor starts and ends at a physical record boundary. Planning reads
+/// only each header and the suffix after a target offset, not entire input files.
+#[derive(Debug)]
+struct Chunk {
+    path: PathBuf,
+    start: u64,
+    end: u64,
+}
+fn chunks(paths: &[PathBuf], size: u64) -> Result<Vec<Chunk>> {
+    assert!(size > 0);
+    let mut result = Vec::new();
+    for path in paths {
+        let mut reader = BufReader::new(File::open(path)?);
+        let length = reader.get_ref().metadata()?.len();
+        reader.skip_until(b'\n')?;
+        let mut start = reader.stream_position()?;
+        while start < length {
+            let target = start.saturating_add(size);
+            let end = if target >= length {
+                length
+            } else {
+                reader.seek(SeekFrom::Start(target - 1))?;
+                reader.skip_until(b'\n')?;
+                reader.stream_position()?.min(length)
+            };
+            result.push(Chunk {
+                path: path.clone(),
+                start,
+                end,
+            });
+            start = end;
+        }
+    }
+    Ok(result)
+}
+fn chunk_rows(
+    chunk: &Chunk,
+    count: usize,
+    cancelled: &AtomicBool,
+    mut consume: impl FnMut(&[Option<&str>]) -> Result<()>,
+) -> Result<()> {
+    let mut reader = BufReader::new(File::open(&chunk.path)?);
+    reader.seek(SeekFrom::Start(chunk.start))?;
+    let mut position = chunk.start;
+    let mut buffer = Vec::new();
+    while position < chunk.end && !cancelled.load(Ordering::Relaxed) {
+        buffer.clear();
+        let read = reader.read_until(b'\n', &mut buffer)?;
+        if read == 0 {
+            return Err("input changed or was truncated while parsing".into());
+        }
+        position += read as u64;
+        if let Some(row) = parsing::line(std::str::from_utf8(&buffer)?, count) {
+            consume(&row)?;
+        }
+    }
+    Ok(())
+}
+/// Catch panics inside the worker so cancellation is visible immediately. Join
+/// every worker before returning any error, including invalid-ingest errors.
+fn workers<T: Send>(
+    count: usize,
+    work: impl Fn(usize, &AtomicBool) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    let cancelled = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..count)
+            .map(|worker| {
+                let work = &work;
+                let cancelled = &cancelled;
+                let handle = std::thread::Builder::new()
+                    .name(format!("ingest-{worker}"))
+                    .spawn_scoped(scope, move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            work(worker, cancelled)
+                        }))
+                        .unwrap_or_else(|_| Err("native ingestion worker panicked".into()));
+                        if result.is_err() {
+                            cancelled.store(true, Ordering::Relaxed);
+                        }
+                        result
+                    });
+                if handle.is_err() {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                handle
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        let mut error: Option<Box<dyn Error + Send + Sync>> = None;
+        for handle in handles {
+            let result = match handle {
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| Err("native ingestion worker panicked".into())),
+                Err(e) => {
+                    cancelled.store(true, Ordering::Relaxed);
+                    Err(e.into())
+                }
+            };
+            match result {
+                Ok(value) => results.push(value),
+                Err(e) => {
+                    if error.is_none() || e.downcast_ref::<InvalidIngest>().is_some() {
+                        error = Some(e);
+                    }
+                }
+            }
+        }
+        error.map_or(Ok(results), Err)
+    })
+}
+struct Part {
+    name: String,
+    rows: u64,
+}
+struct Context<'a> {
+    ids: &'a HashMap<String, String>,
+    campaigns: &'a HashSet<String>,
+    null_campaign: bool,
+    start: i64,
+    end: i64,
+}
+fn stage_table(args: &Args, table: &str, context: &Context<'_>) -> Result<Vec<Part>> {
+    stage_table_with_chunk_size(args, table, context, MAX_BYTES as u64)
+}
+fn stage_table_with_chunk_size(
+    args: &Args,
+    table: &str,
+    context: &Context<'_>,
+    chunk_size: u64,
+) -> Result<Vec<Part>> {
+    let chunks = chunks(&parts(&args.data.join(table))?, chunk_size)?;
+    let next = AtomicUsize::new(0);
+    let count = args.workers.min(chunks.len().max(1));
+    workers(count, |worker, cancelled| {
+        let name = format!("part-{worker}.parquet");
+        let mut sink = Sink::new(&args.stage.join(table).join(&name), table, args.batch)?;
+        while !cancelled.load(Ordering::Relaxed) {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(chunk) = chunks.get(index) else {
+                break;
+            };
+            chunk_rows(
+                chunk,
+                if table == "events" { 7 } else { 4 },
+                cancelled,
+                |row| process_row(table, context, &mut sink, row),
+            )?;
+        }
+        Ok(Part {
+            name,
+            rows: sink.close()?,
+        })
+    })
+}
+fn process_row(
+    table: &str,
+    context: &Context<'_>,
+    sink: &mut Sink,
+    r: &[Option<&str>],
+) -> Result<()> {
+    if table == "events" {
+        if r[0].is_none() {
+            return Ok(());
+        }
+        let ts = parsing::window(r[2], i128::from(context.start), i128::from(context.end));
+        let ingest = parsing::timestamp(r[3]).ok_or(InvalidIngest)?;
+        let cents = if r[4] == Some("purchase") {
+            parsing::unsigned(r[6], 10000000).filter(|v| *v > 0)
+        } else {
+            None
+        };
+        let valid = r[1].is_some()
+            && ts.is_some()
+            && r[5].is_some()
+            && matches!(r[4], Some("view" | "cart" | "purchase"))
+            && (r[4] != Some("purchase") || cents.is_some());
+        sink.push(&[
+            Value::S(r[0]),
+            Value::S(person(context.ids, r[1])),
+            Value::I(Some(ingest)),
+            Value::I(ts),
+            Value::S(r[4]),
+            Value::S(r[5]),
+            Value::I(cents),
+            Value::B(valid),
+        ])
+    } else {
+        if r[0].is_none() {
+            return Ok(());
+        }
+        let ts = parsing::window(
+            r[3],
+            i128::from(context.start) - 604800000,
+            i128::from(context.end),
+        );
+        let valid = r[1].is_some()
+            && ts.is_some()
+            && r[2].map_or(context.null_campaign, |id| context.campaigns.contains(id));
+        sink.push(&[
+            Value::S(r[0]),
+            Value::S(person(context.ids, r[1])),
+            Value::S(r[2]),
+            Value::I(ts),
+            Value::B(valid),
+        ])
+    }
+}
+
 fn run(a: Args) -> Result<()> {
     if fs::read_dir(&a.stage)?.next().is_some() {
         return Err("stage directory must be empty".into());
@@ -279,58 +499,24 @@ fn run(a: Args) -> Result<()> {
         campaign.push(&[Value::S(r[0]), Value::S(r[1])])
     })?;
     let campaign_count = campaign.close()?;
-    let mut event = Sink::new(&a.stage.join("events/part-0.parquet"), "events", a.batch)?;
-    for file in parts(&a.data.join("events"))? {
-        rows(&file, 7, |r| {
-            if r[0].is_none() {
-                return Ok(());
-            }
-            let ts = parsing::window(r[2], i128::from(a.start), i128::from(a.end));
-            let ingest = parsing::timestamp(r[3]).ok_or(InvalidIngest)?;
-            let cents = if r[4] == Some("purchase") {
-                parsing::unsigned(r[6], 10000000).filter(|v| *v > 0)
-            } else {
-                None
-            };
-            let valid = r[1].is_some()
-                && ts.is_some()
-                && r[5].is_some()
-                && matches!(r[4], Some("view" | "cart" | "purchase"))
-                && (r[4] != Some("purchase") || cents.is_some());
-            event.push(&[
-                Value::S(r[0]),
-                Value::S(person(&ids, r[1])),
-                Value::I(Some(ingest)),
-                Value::I(ts),
-                Value::S(r[4]),
-                Value::S(r[5]),
-                Value::I(cents),
-                Value::B(valid),
-            ])
-        })?;
-    }
-    let events = event.close()?;
-    let mut click = Sink::new(&a.stage.join("clicks/part-0.parquet"), "clicks", a.batch)?;
-    for file in parts(&a.data.join("clicks"))? {
-        rows(&file, 4, |r| {
-            if r[0].is_none() {
-                return Ok(());
-            }
-            let ts = parsing::window(r[3], i128::from(a.start) - 604800000, i128::from(a.end));
-            let valid = r[1].is_some()
-                && ts.is_some()
-                && r[2].map_or(null_campaign, |id| campaigns.contains(id));
-            click.push(&[
-                Value::S(r[0]),
-                Value::S(person(&ids, r[1])),
-                Value::S(r[2]),
-                Value::I(ts),
-                Value::B(valid),
-            ])
-        })?;
-    }
-    let clicks = click.close()?;
-    let marker = serde_json::json!({"protocol_version":1,"window_start_ms":a.start,"window_end_ms":a.end,"rows":{"events":events,"clicks":clicks,"products":products,"campaigns":campaign_count}});
+    let context = Context {
+        ids: &ids,
+        campaigns: &campaigns,
+        null_campaign,
+        start: a.start,
+        end: a.end,
+    };
+    let event_parts = stage_table(&a, "events", &context)?;
+    let click_parts = stage_table(&a, "clicks", &context)?;
+    let events: u64 = event_parts.iter().map(|part| part.rows).sum();
+    let clicks: u64 = click_parts.iter().map(|part| part.rows).sum();
+    let part_json = |parts: &[Part]| {
+        parts
+            .iter()
+            .map(|p| serde_json::json!({"name": p.name, "rows": p.rows}))
+            .collect::<Vec<_>>()
+    };
+    let marker = serde_json::json!({"protocol_version":2,"window_start_ms":a.start,"window_end_ms":a.end,"rows":{"events":events,"clicks":clicks,"products":products,"campaigns":campaign_count},"parts":{"events":part_json(&event_parts),"clicks":part_json(&click_parts)}});
     let temp = a.stage.join("_SUCCESS.json.tmp");
     let mut f = File::create(&temp)?;
     serde_json::to_writer(&mut f, &marker)?;
@@ -462,6 +648,7 @@ mod tests {
             start: 1790812800000,
             end: 1792022400000,
             batch: 1,
+            workers: 1,
         })
         .unwrap();
         let marker: serde_json::Value =
@@ -523,9 +710,181 @@ mod tests {
             start: 0,
             end: 100,
             batch: 2,
+            workers: 1,
         })
         .unwrap_err();
         assert!(error.downcast_ref::<InvalidIngest>().is_some());
         assert!(!stage.join("_SUCCESS.json").exists());
+    }
+    #[test]
+    fn chunk_boundaries_preserve_physical_records() {
+        let temp = Temp::new();
+        let path = temp.0.join(".csv");
+        let content = "header\nα,b\r\nheader,row\nmalformed\n\nlast,unterminated";
+        fs::write(&path, content).unwrap();
+        let planned = chunks(&[path.clone()], 7).unwrap();
+        let mut actual = Vec::new();
+        let cancelled = AtomicBool::new(false);
+        for chunk in &planned {
+            chunk_rows(chunk, 2, &cancelled, |row| {
+                actual.push(row.iter().map(|v| v.map(str::to_owned)).collect::<Vec<_>>());
+                Ok(())
+            })
+            .unwrap();
+        }
+        let mut expected = Vec::new();
+        rows(&path, 2, |row| {
+            expected.push(row.iter().map(|v| v.map(str::to_owned)).collect::<Vec<_>>());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert!(planned.len() > 1);
+        for content in ["", "header", "header\n"] {
+            fs::write(&path, content).unwrap();
+            assert!(chunks(&[path.clone()], 2).unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn worker_error_and_panic_cancel_and_join_all() {
+        let joined = AtomicUsize::new(0);
+        let result = workers(3, |worker, cancelled| -> Result<usize> {
+            let _guard = JoinGuard(&joined);
+            if worker == 1 {
+                return Err(Box::new(InvalidIngest));
+            }
+            while !cancelled.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            Ok(worker)
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<InvalidIngest>()
+                .is_some()
+        );
+        assert_eq!(joined.load(Ordering::Relaxed), 3);
+        let result = workers(2, |worker, cancelled| -> Result<usize> {
+            if worker == 0 {
+                panic!("injected worker panic");
+            }
+            while !cancelled.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            Ok(worker)
+        });
+        assert!(result.unwrap_err().to_string().contains("panicked"));
+    }
+    struct JoinGuard<'a>(&'a AtomicUsize);
+    impl Drop for JoinGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[test]
+    fn parallel_parts_preserve_every_event_with_uneven_chunks() {
+        let temp = Temp::new();
+        let (data, stage) = inputs(&temp);
+        fs::write(
+            data.join("events/.csv"),
+            "header\nsmall,u,1,2026-10-01T00:00:00Z,view,p,",
+        )
+        .unwrap();
+        fs::write(
+            data.join("events/large.csv"),
+            format!(
+                "header\n{}",
+                (0..40)
+                    .map(|i| format!(
+                        "e{i},u,1,2026-10-01T00:00:00Z,view,{},\n",
+                        "é".repeat(i + 1)
+                    ))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        fs::write(data.join("events/empty.csv"), "").unwrap();
+        fs::write(data.join("events/header.csv"), "unterminated header").unwrap();
+        let ids = HashMap::from([("u".to_owned(), "canonical".to_owned())]);
+        let campaigns = HashSet::new();
+        let context = Context {
+            ids: &ids,
+            campaigns: &campaigns,
+            null_campaign: false,
+            start: 0,
+            end: 100,
+        };
+        for worker_count in [1, 2, 8] {
+            let directory = stage.join(format!("workers-{worker_count}"));
+            fs::create_dir_all(directory.join("events")).unwrap();
+            let args = Args {
+                data: data.clone(),
+                stage: directory.clone(),
+                start: 0,
+                end: 100,
+                batch: 2,
+                workers: worker_count,
+            };
+            let parts = stage_table_with_chunk_size(&args, "events", &context, 80).unwrap();
+            assert_eq!(parts.len(), worker_count);
+            assert_eq!(parts.iter().map(|part| part.rows).sum::<u64>(), 41);
+            let mut found = Vec::new();
+            for part in parts {
+                let builder = ParquetRecordBatchReaderBuilder::try_new(
+                    File::open(directory.join("events").join(part.name)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(builder.schema(), &schema("events"));
+                for group in builder.metadata().row_groups() {
+                    assert!(group.num_rows() <= 2);
+                }
+                for batch in builder.build().unwrap() {
+                    let batch = batch.unwrap();
+                    let event = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    let person = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    for i in 0..batch.num_rows() {
+                        found.push(event.value(i).to_owned());
+                        assert_eq!(person.value(i), "canonical");
+                    }
+                }
+            }
+            found.sort();
+            let mut expected: Vec<_> = (0..40)
+                .map(|i| format!("e{i}"))
+                .chain(["small".to_owned()])
+                .collect();
+            expected.sort();
+            assert_eq!(found, expected);
+        }
+    }
+    #[test]
+    fn production_chunk_boundary_keeps_very_long_record_once() {
+        let temp = Temp::new();
+        let path = temp.0.join("large.csv");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"header\n").unwrap();
+        file.write_all(&vec![b'x'; MAX_BYTES + 7]).unwrap();
+        file.write_all(b",value\nlast,row").unwrap();
+        drop(file);
+        let planned = chunks(&[path], MAX_BYTES as u64).unwrap();
+        assert_eq!(planned.len(), 2);
+        let mut count = 0;
+        for chunk in planned {
+            chunk_rows(&chunk, 2, &AtomicBool::new(false), |_| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(count, 2);
     }
 }

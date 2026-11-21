@@ -77,6 +77,77 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertTrue(result.events_dir.exists())
         self.check_duckdb(result)
 
+    def success_v2(self, argv):
+        self.success(argv)
+        stage = Path(argv[argv.index('--stage-dir') + 1])
+        marker = stage / '_SUCCESS.json'
+        obj = json.loads(marker.read_text())
+        obj['protocol_version'] = 2
+        obj['parts'] = {}
+        for name, schema in [('events', EVENTS_SCHEMA), ('clicks', CLICKS_SCHEMA)]:
+            pq.write_table(pa.Table.from_batches([], schema=schema), stage / name / 'part-1.parquet')
+            obj['parts'][name] = [{'name': f'part-{i}.parquet', 'rows': 0} for i in range(2)]
+        marker.write_text(json.dumps(obj))
+
+    def test_parallel_inventory_and_worker_argument(self):
+        launcher, _ = self.run_native(self.success_v2)
+        with launcher, patch.dict(os.environ, {'NCPU': '2'}):
+            result = native_ingest.prepare_inputs(self.data, self.scratch)
+        self.assertEqual(self.argv[self.argv.index('--workers') + 1], '2')
+        self.assertEqual(len(list(result.events_dir.glob('*.parquet'))), 2)
+        self.check_duckdb(result)
+
+    def test_invalid_parallel_inventory_is_rejected(self):
+        def corrupt(kind):
+            def effect(argv):
+                self.success_v2(argv)
+                stage = Path(argv[argv.index('--stage-dir') + 1])
+                marker = stage / '_SUCCESS.json'
+                obj = json.loads(marker.read_text())
+                part = obj['parts']['events'][0]
+                if kind == 'duplicate': obj['parts']['events'][1] = part.copy()
+                elif kind == 'traversal': part['name'] = '../products.parquet'
+                elif kind == 'absolute': part['name'] = '/tmp/part-0.parquet'
+                elif kind == 'separator': part['name'] = 'x/part-0.parquet'
+                elif kind == 'backslash': part['name'] = 'x\\part-0.parquet'
+                elif kind == 'unicode': part['name'] = 'part-٠.parquet'
+                elif kind == 'bool': part['rows'] = True
+                elif kind == 'negative': part['rows'] = -1
+                elif kind == 'count': part['rows'] = 1
+                elif kind == 'aggregate': obj['rows']['events'] = 1
+                elif kind == 'empty': obj['parts']['events'] = []
+                elif kind == 'missing': del obj['parts']['events']
+                elif kind == 'extra-table': obj['parts']['other'] = []
+                elif kind == 'not-list': obj['parts']['events'] = {}
+                elif kind == 'not-object': obj['parts']['events'][0] = 'part-0.parquet'
+                elif kind == 'extra-file':
+                    pq.write_table(pa.Table.from_batches([], schema=EVENTS_SCHEMA), stage / 'events/part-2.parquet')
+                elif kind == 'symlink':
+                    path = stage / 'events/part-1.parquet'
+                    path.unlink()
+                    path.symlink_to(stage / 'events/part-0.parquet')
+                elif kind == 'schema':
+                    pq.write_table(pa.table({'wrong': []}), stage / 'events/part-1.parquet')
+                marker.write_text(json.dumps(obj))
+            return effect
+        for kind in ['duplicate', 'traversal', 'absolute', 'separator', 'backslash', 'unicode',
+                     'bool', 'negative', 'count', 'aggregate', 'empty', 'missing', 'extra-table',
+                     'not-list', 'not-object', 'extra-file', 'symlink', 'schema']:
+            with self.subTest(kind=kind):
+                launcher, _ = self.run_native(corrupt(kind))
+                with launcher, self.assertRaises(RuntimeError):
+                    native_ingest.prepare_inputs(self.data, self.scratch)
+                self.assertEqual(list(self.scratch.iterdir()), [])
+
+    def test_worker_limit_is_validated_before_launch(self):
+        with patch('pipeline.native_ingest.subprocess.Popen') as launch:
+            for value in ['0', '-1', '', '1.5', ' 2', '+2', '٢']:
+                with self.subTest(value=value), patch.dict(os.environ, {'NCPU': value}):
+                    with self.assertRaisesRegex(ValueError, '^NCPU must be a positive integer$'):
+                        native_ingest.prepare_inputs(self.data, self.scratch)
+            launch.assert_not_called()
+            self.assertFalse(self.scratch.exists())
+
     def test_failed_exit_cleans_only_owned_stage(self):
         self.scratch.mkdir()
         sibling = self.scratch / 'ingestion-existing'
@@ -160,6 +231,32 @@ class NativeProtocolTests(unittest.TestCase):
 
 
 class RustParityTests(test_ingest.StagingTests):
+    def test_parallel_workers_preserve_uneven_and_shuffled_parts(self):
+        self.write('links/part.csv', 'header\nu,z\nz,A unused\n')
+        events = [f'e{i},u,1790812800000,1790812800000,purchase,p,250' for i in range(30)]
+        # Include invalid copies for downstream dedup, CR in exact strings,
+        # unterminated records and header-only/empty files of uneven sizes.
+        events += ['dup,u,bad,1790812800000,view,p,',
+                   'dup,z,1790812800000,1790812800001,view,p,',
+                   'é, u\r,1790812800000,1790812800000,cart,p,']
+        chunks = ['header\n' + '\n'.join(events[:1]),
+                  'header\n' + '\n'.join(events[1:]), 'unterminated header', '']
+        for index, text in enumerate(chunks):
+            self.write(f'events/part-{index}.csv', text)
+        self.write('clicks/part-a.csv', 'header\nk,z,c,1790812800000')
+        self.write('clicks/part-b.csv', 'header\nother,u,c,1790812800001\n')
+        for workers in (1, 2, 8):
+            with self.subTest(workers=workers), patch.dict(os.environ, {'NCPU': str(workers)}):
+                result = self.compare(self.data, self.scratch, batch_rows=3)
+                marker = json.loads((result.events_dir.parent / '_SUCCESS.json').read_text())
+                self.assertEqual(marker['protocol_version'], 2)
+                self.assertLessEqual(len(marker['parts']['events']), workers)
+                self.assertLessEqual(len(marker['parts']['clicks']), workers)
+        for index, text in enumerate(reversed(chunks)):
+            self.write(f'events/part-{index}.csv', text)
+        with patch.dict(os.environ, {'NCPU': '2'}):
+            self.compare(self.data, self.scratch, batch_rows=3)
+
     def test_native_cli_rejects_invalid_arguments_and_nonempty_stage(self):
         binary = os.environ.get('RUST_INGEST_BIN', str(Path(__file__).resolve().parents[1] / 'native/ingest/target/release/shopping-ingest'))
         stage = self.root / 'direct-stage'
@@ -169,6 +266,8 @@ class RustParityTests(test_ingest.StagingTests):
                      '--batch-rows', '2']
         for invalid in [[], ['--unknown', 'x'], ['--data-dir'],
                         arguments + ['--batch-rows', '2'],
+                        arguments + ['--workers', '0'],
+                        arguments + ['--workers', '-1'],
                         arguments[:-1] + ['0'], arguments[:-1] + ['-1'],
                         arguments[:5] + ['not-an-integer'] + arguments[6:]]:
             with self.subTest(arguments=invalid):
