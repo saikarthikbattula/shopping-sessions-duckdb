@@ -12,9 +12,13 @@ GENERATOR ?= tools/generator/target/release/generate
 CARGO ?= cargo
 RUST_JOBS ?= 2
 NATIVE_INGEST ?= $(CURDIR)/native/ingest/target/release/shopping-ingest
+BENCH_REPORT ?= out-benchmark/report.json
+BENCH_RUNS ?= 3
+BENCH_NCPU ?= 2
+BENCH_MEM_GB ?= 2
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: setup test native-ingest test-native build fixtures fixtures-local generator dev run-dev run-local check-dev check-dev-fingerprint
+.PHONY: setup test native-ingest test-native build fixtures fixtures-local generator dev run-dev run-local check-dev check-dev-fingerprint benchmark
 
 ## Create an isolated environment with pinned runtime and checker dependencies
 setup:
@@ -72,3 +76,7 @@ check-dev:
 ## Public seed-1 comparison without committing or downloading answer rows
 check-dev-fingerprint:
 	$(PYTHON) scripts/check_dev_fingerprints.py out
+
+## Native baseline/candidate comparison; each report path must be new
+benchmark:
+	$(PYTHON) scripts/benchmark.py "$(DEV)" --runs $(BENCH_RUNS) --ncpu $(BENCH_NCPU) --mem-gb $(BENCH_MEM_GB) --report "$(BENCH_REPORT)"

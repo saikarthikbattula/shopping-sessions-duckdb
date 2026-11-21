@@ -26,6 +26,8 @@ The handoffs below record the original assignments to Pranav's Cursor Mobile ses
 - [Shared ingestion-to-DuckDB contract](docs/DATA_CONTRACT.md)
 - [Opt-in serial Rust ingestion](docs/RUST_INGESTION.md)
 - [Parallel Rust ingestion](docs/PARALLEL_INGESTION.md)
+- [Incremental Rust optimization plan](docs/RUST_OPTIMIZATION_PLAN.md)
+- [Repeatable baseline benchmark](docs/BENCHMARKING.md)
 - [Pranav: strict parsing and identity resolution](docs/handoffs/PRANAV.md)
 - [Karthik: DuckDB analytics and output tables](docs/handoffs/KARTHIK.md)
 
