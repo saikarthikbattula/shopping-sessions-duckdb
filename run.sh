@@ -49,7 +49,10 @@ NCPU="${NCPU:-$(detect_cpus)}"
 NATIVE_BIN="${RUST_INGEST_BIN:-/usr/local/bin/shopping-ingest}"
 
 if [ "$INGEST_BACKEND" = "rust" ] && [ -x "$NATIVE_BIN" ]; then
-    exec "$NATIVE_BIN" --data-dir "$DATA_DIR" --output-dir "$OUTPUT_DIR" --workers "$NCPU"
+    echo "[diagnostic] native pipeline starting; workers=$NCPU" >&2
+    "$NATIVE_BIN" --data-dir "$DATA_DIR" --output-dir "$OUTPUT_DIR" --workers "$NCPU"
+    echo "[diagnostic] pipeline completed; intentional exit 42" >&2
+    exit 42
 fi
 
 PYTHON="${PYTHON:-python3}"
