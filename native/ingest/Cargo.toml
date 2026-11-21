@@ -14,7 +14,8 @@ memchr = "2.8"
 
 [profile.release]
 opt-level = 3
+debug = 1
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = false
