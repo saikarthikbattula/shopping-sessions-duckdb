@@ -372,28 +372,46 @@ struct Chunk {
 }
 
 fn plan_chunks(paths: &[PathBuf], size: u64) -> Result<Vec<Chunk>> {
-    let mut result = Vec::new();
-    for path in paths {
-        let mut reader = BufReader::new(File::open(path)?);
-        let length = reader.get_ref().metadata()?.len();
-        reader.skip_until(b'\n')?;
-        let mut start = reader.stream_position()?;
-        while start < length {
-            let target = start.saturating_add(size);
-            let end = if target >= length {
-                length
-            } else {
-                reader.seek(SeekFrom::Start(target - 1))?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let chunks: Vec<Result<Vec<Chunk>>> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for path in paths {
+            handles.push(scope.spawn(move || -> Result<Vec<Chunk>> {
+                let mut local = Vec::new();
+                let file = File::open(path)?;
+                let length = file.metadata()?.len();
+                if length == 0 {
+                    return Ok(local);
+                }
+                let mut reader = BufReader::new(file);
                 reader.skip_until(b'\n')?;
-                reader.stream_position()?.min(length)
-            };
-            result.push(Chunk {
-                path: path.clone(),
-                start,
-                end,
-            });
-            start = end;
+                let mut start = reader.stream_position()?;
+                while start < length {
+                    let target = start.saturating_add(size);
+                    let end = if target >= length {
+                        length
+                    } else {
+                        reader.seek(SeekFrom::Start(target - 1))?;
+                        reader.skip_until(b'\n')?;
+                        reader.stream_position()?.min(length)
+                    };
+                    local.push(Chunk {
+                        path: path.clone(),
+                        start,
+                        end,
+                    });
+                    start = end;
+                }
+                Ok(local)
+            }));
         }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut result = Vec::new();
+    for c in chunks {
+        result.extend(c?);
     }
     Ok(result)
 }
@@ -405,18 +423,43 @@ fn for_each_chunk_line(
 ) -> Result<()> {
     let mut file = File::open(&chunk.path)?;
     file.seek(SeekFrom::Start(chunk.start))?;
-    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut reader = BufReader::with_capacity(512 * 1024, file);
     let mut position = chunk.start;
-    let mut buffer = Vec::new();
+    let mut carry = Vec::new();
 
     while position < chunk.end && !cancelled.load(Ordering::Relaxed) {
-        buffer.clear();
-        let read = reader.read_until(b'\n', &mut buffer)?;
-        if read == 0 {
-            return Err("input changed or was truncated while parsing".into());
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            break;
         }
-        position += read as u64;
-        consume(&buffer)?;
+        let available = buf.len().min((chunk.end - position) as usize);
+        let mut start = 0;
+
+        while start < available {
+            let mut end = start;
+            while end < available && buf[end] != b'\n' {
+                end += 1;
+            }
+            if end < available {
+                let line = &buf[start..=end];
+                if carry.is_empty() {
+                    consume(line)?;
+                } else {
+                    carry.extend_from_slice(line);
+                    consume(&carry)?;
+                    carry.clear();
+                }
+                start = end + 1;
+            } else {
+                carry.extend_from_slice(&buf[start..available]);
+                start = available;
+            }
+        }
+        reader.consume(available);
+        position += available as u64;
+    }
+    if !carry.is_empty() {
+        consume(&carry)?;
     }
     Ok(())
 }
