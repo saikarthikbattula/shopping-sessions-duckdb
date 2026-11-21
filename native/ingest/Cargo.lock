@@ -670,6 +670,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "memchr",
  "parquet",
  "serde_json",
 ]
