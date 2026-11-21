@@ -18,3 +18,6 @@ scratch
 scratch-*
 .env
 .env.*
+**/target
+*.profraw
+*.profdata
