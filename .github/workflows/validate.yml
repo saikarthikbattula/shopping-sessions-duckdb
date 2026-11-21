@@ -31,7 +31,7 @@ jobs:
         run: |
           cargo build --release --locked --jobs 2 --manifest-path native/ingest/Cargo.toml
           mkdir -p "$RUNNER_TEMP/native-baseline"
-          git archive 023349d4990b88ecd2238e93364804b976131f6f native/ingest | tar -x -C "$RUNNER_TEMP/native-baseline"
+          git archive 0c5093ddc36073c3fecf089b7c6dfe24c082371b native/ingest | tar -x -C "$RUNNER_TEMP/native-baseline"
           cargo build --release --locked --jobs 2 --manifest-path "$RUNNER_TEMP/native-baseline/native/ingest/Cargo.toml"
           make generator
       - name: Alternating x86 comparisons on two sizes and seeds
