@@ -88,9 +88,13 @@ def ablate(source, variant):
                     }
 '''
         result = source[:start] + replacement + source[end:]
-        return replace_once(result,
-            '                    let mut dedup_map: HashMap<u128, DedupWinner, FastBuildHasher> =\n'
-            '                        HashMap::with_capacity_and_hasher(131072, FastBuildHasher);', '')
+        # Capacity is tunable; still require exactly one complete declaration.
+        declaration = (r'                    let mut dedup_map: HashMap<u128, DedupWinner, FastBuildHasher> =\n'
+                       r'                        HashMap::with_capacity_and_hasher\(\d+, FastBuildHasher\);')
+        result, count = re.subn(declaration, '', result)
+        if count != 1:
+            raise ValueError('Expected one event dedup map declaration')
+        return result
     raise ValueError(variant)
 
 

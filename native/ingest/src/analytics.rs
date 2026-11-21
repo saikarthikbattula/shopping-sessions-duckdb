@@ -97,43 +97,41 @@ struct CampaignDailyAccumulator {
     assisted_sessions: i64,
 }
 
+// Keep common IDs inline while carrying an exact pointer/length for longer IDs.
+// The final byte is the inline length, or has its high bit set for an external
+// allocation. Rust allocations cannot exceed isize::MAX, leaving that bit free.
 #[derive(Clone, Copy)]
 pub struct CompactId {
-    pub len: u8,
-    pub bytes: [u8; 31],
+    bytes: [u8; 16],
 }
 
 impl CompactId {
     #[inline(always)]
     pub fn from_bytes(b: &[u8]) -> Self {
-        if b.len() <= 31 {
-            let mut bytes = [0u8; 31];
+        let mut bytes = [0u8; 16];
+        if b.len() <= 15 {
             bytes[..b.len()].copy_from_slice(b);
-            CompactId {
-                len: b.len() as u8,
-                bytes,
-            }
+            bytes[15] = b.len() as u8;
         } else {
+            // Preserve the existing process-lifetime ownership: IDs are copied
+            // between worker buffers and remain valid until the executable exits.
             let leaked: &'static [u8] = Box::leak(b.to_vec().into_boxed_slice());
-            let ptr = leaked.as_ptr() as usize;
-            let full_len = leaked.len();
-            let mut bytes = [0u8; 31];
-            bytes[0..8].copy_from_slice(&ptr.to_ne_bytes());
-            bytes[8..16].copy_from_slice(&full_len.to_ne_bytes());
-            CompactId {
-                len: 0xFF,
-                bytes,
-            }
+            bytes[..8].copy_from_slice(&(leaked.as_ptr() as u64).to_le_bytes());
+            bytes[8..].copy_from_slice(&((leaked.len() as u64) | (1 << 63)).to_le_bytes());
         }
+        Self { bytes }
     }
 
     #[inline(always)]
     pub fn as_bytes(&self) -> &[u8] {
-        if self.len != 0xFF {
-            &self.bytes[..self.len as usize]
+        if self.bytes[15] & 0x80 == 0 {
+            &self.bytes[..self.bytes[15] as usize]
         } else {
-            let ptr = usize::from_ne_bytes(self.bytes[0..8].try_into().unwrap()) as *const u8;
-            let len = usize::from_ne_bytes(self.bytes[8..16].try_into().unwrap());
+            let ptr = u64::from_le_bytes(self.bytes[..8].try_into().unwrap()) as *const u8;
+            let tagged_len = u64::from_le_bytes(self.bytes[8..].try_into().unwrap());
+            let len = (tagged_len & !(1 << 63)) as usize;
+            // The allocation is immutable and leaked by from_bytes. Copying an
+            // ID preserves its pointer, and returned borrows cannot outlive self.
             unsafe { std::slice::from_raw_parts(ptr, len) }
         }
     }
@@ -183,10 +181,7 @@ impl std::hash::Hash for CompactId {
 impl Default for CompactId {
     #[inline(always)]
     fn default() -> Self {
-        CompactId {
-            len: 0,
-            bytes: [0u8; 31],
-        }
+        CompactId { bytes: [0u8; 16] }
     }
 }
 
@@ -388,6 +383,10 @@ impl BuildHasher for FastBuildHasher {
 
 
 const NUM_SHARDS: usize = 64;
+// Event IDs and people have independent partitioning requirements. Smaller
+// event partitions keep each deduplication table bounded without multiplying
+// person buffers or fragmenting a person's analytics work.
+const NUM_EVENT_SHARDS: usize = 512;
 
 struct ShardJobs {
     order: Vec<usize>,
@@ -465,7 +464,10 @@ fn hash_event_id_128(bytes: &[u8]) -> (u128, usize) {
     // Length mixing prevents collisions between differently-padded inputs.
     h1 ^= (len as u64).wrapping_mul(0x1c69b3f74ac4ae35);
     h2 ^= (len as u64).wrapping_mul(0x517cc1b727220a95);
-    let shard = (h1 as usize) & (NUM_SHARDS - 1);
+    // Fold and avalanche every ID byte before choosing a partition. Low
+    // FNV bits alone depend heavily on the first/last word's low bytes.
+    let partition_hash = FastHasher(h1 ^ h2.rotate_left(17)).finish();
+    let shard = (partition_hash as usize) & (NUM_EVENT_SHARDS - 1);
     (((h1 as u128) << 64) | (h2 as u128), shard)
 }
 
@@ -1663,7 +1665,7 @@ pub fn run_pipeline(
                     };
                     let mut date_cache = LocalDateCache::default();
                     let mut parsed = ParsedEvents {
-                        shards: (0..NUM_SHARDS).map(|_| Vec::with_capacity(16384)).collect(),
+                        shards: (0..NUM_EVENT_SHARDS).map(|_| Vec::with_capacity(2048)).collect(),
                         wide_times: Vec::new(),
                     };
 
@@ -1778,7 +1780,7 @@ pub fn run_pipeline(
         // 6. Lock-Free Parallel Deduplication of Events and Routing to Person Shards
         let t_events_dedup_start = std::time::Instant::now();
         let (worker_person_events, events_dedup_cpu_ns): (Vec<Vec<Vec<RawPersonEvent>>>, u64) = std::thread::scope(|e_scope| {
-            let jobs = Arc::new(ShardJobs::new((0..NUM_SHARDS).map(|shard|
+            let jobs = Arc::new(ShardJobs::new((0..NUM_EVENT_SHARDS).map(|shard|
                 worker_event_shards.iter().map(|worker| worker.shards[shard].len()).sum()).collect()));
             let mut handles = Vec::new();
             let worker_event_shards = &worker_event_shards;
@@ -1792,7 +1794,7 @@ pub fn run_pipeline(
                         (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect();
 
                     let mut dedup_map: HashMap<u128, DedupWinner, FastBuildHasher> =
-                        HashMap::with_capacity_and_hasher(131072, FastBuildHasher);
+                        HashMap::with_capacity_and_hasher(16384, FastBuildHasher);
 
                     while let Some(shard_idx) = jobs.next() {
                         dedup_map.clear();
@@ -2727,7 +2729,7 @@ mod tests {
     }
     #[test]
     fn compact_event_offsets_preserve_full_timestamps() {
-        assert_eq!(std::mem::size_of::<RawEvent>(), 64);
+        assert_eq!(std::mem::size_of::<RawEvent>(), 48);
         let start = 1_790_812_800_000;
         let mut parsed = ParsedEvents::default();
         for (ingest, ts, wide) in [
@@ -2775,6 +2777,52 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn event_partitions_use_interior_id_bytes() {
+        let mut counts = vec![0usize; NUM_EVENT_SHARDS];
+        for i in 0..16384 {
+            // Fixed first and ninth bytes exposed the previous low-bit skew.
+            let id = format!("e{i:07x}z");
+            let (hash, shard) = hash_event_id_128(id.as_bytes());
+            assert_eq!(hash_event_id_128(id.as_bytes()), (hash, shard));
+            counts[shard] += 1;
+        }
+        assert!(counts.iter().filter(|&&count| count != 0).count() > NUM_EVENT_SHARDS / 2);
+        assert!(counts.iter().max().unwrap() < &128);
+    }
+
+    #[test]
+    fn compact_id_inline_boundary_preserves_bytes_hashes_and_copies() {
+        assert_eq!(std::mem::size_of::<CompactId>(), 16);
+        assert_eq!(std::mem::size_of::<RawPersonEvent>(), 32);
+        assert_eq!(std::mem::size_of::<RawClick>(), 48);
+        assert_eq!(std::mem::size_of::<RawPersonClick>(), 48);
+        for len in [0, 1, 14, 15, 16, 17, 30, 31, 32, 255, 256, 4096] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let a = CompactId::from_bytes(&bytes);
+            let b = CompactId::from_bytes(&bytes);
+            let copied = a;
+            assert_eq!(a.as_bytes(), bytes);
+            assert!(a == b && copied == b);
+            let mut left = FastBuildHasher.build_hasher();
+            let mut right = FastBuildHasher.build_hasher();
+            std::hash::Hash::hash(&a, &mut left);
+            std::hash::Hash::hash(&b, &mut right);
+            assert_eq!(left.finish(), right.finish());
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert!(a < CompactId::from_bytes(&longer));
+            if len > 0 {
+                let mut different = bytes.clone();
+                different[len - 1] += 1;
+                let c = CompactId::from_bytes(&different);
+                assert!(a != c && a < c);
+            }
+            drop(bytes);
+            std::thread::spawn(move || assert!(copied == b)).join().unwrap();
         }
     }
 

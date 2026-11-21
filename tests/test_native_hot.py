@@ -12,12 +12,48 @@ import pyarrow.parquet as pq
 
 
 class NativeHotPersonTests(unittest.TestCase):
-    def test_many_overlapping_clicks_and_sessions(self):
+    def native_binary(self):
         binary = Path(os.environ.get("RUST_INGEST_BIN", "native/ingest/target/release/shopping-ingest")).resolve()
         if not binary.is_file():
             if os.environ.get("REQUIRE_RUST_INGEST") == "1":
                 self.fail("Required native executable is missing")
             self.skipTest("Native executable has not been built")
+        return binary
+
+    def test_raw_oracle_with_opaque_ids_and_repartitioning(self):
+        from tests.test_analytics import canonical
+        from tests.test_integration import raw_case, write_case
+
+        binary = self.native_binary()
+        for seed in range(4):
+            for prefix in ("", "opaque-identity-prefix-λ-"):
+                records, expected = raw_case(seed)
+
+                def rename(value):
+                    return prefix + value if value else value
+
+                # A common prefix preserves exact byte ordering, including
+                # canonical names and click-ID ties, while exercising long IDs.
+                for table, indices in (("events", (0, 1)), ("clicks", (0, 1)), ("links", (0, 1))):
+                    records[table] = [tuple(rename(value) if i in indices else value
+                                            for i, value in enumerate(row))
+                                      if not isinstance(row, str) else row
+                                      for row in records[table]]
+                expected = (canonical([dict(row, user_id=rename(row["user_id"]))
+                                       for row in expected[0]], "user_id"), expected[1])
+                for workers, parts in ((1, 2), (8, 7)):
+                    with self.subTest(seed=seed, opaque=bool(prefix), workers=workers), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        data, output = root / "data", root / "output"
+                        write_case(data, records, seed + parts, parts)
+                        subprocess.run([str(binary), "--data-dir", str(data), "--output-dir", str(output),
+                                        "--workers", str(workers)], check=True, capture_output=True)
+                        actual = tuple(canonical(pq.read_table(output / name).to_pylist(), key)
+                                       for name, key in (("user_daily", "user_id"), ("campaign_daily", "campaign_id")))
+                        self.assertEqual(actual, expected)
+
+    def test_many_overlapping_clicks_and_sessions(self):
+        binary = self.native_binary()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             data = root / "data"
