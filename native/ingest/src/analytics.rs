@@ -624,10 +624,84 @@ thread_local! {
     static DATE_CACHE: std::cell::Cell<([u8; 10], i64)> = const { std::cell::Cell::new(([0u8; 10], 0)) };
 }
 
+/// SIMD-accelerated ISO timestamp parser for the fixed 20-byte `YYYY-MM-DDTHH:MM:SSZ` format.
+/// On x86_64 with SSE4.1, loads the 20 bytes into one XMM register, validates all 6 separator
+/// positions and all digit positions simultaneously, then extracts pairs with zero-extend.
+/// Falls back to scalar on ARM or when SSE4.1 is unavailable.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn parse_f1_sse41(b: &[u8]) -> Option<i64> {
+    use std::arch::x86_64::*;
+    // Load 16 bytes covering positions 0..15. Remaining 4 bytes (16..19) scalar.
+    let v = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+    // Extract digit bytes from fixed positions by shuffling into a compact vector.
+    // Positions of digits in the ISO string:
+    //   0,1,2,3=year  5,6=month  8,9=day  11,12=hour  14,15=min  17,18=sec
+    // We validate the separator bytes by direct comparison.
+    // Separator check (scalar, positions 4,7,10,13,16,19):
+    // pos 4='-', 7='-', 10='T', 13=':', 16=':', 19='Z'
+    // Extract the 16 bytes as array for separator checks:
+    let mut arr = [0u8; 16];
+    _mm_storeu_si128(arr.as_mut_ptr() as *mut __m128i, v);
+    if arr[4] != b'-' || arr[7] != b'-' || arr[10] != b'T' || arr[13] != b':' {
+        return None;
+    }
+    if b[16] != b':' || b[19] != b'Z' {
+        return None;
+    }
+    // Subtract '0' from all 16 positions at once; wrapping subtraction produces > 9 for non-digits.
+    let zero_v = _mm_set1_epi8(b'0' as i8);
+    let digits_v = _mm_sub_epi8(v, zero_v); // wrapping subtraction
+    let mut digits = [0u8; 16];
+    _mm_storeu_si128(digits.as_mut_ptr() as *mut __m128i, digits_v);
+    // Remaining two digit bytes at positions 17,18
+    let s0 = b[17].wrapping_sub(b'0');
+    let s1 = b[18].wrapping_sub(b'0');
+    if s0 > 9 || s1 > 9 { return None; }
+    // Extract digit pairs (validate range ≤9 for each digit):
+    // Year: 0,1,2,3
+    if digits[0]>9||digits[1]>9||digits[2]>9||digits[3]>9 { return None; }
+    // Month: 5,6
+    if digits[5]>9||digits[6]>9 { return None; }
+    // Day: 8,9
+    if digits[8]>9||digits[9]>9 { return None; }
+    // Hour: 11,12
+    if digits[11]>9||digits[12]>9 { return None; }
+    // Min: 14,15
+    if digits[14]>9||digits[15]>9 { return None; }
+    let h = digits[11] as i64 * 10 + digits[12] as i64;
+    let mi = digits[14] as i64 * 10 + digits[15] as i64;
+    let s = s0 as i64 * 10 + s1 as i64;
+    if h > 23 || mi > 59 || s > 59 { return None; }
+    let prefix: [u8; 10] = b[0..10].try_into().unwrap();
+    let days = DATE_CACHE.with(|cell| {
+        let (cached_prefix, cached_days) = cell.get();
+        if prefix == cached_prefix {
+            Some(cached_days)
+        } else {
+            let y = digits[0] as i64 * 1000 + digits[1] as i64 * 100
+                  + digits[2] as i64 * 10  + digits[3] as i64;
+            let m = digits[5] as i64 * 10 + digits[6] as i64;
+            let day = digits[8] as i64 * 10 + digits[9] as i64;
+            let computed = civil_to_days(y, m, day)?;
+            cell.set((prefix, computed));
+            Some(computed)
+        }
+    })?;
+    Some((days * 86400 + h * 3600 + mi * 60 + s) * 1000)
+}
+
 #[inline(always)]
 fn parse_f1_fast(b: &[u8]) -> Option<i64> {
     if b.len() != 20 {
         return None;
+    }
+    // On x86_64 with SSE4.1, use the SIMD path that validates and extracts
+    // all digit/separator positions with one XMM load.
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("sse4.1") {
+        return unsafe { parse_f1_sse41(b) };
     }
     if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
         return None;
@@ -754,6 +828,75 @@ fn parse_unsigned_bytes(b: Option<&[u8]>, maximum: i64) -> Option<i64> {
     Some(n)
 }
 
+/// Single-pass AVX2 CSV scanner: finds all comma positions AND detects quotes
+/// in one pass through memory, eliminating the separate `memchr(b'"')` pre-scan.
+/// Falls back to scalar on non-x86_64 or when AVX2 is unavailable at runtime.
+/// Returns (comma_count, has_quote). Comma positions written into `splits`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn csv_scan_avx2(line: &[u8], splits: &mut [usize], max_splits: usize) -> (usize, bool) {
+    use std::arch::x86_64::*;
+    let comma_v = _mm256_set1_epi8(b',' as i8);
+    let quote_v = _mm256_set1_epi8(b'"' as i8);
+    let len = line.len();
+    let ptr = line.as_ptr();
+    let mut nsplits = 0usize;
+    let mut has_quote = false;
+    let mut i = 0usize;
+    // 32-byte chunks
+    while i + 32 <= len {
+        let chunk = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+        let qmask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, quote_v)) as u32;
+        if qmask != 0 {
+            return (0, true);
+        }
+        let cmask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, comma_v)) as u32;
+        let mut m = cmask;
+        while m != 0 {
+            let bit = m.trailing_zeros() as usize;
+            if nsplits < max_splits {
+                splits[nsplits] = i + bit;
+                nsplits += 1;
+            } else {
+                return (nsplits + m.count_ones() as usize, false); // overflow
+            }
+            m &= m - 1;
+        }
+        i += 32;
+    }
+    // Scalar tail (at most 31 bytes)
+    while i < len {
+        let b = line[i];
+        if b == b'"' { return (0, true); }
+        if b == b',' {
+            if nsplits < max_splits {
+                splits[nsplits] = i;
+                nsplits += 1;
+            } else {
+                nsplits += 1;
+            }
+        }
+        i += 1;
+    }
+    (nsplits, false)
+}
+
+/// Scalar fallback CSV scanner used on non-x86_64 or when AVX2 unavailable.
+#[inline(always)]
+fn csv_scan_scalar(line: &[u8], splits: &mut [usize], max_splits: usize) -> (usize, bool) {
+    let mut nsplits = 0usize;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b'"' { return (0, true); }
+        if b == b',' {
+            if nsplits < max_splits {
+                splits[nsplits] = i;
+            }
+            nsplits += 1;
+        }
+    }
+    (nsplits, false)
+}
+
 #[inline(always)]
 fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [u8]>; N]) -> bool {
     let line = if !line.is_empty() && line[line.len() - 1] == b'\n' {
@@ -765,33 +908,45 @@ fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [
         return false;
     }
 
-    if memchr::memchr(b'"', line).is_none() {
-        // Single AVX pass: collect all comma positions, then slice fields.
-        // On Intel AVX-512 this scans the whole line in one vectorized pass
-        // instead of N separate memchr calls.
-        let len = line.len();
-        let mut splits = [len; N]; // sentinel: last field ends at len
-        let mut nsplits = 0usize;
-        for pos in memchr::memchr_iter(b',', line) {
-            if nsplits >= N {
-                return false; // too many commas → wrong field count
+    // Fast path: combined single-pass AVX2 (or scalar) scan finds commas + quotes together.
+    // This eliminates the separate memchr(b'"') pre-scan from the previous version.
+    let mut splits = [0usize; N];
+    let (nsplits, has_quote) = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                // SAFETY: avx2 feature confirmed at runtime above.
+                unsafe { csv_scan_avx2(line, &mut splits, N) }
+            } else {
+                csv_scan_scalar(line, &mut splits, N)
             }
-            splits[nsplits] = pos;
-            nsplits += 1;
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            csv_scan_scalar(line, &mut splits, N)
+        }
+    };
+
+    if !has_quote {
+        // No-quote fast path: slice fields from collected comma positions.
         if nsplits + 1 != N {
             return false;
         }
+        let len = line.len();
         let mut prev = 0usize;
-        for i in 0..N {
+        for i in 0..N - 1 {
             let end = splits[i];
             let raw = &line[prev..end];
             fields[i] = if raw.is_empty() { None } else { Some(raw) };
             prev = end + 1;
         }
+        // Last field
+        let raw = &line[prev..len];
+        fields[N - 1] = if raw.is_empty() { None } else { Some(raw) };
         return true;
     }
 
+    // Quote-containing fallback (rare in event data): sequential scan.
     let mut count = 0;
     let mut start = 0;
     let len = line.len();
@@ -2181,7 +2336,10 @@ mod tests {
         }
         cases.extend(["0000-01-01T00:00:00Z", "2026-02-29T00:00:00Z",
                       "2028-02-29T24:00:00Z", "2028-02-29T00:60:00Z",
-                      "2028-02-29T00:00:60Z", "202x-02-28T00:00:00Z"]
+                      "2028-02-29T00:00:60Z", "202x-02-28T00:00:00Z",
+                      "202/-02-28T00:00:00Z", "2026-0/-28T00:00:00Z",
+                      "2026-02-2/T00:00:00Z", "2026-02-28T/0:00:00Z",
+                      "2026-02-28T00:/0:00Z", "2026-02-28T00:00:/0Z"]
                      .map(str::to_owned));
         for _ in 0..3 {
             for value in &cases {
@@ -2417,5 +2575,32 @@ mod tests {
             }
         }
         assert_eq!(user_names, vec![long_small.to_string()]);
+    }
+
+    #[test]
+    fn test_parse_csv_line_simd_and_quotes() {
+        let mut fields = [None; 7];
+        // Standard unquoted line
+        let line = b"e1,u1,2026-01-01T00:00:00Z,2026-01-01T00:00:01Z,view,p1,\n";
+        assert!(super::parse_csv_line(line, &mut fields));
+        assert_eq!(fields[0], Some(&b"e1"[..]));
+        assert_eq!(fields[1], Some(&b"u1"[..]));
+        assert_eq!(fields[4], Some(&b"view"[..]));
+        assert_eq!(fields[5], Some(&b"p1"[..]));
+        assert_eq!(fields[6], None);
+
+        // Quoted line
+        let qline = b"\"e2\",u2,2026-01-01T00:00:00Z,2026-01-01T00:00:01Z,\"cart\",p2,100\n";
+        assert!(super::parse_csv_line(qline, &mut fields));
+        assert_eq!(fields[0], Some(&b"e2"[..]));
+        assert_eq!(fields[4], Some(&b"cart"[..]));
+        assert_eq!(fields[6], Some(&b"100"[..]));
+
+        // Invalid comma count
+        let bad_line = b"e1,u1,too,few,fields\n";
+        assert!(!super::parse_csv_line(bad_line, &mut fields));
+
+        let bad_line2 = b"e1,u1,1,2,3,4,5,too,many\n";
+        assert!(!super::parse_csv_line(bad_line2, &mut fields));
     }
 }
