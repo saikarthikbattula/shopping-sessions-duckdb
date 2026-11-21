@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pyarrow.parquet as pq
 
-from pipeline.pipeline import main
+from tests.native_support import run_native
 from tests.test_analytics import BASE, CAMPAIGNS, DAY, GAP, PRODUCTS, WEEK, canonical, reference
 
 
@@ -161,16 +161,10 @@ class RawIntegrationTests(unittest.TestCase):
                     root = Path(tmp)
                     data, output = root / 'data', root / 'output'
                     write_case(data, records, seed + parts, parts)
-                    stdout = io.StringIO()
-                    with (patch.dict(os.environ, dict(DATA_DIR=str(data), OUTPUT_DIR=str(output),
-                                                     SCRATCH_DIR=str(root / 'scratch'), NCPU='2', MEM_GB='2')),
-                          contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(stdout)):
-                        main()
-                    self.assertEqual(stdout.getvalue(), '')
+                    run_native(data, output, workers=2)
                     actual = tuple(canonical(pq.read_table(output / name).to_pylist(), key)
                                    for name, key in [('user_daily', 'user_id'), ('campaign_daily', 'campaign_id')])
                     self.assertEqual(actual, expected)
-                    self.assertEqual(list((root / 'scratch').iterdir()), [])
 
 
 if __name__ == '__main__':

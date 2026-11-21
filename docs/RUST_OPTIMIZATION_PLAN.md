@@ -1,3 +1,6 @@
+> Historical workstream record. Python/staging commands below are retired.
+> Use the current README.md and DATA_CONTRACT.md for the Rust-only runtime.
+
 # Incremental Rust optimization
 
 Source: user-approved plan `inline:rust-optimization`, executed in numbered order. Karthik owns every step. Each increment uses a task branch and PR; agents never merge to main or enable auto-merge.

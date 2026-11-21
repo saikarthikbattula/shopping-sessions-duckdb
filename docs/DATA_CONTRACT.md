@@ -1,49 +1,34 @@
-# Shared ingestion-to-DuckDB contract
+# Rust input/output contract
 
-Status: implemented in `pipeline/contracts.py`, with integrated ingestion and analytics implementations. The interface and schemas are unchanged. The supplied rules remain authoritative.
+The user-requested Rust-only migration retires PreparedInputs, the Python
+prepare_inputs/run_pipeline interface, the Python/native staging adapter, and
+intermediate events/clicks Parquet staging. Their historical definitions remain
+available at Git revision 4e0f829. No production consumer uses those interfaces.
 
-## Modules and calls
+The official rules.md and final output schemas are unchanged. The production
+interface is native/ingest's complete CSV-to-Parquet executable, documented in
+its README. It reads every CSV in events/, clicks/ and links/, plus products.csv,
+campaigns.csv and manifest.json. Input directories remain read-only.
 
-Integrator owns `pipeline/contracts.py` with frozen `PreparedInputs` and these fields:
+Identity resolution uses all valid links before event/click assignment, including
+unused minimum IDs and transitive shared-device components. Preserve exact UTF-8
+string semantics. Deduplicate events globally by smallest ingestion time before
+validation and lateness filtering. Preserve every specified millisecond boundary.
 
-- `events_dir: Path`, `clicks_dir: Path`: staged Parquet directories.
-- `products_path: Path`, `campaigns_path: Path`: staged lookup Parquet files.
-- `window_start_ms: int`, `window_end_ms: int`: manifest boundaries.
+## Outputs
 
-Import `EVENTS_SCHEMA`, `CLICKS_SCHEMA`, `PRODUCTS_SCHEMA`, and `CAMPAIGNS_SCHEMA` from that module when writing staged Arrow/Parquet data. `USER_DAILY_SCHEMA` and `CAMPAIGN_DAILY_SCHEMA` also describe the required outputs. The integrator's `make test` checks these schemas across the Arrow/Parquet/DuckDB boundary; it does not test workstream correctness.
+`user_daily/`: user_id (string), day (Parquet DATE), sessions (integer), events
+(integer), revenue_cents (integer), top_category (nullable string).
 
-Pranav implements `prepare_inputs(data_dir: Path, scratch_dir: Path, *, batch_rows: int = 65536) -> PreparedInputs` in `pipeline/ingest.py`. Helpers belong in `pipeline/parsing.py` and `pipeline/identity.py`.
+`campaign_daily/`: campaign_id (string), channel (string), day (Parquet DATE),
+sessions (integer), purchasing_sessions (integer), revenue_cents (integer),
+assisted_sessions (integer).
 
-Karthik implements `run_pipeline(con: duckdb.DuckDBPyConnection, prepared: PreparedInputs, output_dir: Path) -> None` in `pipeline/analytics.py`; SQL may live under `pipeline/sql/`.
+Output folders contain one or more directly nested Parquet files, including typed
+empty outputs. Row order and file count are irrelevant. Never create duplicate
+logical keys or extra columns. Tests/schemas.py is a local validation definition,
+not a production dependency or an alternative pipeline.
 
-Integrator owns the existing `pipeline/pipeline.py`: environment/configuration, DuckDB connection, ingestion call, analytical call, timings, and failure exit. It owns Dockerfile, run.sh, Makefile, requirements, and harness integration. Neither owner creates a connection or executes the pipeline on module import.
-
-Use package imports such as `from pipeline.contracts import PreparedInputs`. The canonical entrypoint is `python -m pipeline.pipeline`, not direct script execution. The integrator supplies a dedicated temporary working directory inside `SCRATCH_DIR`, closes the connection, and removes only that directory when the invocation finishes. Its DuckDB memory limit is 75% of `MEM_GB` to reserve Python/Arrow headroom; all spills use that working directory.
-
-## Staged schemas
-
-String fields are Arrow UTF-8; milliseconds and prices are signed int64; `payload_valid` is a non-null Boolean. Nullability below is explicit. Numeric staging never uses floats.
-
-| Table | Columns |
-| --- | --- |
-| events | `event_id: string NOT NULL`, `person_id: string nullable`, `ingest_ms: int64 NOT NULL`, `ts_ms: int64 nullable`, `event_type: string nullable`, `product_id: string nullable`, `price_cents: int64 nullable`, `payload_valid: bool NOT NULL` |
-| clicks | `click_id: string NOT NULL`, `person_id: string nullable`, `campaign_id: string nullable`, `ts_ms: int64 nullable`, `payload_valid: bool NOT NULL` |
-| products | `product_id: string NOT NULL`, `category: string NOT NULL` |
-| campaigns | `campaign_id: string NOT NULL`, `channel: string NOT NULL` |
-
-Events: drop only malformed lines and empty event IDs before staging. Keep every other copy, including invalid and late ones. `payload_valid` means non-empty user, valid in-window timestamp, exact allowed type, non-empty product, and valid purchase price where applicable. Lateness is deliberately excluded and applied by Karthik after deduplication. Invalid/out-of-window timestamps become null. `price_cents` is null for non-purchases and invalid prices. For valid purchases it is the parsed integer. Ingestion times are always valid by the input rules.
-
-Clicks: drop only malformed lines and empty click IDs before staging. Keep remaining copies; `payload_valid` means non-empty user, valid in-window timestamp, and known campaign. Invalid/out-of-window timestamps become null. Karthik deduplicates before filtering.
-
-Canonical person names derive from all valid links, independent of event/click validation. Null users remain null. Unlinked IDs map to themselves. Do not normalize strings or replace IDs with numeric suffixes. UTF-8 byte order governs person names and every specified tie.
-
-## Staging and operational behavior
-
-- Write batches to a dedicated subdirectory of the provided scratch directory. Read every input `*.csv`, skip exactly its first physical header line, and process header-like data rows normally.
-- Use typed Parquet even for empty inputs: each staged directory must contain at least one readable file with the agreed schema.
-- No ordering guarantee across or within staged files. Do not partition events by user before global event-ID deduplication.
-- Use the same strict CSV dialect for lookups. They are guaranteed clean and unique; stage their strings unchanged.
-- Do not delete staged files until the analytical consumer finishes. Integrator manages successful-run cleanup and shared memory budgeting.
-- Malformed input rows are skipped as specified; operational failures raise exceptions and must not produce a success exit. No runtime downloads or stdout data dumps.
-
-Contract changes must be coordinated before either owner changes schema or stage ordering. Document proposals in the handoff results; do not silently adapt one side.
+The specialized generator path and exact fallback are both Rust. Fast-path
+assumptions must be verified; unsupported records select the exact computation.
+Changing the implementation cannot change the official expected outputs.

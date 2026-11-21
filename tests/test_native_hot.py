@@ -9,6 +9,7 @@ import tempfile
 import unittest
 
 import pyarrow.parquet as pq
+from tests.native_support import run_native
 
 
 class NativeHotPersonTests(unittest.TestCase):
@@ -46,8 +47,7 @@ class NativeHotPersonTests(unittest.TestCase):
                         root = Path(tmp)
                         data, output = root / "data", root / "output"
                         write_case(data, records, seed + parts, parts)
-                        subprocess.run([str(binary), "--data-dir", str(data), "--output-dir", str(output),
-                                        "--workers", str(workers)], check=True, capture_output=True)
+                        run_native(data, output, workers=workers)
                         actual = tuple(canonical(pq.read_table(output / name).to_pylist(), key)
                                        for name, key in (("user_daily", "user_id"), ("campaign_daily", "campaign_id")))
                         self.assertEqual(actual, expected)
@@ -83,8 +83,7 @@ class NativeHotPersonTests(unittest.TestCase):
                     assists[campaign, day] += 1
             for workers in (1, 8):
                 output = root / f"output-{workers}"
-                subprocess.run([str(binary), "--data-dir", str(data), "--output-dir", str(output),
-                                "--workers", str(workers)], check=True, capture_output=True)
+                run_native(data, output, workers=workers)
                 rows = pq.read_table(output / "campaign_daily").to_pylist()
                 actual = {(row["campaign_id"], row["day"]): row for row in rows}
                 self.assertEqual(set(actual), set(sessions) | set(assists))

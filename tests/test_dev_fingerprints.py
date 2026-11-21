@@ -13,7 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from scripts.run_fixtures import SCHEMAS, load_expected
-from pipeline.contracts import USER_DAILY_SCHEMA, CAMPAIGN_DAILY_SCHEMA
+from tests.schemas import USER_DAILY_SCHEMA, CAMPAIGN_DAILY_SCHEMA
 
 
 class DevFingerprintTests(unittest.TestCase):

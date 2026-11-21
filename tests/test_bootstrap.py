@@ -1,138 +1,43 @@
-"""Integration checks for shared plumbing, not competition-correctness tests."""
-
-import contextlib
-import io
+"""Rust-only entrypoint, CLI and output contract checks."""
 import os
+from pathlib import Path
+import subprocess
 import tempfile
 import unittest
-from pathlib import Path
-from unittest.mock import patch
-
-import pyarrow as pa
 import pyarrow.parquet as pq
+from tests.native_support import native_binary, run_native
+from tests.schemas import USER_DAILY_SCHEMA, CAMPAIGN_DAILY_SCHEMA
 
-from pipeline.contracts import (
-    CAMPAIGN_DAILY_SCHEMA,
-    CAMPAIGNS_SCHEMA,
-    CLICKS_SCHEMA,
-    EVENTS_SCHEMA,
-    PRODUCTS_SCHEMA,
-    USER_DAILY_SCHEMA,
-    PreparedInputs,
-)
-from pipeline.pipeline import configure_connection, main
+ROOT = Path(__file__).resolve().parents[1]
 
 
-class BootstrapIntegrationTests(unittest.TestCase):
-    def test_staged_parquet_preserves_exact_strings_nulls_and_int64(self):
+class RuntimeTests(unittest.TestCase):
+    def test_no_argument_entrypoint_matches_explicit_rust_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            event_path = root / "events.parquet"
-            large_ms = 2**53 + 1
-            table = pa.Table.from_pylist([
-                {
-                    "event_id": "e\r", "person_id": " é\t ",
-                    "ingest_ms": large_ms, "ts_ms": None,
-                    "event_type": "purchase", "product_id": "p1",
-                    "price_cents": None, "payload_valid": False,
-                },
-                {
-                    "event_id": "e2", "person_id": None,
-                    "ingest_ms": large_ms + 1, "ts_ms": large_ms,
-                    "event_type": "view", "product_id": " p1",
-                    "price_cents": None, "payload_valid": False,
-                },
-            ], schema=EVENTS_SCHEMA)
-            pq.write_table(table, event_path)
-            con = configure_connection(root / "scratch'quoted", ncpu=2, mem_gb=2)
-            try:
-                rows = con.execute(
-                    "SELECT event_id, person_id, ingest_ms, ts_ms, price_cents, "
-                    "payload_valid FROM read_parquet(?) ORDER BY ingest_ms",
-                    [str(event_path)],
-                ).fetchall()
-                self.assertEqual(rows, [
-                    ("e\r", " é\t ", large_ms, None, None, False),
-                    ("e2", None, large_ms + 1, large_ms, None, False),
-                ])
-                self.assertEqual(con.execute("SELECT current_setting('threads')").fetchone()[0], 2)
-                self.assertEqual(
-                    con.execute("SELECT current_setting('preserve_insertion_order')").fetchone()[0], False
-                )
-                spill = con.execute("SELECT current_setting('temp_directory')").fetchone()[0]
-                self.assertEqual(Path(spill), root / "scratch'quoted" / "duckdb_tmp")
-            finally:
-                con.close()
+            data = ROOT/'fixtures/E1/data'
+            if not data.exists(): data = ROOT/'fixtures/E1/input'
+            run_native(data,root/'explicit')
+            env = dict(os.environ,DATA_DIR=str(data),OUTPUT_DIR=str(root/'environment'),
+                       NCPU='2',RUST_INGEST_BIN=str(native_binary()),PYTHON='/nonexistent',
+                       INGEST_BACKEND='python')
+            result=subprocess.run([str(ROOT/'run.sh')],env=env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(result.stdout,'')
+            for table,schema in [('user_daily',USER_DAILY_SCHEMA),('campaign_daily',CAMPAIGN_DAILY_SCHEMA)]:
+                actual=pq.read_table(root/'environment'/table)
+                self.assertEqual(actual.schema.remove_metadata(),schema)
+                def rows(path): return sorted(pq.read_table(path/table).to_pylist(),key=lambda r: repr(sorted(r.items())))
+                self.assertEqual(rows(root/'explicit'),rows(root/'environment'))
 
-    def test_empty_staged_schemas_are_readable_by_duckdb(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            con = configure_connection(root, ncpu=1, mem_gb=1)
-            try:
-                for name, schema in (
-                    ("events", EVENTS_SCHEMA), ("clicks", CLICKS_SCHEMA),
-                    ("products", PRODUCTS_SCHEMA), ("campaigns", CAMPAIGNS_SCHEMA),
-                ):
-                    with self.subTest(name=name):
-                        path = root / f"{name}.parquet"
-                        pq.write_table(pa.Table.from_batches([], schema=schema), path)
-                        self.assertEqual(pq.read_schema(path), schema)
-                        self.assertEqual(
-                            con.execute("SELECT count(*) FROM read_parquet(?)", [str(path)]).fetchone()[0], 0
-                        )
-            finally:
-                con.close()
+    def test_missing_executable_fails_without_python_fallback(self):
+        env=dict(os.environ,RUST_INGEST_BIN='/nonexistent/shopping-ingest')
+        result=subprocess.run([str(ROOT/'run.sh')],env=env,capture_output=True,text=True)
+        self.assertEqual(result.returncode,127)
+        self.assertIn('Rust executable missing',result.stderr)
 
-    def test_orchestrator_connects_stages_and_cleans_only_its_work_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            data, output, scratch = (root / part for part in ("data", "output", "scratch"))
-            scratch.mkdir()
-            sentinel = scratch / "keep.txt"
-            sentinel.write_text("unrelated scratch file")
-            seen = {}
-
-            def fake_prepare(data_dir, work_dir):
-                self.assertEqual(data_dir, data)
-                seen["work"] = work_dir
-                return PreparedInputs(
-                    work_dir / "events", work_dir / "clicks",
-                    work_dir / "products.parquet", work_dir / "campaigns.parquet",
-                    0, 1,
-                )
-
-            def fake_analytics(con, prepared, output_dir):
-                self.assertEqual(con.execute("SELECT 42").fetchone()[0], 42)
-                self.assertEqual(prepared.events_dir, seen["work"] / "events")
-                self.assertEqual(output_dir, output)
-                for name, schema in (
-                    ("user_daily", USER_DAILY_SCHEMA),
-                    ("campaign_daily", CAMPAIGN_DAILY_SCHEMA),
-                ):
-                    folder = output_dir / name
-                    folder.mkdir(parents=True)
-                    pq.write_table(pa.Table.from_batches([], schema=schema), folder / "part-0.parquet")
-
-            stdout, stderr = io.StringIO(), io.StringIO()
-            with (
-                patch.dict(os.environ, {
-                    "DATA_DIR": str(data), "OUTPUT_DIR": str(output),
-                    "SCRATCH_DIR": str(scratch), "NCPU": "1", "MEM_GB": "1",
-                }),
-                patch("pipeline.pipeline.prepare_inputs", side_effect=fake_prepare),
-                patch("pipeline.pipeline.run_pipeline", side_effect=fake_analytics),
-                contextlib.redirect_stdout(stdout),
-                contextlib.redirect_stderr(stderr),
-            ):
-                main()
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIn("total:", stderr.getvalue())
-            self.assertFalse(seen["work"].exists())
-            self.assertTrue(sentinel.exists())
-            for name in ("user_daily", "campaign_daily"):
-                schema = pq.read_schema(output / name / "part-0.parquet")
-                self.assertEqual(schema.field("day").type, pa.date32())
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_invalid_cpu_and_retired_staging_arguments_fail(self):
+        for args,env in [([],dict(os.environ,NCPU='0')),(['--stage-dir','out'],os.environ),
+                         (['--workers','bad'],os.environ)]:
+            result=subprocess.run([str(native_binary()),*args],env=env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,64,result.stderr)

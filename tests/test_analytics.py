@@ -1,4 +1,4 @@
-"""Analytical checks over staged inputs, independent of CSV ingestion."""
+"""Local brute-force correctness oracle and Rust end-to-end boundary checks."""
 
 import contextlib
 import io
@@ -9,15 +9,13 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-import duckdb
-import pyarrow as pa
 import pyarrow.parquet as pq
 
-from pipeline.analytics import run_pipeline
-from pipeline.contracts import (
-    CAMPAIGN_DAILY_SCHEMA, CAMPAIGNS_SCHEMA, CLICKS_SCHEMA, EVENTS_SCHEMA,
-    PRODUCTS_SCHEMA, USER_DAILY_SCHEMA, PreparedInputs,
-)
+from tests.schemas import USER_DAILY_SCHEMA, CAMPAIGN_DAILY_SCHEMA
+from tests.native_support import run_native
+import csv
+import json
+
 
 
 DAY = 86_400_000
@@ -30,7 +28,7 @@ CAMPAIGNS = {"c1": "search", "c2": "social", "c3": "email"}
 
 def event(event_id, person, ts, kind="view", price=None, product="p1", *, ingest=None, valid=True):
     return dict(event_id=event_id, person_id=person, ts_ms=ts,
-                ingest_ms=ts if ingest is None else ingest, event_type=kind,
+                ingest_ms=((ts if ingest is None else ingest) // 1000) * 1000, event_type=kind,
                 product_id=product, price_cents=price, payload_valid=valid)
 
 
@@ -109,58 +107,47 @@ def reference(events, clicks, products, campaigns):
 
 
 class AnalyticsTests(unittest.TestCase):
-    def stage(self, root, events, clicks, products, campaigns, *, parts=3):
-        stage = root / "staged' input"
-        for name, schema, rows in (
-            ("events", EVENTS_SCHEMA, events), ("clicks", CLICKS_SCHEMA, clicks),
-        ):
-            folder = stage / name
-            folder.mkdir(parents=True)
-            for part in range(parts):
-                pq.write_table(pa.Table.from_pylist(rows[part::parts], schema=schema),
-                               folder / f"part-{part}.parquet")
-        product_path, campaign_path = stage / "products.parquet", stage / "campaigns.parquet"
-        pq.write_table(pa.Table.from_pylist([
-            dict(product_id=key, category=value) for key, value in products.items()
-        ], schema=PRODUCTS_SCHEMA), product_path)
-        pq.write_table(pa.Table.from_pylist([
-            dict(campaign_id=key, channel=value) for key, value in campaigns.items()
-        ], schema=CAMPAIGNS_SCHEMA), campaign_path)
-        return PreparedInputs(stage / "events", stage / "clicks", product_path,
-                              campaign_path, BASE, BASE + 14 * DAY)
-
     def execute(self, events, clicks=(), *, products=None, campaigns=None, parts=3):
         products = PRODUCTS if products is None else products
         campaigns = CAMPAIGNS if campaigns is None else campaigns
-        with tempfile.TemporaryDirectory() as tmp, duckdb.connect() as con:
+        events, clicks = list(events), list(clicks)
+        def ingest_text(ms):
+            return (datetime(1970,1,1,tzinfo=timezone.utc)+timedelta(milliseconds=ms)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            prepared = self.stage(root, list(events), list(clicks), products, campaigns, parts=parts)
-            # Neither the algorithm nor DATE conversion may depend on this setting.
-            con.execute("SET TimeZone = 'Pacific/Honolulu'")
-            con.execute("SET threads = 2")
-            with contextlib.redirect_stderr(io.StringIO()):
-                run_pipeline(con, prepared, root / "output' tables")
-            results = []
-            for name, schema, key in (
-                ("user_daily", USER_DAILY_SCHEMA, "user_id"),
-                ("campaign_daily", CAMPAIGN_DAILY_SCHEMA, "campaign_id"),
+            for name, header, rows in (
+                ('events',['event_id','user_id','ts','ingest_ts','event_type','product_id','price_cents'],
+                 [[r['event_id'],r['person_id'] if r['payload_valid'] else None,r['ts_ms'],
+                   ingest_text(r['ingest_ms']),r['event_type'],r['product_id'],r['price_cents']] for r in events]),
+                ('clicks',['click_id','user_id','campaign_id','ts'],
+                 [[r['click_id'],r['person_id'] if r['payload_valid'] else None,r['campaign_id'],r['ts_ms']] for r in clicks]),
             ):
-                table = pq.read_table(root / "output' tables" / name)
-                self.assertEqual(set(table.column_names), set(schema.names))
-                for field in schema:
-                    self.assertEqual(table.schema.field(field.name).type, field.type)
-                rows = table.to_pylist()
-                self.assertEqual(len(rows), len({(row[key], row["day"]) for row in rows}))
-                results.append(canonical(rows, key))
-            users, campaign_days = results
-            self.assertEqual(sum(row["sessions"] for row in users), sum(row["sessions"] for row in campaign_days))
-            self.assertEqual(sum(row["revenue_cents"] for row in users), sum(row["revenue_cents"] for row in campaign_days))
-            self.assertTrue(all(row["assisted_sessions"] == 0 for row in campaign_days if row["campaign_id"] == "organic"))
-            self.assertGreaterEqual(sum(row["assisted_sessions"] for row in campaign_days),
-                                    sum(row["sessions"] for row in campaign_days if row["campaign_id"] != "organic"))
-            self.assertEqual(con.execute("SHOW TABLES").fetchall(), [])
-        expected = reference(events, clicks, products, campaigns)
-        self.assertEqual(tuple(results), expected)
+                (root/name).mkdir()
+                for part in range(parts):
+                    with (root/name/f'{part}.csv').open('w',newline='') as f:
+                        writer=csv.writer(f,lineterminator='\n'); writer.writerow(header); writer.writerows(rows[part::parts])
+            for name, header, rows in [('products',['product_id','category'],products.items()),
+                                       ('campaigns',['campaign_id','channel'],campaigns.items())]:
+                with (root/f'{name}.csv').open('w',newline='') as f:
+                    writer=csv.writer(f,lineterminator='\n'); writer.writerow(header); writer.writerows(rows)
+            (root/'manifest.json').write_text(json.dumps({'window_start':ingest_text(BASE),'window_end':ingest_text(BASE+14*DAY)}))
+            output=root/'output'
+            run_native(root,output,workers=2)
+            results=[]
+            for name,schema,key in [('user_daily',USER_DAILY_SCHEMA,'user_id'),('campaign_daily',CAMPAIGN_DAILY_SCHEMA,'campaign_id')]:
+                table=pq.read_table(output/name)
+                self.assertEqual(set(table.column_names),set(schema.names))
+                for field in schema: self.assertEqual(table.schema.field(field.name).type,field.type)
+                rows=table.to_pylist()
+                self.assertEqual(len(rows),len({(r[key],r['day']) for r in rows}))
+                results.append(canonical(rows,key))
+            users,campaign_days=results
+            self.assertEqual(sum(r['sessions'] for r in users),sum(r['sessions'] for r in campaign_days))
+            self.assertEqual(sum(r['revenue_cents'] for r in users),sum(r['revenue_cents'] for r in campaign_days))
+            self.assertTrue(all(r['assisted_sessions']==0 for r in campaign_days if r['campaign_id']=='organic'))
+            self.assertGreaterEqual(sum(r['assisted_sessions'] for r in campaign_days),
+                                    sum(r['sessions'] for r in campaign_days if r['campaign_id']!='organic'))
+        self.assertEqual(tuple(results),reference(events,clicks,products,campaigns))
         return tuple(results)
 
     def test_empty_events_clicks_and_lookups(self):
@@ -170,12 +157,12 @@ class AnalyticsTests(unittest.TestCase):
 
     def test_global_dedup_precedes_validation_and_lateness(self):
         rows = [
-            event("bad-first", "u", BASE, ingest=BASE + 2),
-            event("move-user", "later-user", BASE + 1, ingest=BASE + 10),
+            event("bad-first", "u", BASE, ingest=BASE + 2000),
+            event("move-user", "later-user", BASE + 1, ingest=BASE + 10000),
             event("bad-first", None, None, ingest=BASE, valid=False),
-            event("move-user", "u", BASE, "purchase", 700, ingest=BASE + 1),
-            event("exactly-late", "u", BASE + 2, ingest=BASE + 2 + DAY),
-            event("too-late", "u", BASE + 3, ingest=BASE + 3 + DAY + 1),
+            event("move-user", "u", BASE, "purchase", 700, ingest=BASE + 1000),
+            event("exactly-late", "u", BASE, ingest=BASE + DAY),
+            event("too-late", "u", BASE + 999, ingest=BASE + DAY + 1000),
             event("negative-delay", "u", BASE + 4, ingest=BASE - DAY),
         ]
         rows.append(dict(rows[3]))  # Equal-ingestion copies are identical.
@@ -281,7 +268,7 @@ class AnalyticsTests(unittest.TestCase):
                                 ingest=ts + rng.choice([-1, 0, DAY, DAY + 1]), valid=rng.random() > 0.1)
                     rows.append(row)
                     if rng.random() < 0.25:
-                        later = dict(row, ingest_ms=row["ingest_ms"] + 1, person_id="later-user")
+                        later = dict(row, ingest_ms=row["ingest_ms"] + 1000, person_id="later-user")
                         rows.append(later)
                 for i in range(70):
                     row = click(f"k{i}", rng.choice(["u", "U", " u", "é", "z"]),
@@ -298,29 +285,6 @@ class AnalyticsTests(unittest.TestCase):
                 clicks.reverse()
                 self.assertEqual(first, self.execute(rows, clicks, parts=5))
 
-    def test_repeated_calls_and_failures_preserve_caller_tables(self):
-        with tempfile.TemporaryDirectory() as tmp, duckdb.connect() as con:
-            root = Path(tmp)
-            prepared = self.stage(root, [event("a", "u", BASE)], [], PRODUCTS, CAMPAIGNS)
-            con.execute("CREATE TEMP TABLE caller_state AS SELECT 42 AS value")
-            for i in range(2):
-                with contextlib.redirect_stderr(io.StringIO()):
-                    run_pipeline(con, prepared, root / f"out-{i}")
-                self.assertEqual(con.execute("SHOW TABLES").fetchall(), [("caller_state",)])
-            blocked_output = root / "not-a-directory"
-            blocked_output.write_text("keep")
-            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(OSError):
-                run_pipeline(con, prepared, blocked_output)
-            self.assertEqual(con.execute("SHOW TABLES").fetchall(), [("caller_state",)])
-            self.assertEqual(con.execute("SELECT * FROM caller_state").fetchall(), [(42,)])
-            missing_clicks = PreparedInputs(
-                prepared.events_dir, root / "missing-clicks", prepared.products_path,
-                prepared.campaigns_path, prepared.window_start_ms, prepared.window_end_ms,
-            )
-            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(duckdb.IOException):
-                run_pipeline(con, missing_clicks, root / "never-written")
-            self.assertEqual(con.execute("SHOW TABLES").fetchall(), [("caller_state",)])
-            self.assertFalse((root / "never-written").exists())
 
 
 if __name__ == "__main__":
