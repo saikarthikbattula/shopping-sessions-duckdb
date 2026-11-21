@@ -215,16 +215,15 @@ struct ParsedEvents {
 }
 
 impl ParsedEvents {
-    #[inline]
+    #[inline(always)]
     fn encode_times(&mut self, start: i64, ingest: i64, ts: Option<i64>) -> (u32, i32, u8) {
-        let offset = |value: i64| {
-            value.checked_sub(start).and_then(|delta| i32::try_from(delta).ok())
+        let d_ingest = ingest.wrapping_sub(start);
+        let (d_ts, missing) = match ts {
+            Some(t) => (t.wrapping_sub(start), 0),
+            None => (0, NO_EVENT_TS),
         };
-        let ingest_offset = offset(ingest);
-        let ts_offset = ts.map_or(Some(0), offset);
-        let missing = if ts.is_none() { NO_EVENT_TS } else { 0 };
-        if let (Some(ingest_offset), Some(ts_offset)) = (ingest_offset, ts_offset) {
-            (ingest_offset as u32, ts_offset, missing)
+        if (d_ingest as i32 as i64 == d_ingest) & (d_ts as i32 as i64 == d_ts) {
+            ((d_ingest as i32) as u32, d_ts as i32, missing)
         } else {
             let index = u32::try_from(self.wide_times.len()).expect("too many wide timestamp pairs");
             self.wide_times.push((ingest, ts.unwrap_or(i64::MIN)));
@@ -410,7 +409,7 @@ const NUM_SHARDS: usize = 256;
 fn get_shard_bytes(key: &[u8]) -> usize {
     let mut hasher = FastBuildHasher.build_hasher();
     hasher.write(key);
-    (hasher.finish() as usize) % NUM_SHARDS
+    (hasher.finish() as usize) & (NUM_SHARDS - 1)
 }
 
 #[inline(always)]
@@ -440,7 +439,7 @@ fn hash_event_id_128(bytes: &[u8]) -> (u128, usize) {
     // Length mixing prevents collisions between differently-padded inputs.
     h1 ^= (bytes.len() as u64).wrapping_mul(0x1c69b3f74ac4ae35);
     h2 ^= (bytes.len() as u64).wrapping_mul(0x517cc1b727220a95);
-    let shard = (h1 as usize) % NUM_SHARDS;
+    let shard = (h1 as usize) & (NUM_SHARDS - 1);
     (((h1 as u128) << 64) | (h2 as u128), shard)
 }
 
@@ -787,11 +786,20 @@ fn parse_ts_bytes(b: &[u8]) -> Option<i64> {
     if b.is_empty() {
         return None;
     }
-    if b.iter().all(u8::is_ascii_digit) {
-        let mut n = 0i64;
-        for &c in b {
-            n = n.checked_mul(10)?.checked_add(i64::from(c - b'0'))?;
+    // Single-pass digit check and parse for epoch millisecond integers
+    let mut n = 0i64;
+    let mut is_digits = true;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            is_digits = false;
+            break;
         }
+        n = match n.checked_mul(10).and_then(|v| v.checked_add(i64::from(c - b'0'))) {
+            Some(v) => v,
+            None => return None,
+        };
+    }
+    if is_digits {
         return Some(n);
     }
     if b.len() != 20 && b.len() != 25 {
@@ -859,7 +867,7 @@ fn parse_unsigned_bytes(b: Option<&[u8]>, maximum: i64) -> Option<i64> {
         if !c.is_ascii_digit() {
             return None;
         }
-        n = n.checked_mul(10)?.checked_add(i64::from(c - b'0'))?;
+        n = n * 10 + i64::from(c - b'0');
         if n > maximum {
             return None;
         }
