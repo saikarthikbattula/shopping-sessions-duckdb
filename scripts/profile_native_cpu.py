@@ -133,21 +133,22 @@ def measure(binary, data, output, workers):
                 parsed_event_copies=int(count[1]) if count else None, stderr=process.stderr)
 
 
-def perf(binary, data, root, workers):
+def perf(binary, data, root, workers, sudo=False):
     tool = shutil.which('perf')
     if not tool:
         return dict(available=False, reason='perf not installed; IPC and function split unavailable')
     command = [str(binary), '--data-dir', str(data), '--output-dir', str(root / 'perf-output'),
                '--workers', str(workers)]
-    stat = subprocess.run([tool, 'stat', '-e', 'cycles,instructions,cache-misses,page-faults',
+    prefix = ['sudo', '-n', tool] if sudo else [tool]
+    stat = subprocess.run([*prefix, 'stat', '-e', 'cycles,instructions,cache-misses,page-faults',
                            '--', *command], capture_output=True, text=True)
     (root / 'perf-stat.txt').write_text(stat.stderr)
-    record = subprocess.run([tool, 'record', '-F', '199', '--call-graph', 'dwarf',
+    record = subprocess.run([*prefix, 'record', '-F', '999', '--call-graph', 'dwarf',
         '-o', str(root / 'perf.data'), '--', *command], capture_output=True, text=True)
     (root / 'perf-record.txt').write_text(record.stderr)
     report = ''
     if record.returncode == 0:
-        result = subprocess.run([tool, 'report', '--stdio', '--no-children', '-i', str(root / 'perf.data')],
+        result = subprocess.run([*prefix, 'report', '--stdio', '--no-children', '-i', str(root / 'perf.data')],
                                 capture_output=True, text=True)
         report = result.stdout
         (root / 'perf-report.txt').write_text(report)
@@ -155,7 +156,7 @@ def perf(binary, data, root, workers):
     cycles = re.search(r'([\d,.]+)\s+cycles', stat.stderr)
     ipc = (float(instructions[1].replace(',', '')) / float(cycles[1].replace(',', ''))
            if instructions and cycles else None)
-    return dict(available=True, stat_exit=stat.returncode, record_exit=record.returncode,
+    return dict(available=True, sudo=sudo, stat_exit=stat.returncode, record_exit=record.returncode,
                 ipc=ipc, stat=stat.stderr, record=record.stderr, function_report=report)
 
 
@@ -165,6 +166,7 @@ def main():
     parser.add_argument('work', type=Path)
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--reuse-build', action='store_true')
+    parser.add_argument('--sudo-perf', action='store_true', help='Use passwordless sudo for read-only perf on CI')
     args = parser.parse_args()
     if args.workers < 1:
         parser.error('workers must be positive')
@@ -196,7 +198,7 @@ def main():
                                outputs_valid=False)
         print(json.dumps({variant: summary}, indent=2), flush=True)
     report = dict(baseline=BASELINE, workers=args.workers, profiling_during_measurement=False,
-                  ablations=results, perf=perf(root / 'baseline/binary', data, root, args.workers),
+                  ablations=results, perf=perf(root / 'baseline/binary', data, root, args.workers, args.sudo_perf),
                   binaries={v: hashlib.sha256((root / v / 'binary').read_bytes()).hexdigest()
                             for v in ('baseline', *VARIANTS)})
     (root / 'report.json').write_text(json.dumps(report, indent=2))

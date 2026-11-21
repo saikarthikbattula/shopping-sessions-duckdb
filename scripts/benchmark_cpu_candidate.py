@@ -48,9 +48,9 @@ def main():
         for round_number in range(3):
             order = ('baseline', 'candidate') if round_number % 2 == 0 else ('candidate', 'baseline')
             for arm in order:
-                result = measure(getattr(args, arm).resolve(), args.data.resolve(), root / arm, args.workers)
+                result = measure(getattr(args, arm).resolve(), args.data.resolve(), root / f'{round_number}-{arm}', args.workers)
                 runs.append(dict(arm=arm, round=round_number, **result))
-            compare_outputs(root / 'baseline', root / 'candidate')
+            compare_outputs(root / f'{round_number}-baseline', root / f'{round_number}-candidate')
     counts = {run['parsed_event_copies'] for run in runs}
     if len(counts) != 1 or not next(iter(counts)):
         raise RuntimeError(f'Baseline/candidate input event counts differ: {counts}')
