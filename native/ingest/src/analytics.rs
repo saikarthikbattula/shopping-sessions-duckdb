@@ -344,20 +344,36 @@ impl Hasher for FastHasher {
     #[inline(always)]
     fn write(&mut self, bytes: &[u8]) {
         // Read complete words to avoid a dependent multiply for every ID byte.
-        // HashMap and HashSet still compare full keys when hashes collide.
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+        // Fast path for 8-16 byte slices (typical ID length) avoids chunks_exact overhead.
+        let len = bytes.len();
+        let ptr = bytes.as_ptr();
+        if len >= 8 && len <= 16 {
+            let word = unsafe { (ptr as *const u64).read_unaligned().to_le() };
             self.0 = (self.0 ^ word).rotate_left(27).wrapping_mul(0x3c79ac492ba7b653);
+            let rem_len = len - 8;
+            if rem_len > 0 {
+                let mut tail = [0u8; 8];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr.add(8), tail.as_mut_ptr(), rem_len);
+                }
+                let word = u64::from_le_bytes(tail);
+                self.0 = (self.0 ^ word).rotate_left(27).wrapping_mul(0x3c79ac492ba7b653);
+            }
+        } else {
+            let mut chunks = bytes.chunks_exact(8);
+            for chunk in &mut chunks {
+                let word = u64::from_le_bytes(chunk.try_into().unwrap());
+                self.0 = (self.0 ^ word).rotate_left(27).wrapping_mul(0x3c79ac492ba7b653);
+            }
+            let remainder = chunks.remainder();
+            if !remainder.is_empty() {
+                let mut tail = [0u8; 8];
+                tail[..remainder.len()].copy_from_slice(remainder);
+                let word = u64::from_le_bytes(tail);
+                self.0 = (self.0 ^ word).rotate_left(27).wrapping_mul(0x3c79ac492ba7b653);
+            }
         }
-        let remainder = chunks.remainder();
-        if !remainder.is_empty() {
-            let mut tail = [0u8; 8];
-            tail[..remainder.len()].copy_from_slice(remainder);
-            let word = u64::from_le_bytes(tail);
-            self.0 = (self.0 ^ word).rotate_left(27).wrapping_mul(0x3c79ac492ba7b653);
-        }
-        self.0 ^= (bytes.len() as u64).wrapping_mul(0x1c69b3f74ac4ae35);
+        self.0 ^= (len as u64).wrapping_mul(0x1c69b3f74ac4ae35);
     }
     #[inline(always)]
     fn write_u128(&mut self, i: u128) {
@@ -376,6 +392,7 @@ impl BuildHasher for FastBuildHasher {
         FastHasher(14695981039346656037)
     }
 }
+
 
 const NUM_SHARDS: usize = 64;
 
@@ -1844,13 +1861,17 @@ pub fn run_pipeline(
                         local_events.clear();
                         local_clicks.clear();
 
-                        let mut cache_person = [CompactId::default(); 64];
-                        let mut cache_pidx = [0u32; 64];
-                        let mut cache_valid = [false; 64];
+                        let mut cache_person = [CompactId::default(); 256];
+                        let mut cache_pidx = [0u32; 256];
+                        let mut cache_valid = [false; 256];
 
                         for w_events in worker_person_events {
                             for ev in &w_events[shard_idx] {
-                                let slot = (ev.person.bytes[0] as usize ^ ev.person.bytes[7] as usize) & 63;
+                                let last_idx = (ev.person.len.min(31) as usize).saturating_sub(1);
+                                let slot = ((ev.person.bytes[0] as usize)
+                                    ^ ((ev.person.bytes[last_idx] as usize) << 2)
+                                    ^ ((ev.person.len as usize) << 5))
+                                    & 255;
                                 let p_idx = if cache_valid[slot] && cache_person[slot] == ev.person {
                                     cache_pidx[slot]
                                 } else {
@@ -1874,7 +1895,11 @@ pub fn run_pipeline(
 
                         for w_clicks in worker_person_clicks {
                             for cl in &w_clicks[shard_idx] {
-                                let slot = (cl.person.bytes[0] as usize ^ cl.person.bytes[7] as usize) & 63;
+                                let last_idx = (cl.person.len.min(31) as usize).saturating_sub(1);
+                                let slot = ((cl.person.bytes[0] as usize)
+                                    ^ ((cl.person.bytes[last_idx] as usize) << 2)
+                                    ^ ((cl.person.len as usize) << 5))
+                                    & 255;
                                 let p_opt = if cache_valid[slot] && cache_person[slot] == cl.person {
                                     Some(cache_pidx[slot])
                                 } else {
