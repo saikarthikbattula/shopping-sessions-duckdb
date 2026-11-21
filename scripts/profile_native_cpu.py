@@ -27,10 +27,16 @@ def ablate(source, variant):
         end = source.index('                            let (eid_hash, shard_idx)', start)
         return source[:start] + '                            let category_idx = unknown_idx;\n\n' + source[end:]
     if variant == 'raw_user':
-        anchor = 'ids.get_compact_with_shard(user_bytes)'
-        if source.count(anchor) != 2:
-            raise ValueError('Expected event and click identity lookups')
-        return source.replace(anchor, '(CompactId::from_bytes(user_bytes), get_shard_bytes(user_bytes) as u8)')
+        # Event and click rows both resolve identity through IdentityBatch::push.
+        source = replace_once(source,
+            '''                ids.prefetch(hash);
+                row.set_person(CompactId::from_bytes(user), 0);
+                (hash, true)''',
+            '''                row.set_person(CompactId::from_bytes(user), get_shard_bytes(user) as u8);
+                (hash, false)''')
+        return replace_once(source,
+            'let (person, shard) = ids.get_compact_with_shard(user);',
+            'let (person, shard) = (CompactId::from_bytes(user), get_shard_bytes(user) as u8);')
     if variant == 'parse_discard':
         return replace_once(source,
             '    let workers_count = workers_count.clamp(1, 16);',

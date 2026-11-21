@@ -148,9 +148,18 @@ impl std::fmt::Debug for CompactId {
     }
 }
 
+// Inline IDs are zero-padded with their length in the final byte, so equal
+// representations mean equal IDs. External IDs (16+ bytes) never equal inline
+// ones, but two external copies may live in different allocations.
 impl PartialEq for CompactId {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
+        if self.bytes == other.bytes {
+            return true;
+        }
+        if (self.bytes[15] | other.bytes[15]) & 0x80 == 0 {
+            return false;
+        }
         self.as_bytes() == other.as_bytes()
     }
 }
@@ -174,7 +183,11 @@ impl PartialOrd for CompactId {
 impl std::hash::Hash for CompactId {
     #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write(self.as_bytes());
+        if self.bytes[15] & 0x80 == 0 {
+            state.write_u128(u128::from_le_bytes(self.bytes));
+        } else {
+            state.write(self.as_bytes());
+        }
     }
 }
 
@@ -498,7 +511,27 @@ impl ShortIdentityTable {
             // At most 70% occupied, with an empty cell terminating every miss.
             (entries + entries.div_ceil(2)).next_power_of_two()
         };
-        Self { slots: vec![ShortIdentitySlot::default(); capacity] }
+        let slots = vec![ShortIdentitySlot::default(); capacity];
+        // Every parsed row probes a random slot; huge pages avoid a TLB miss
+        // on top of the cache miss. Advice is applied before any slot is written.
+        advise_huge_pages(slots.as_ptr().cast(), capacity * std::mem::size_of::<ShortIdentitySlot>());
+        Self { slots }
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, hash: u64) {
+        #[cfg(target_arch = "x86_64")]
+        if !self.slots.is_empty() {
+            let index = hash as usize & (self.slots.len() - 1);
+            // Slots are 33 bytes and unaligned, so a slot can span two lines.
+            unsafe {
+                let slot = self.slots.as_ptr().add(index).cast::<i8>();
+                std::arch::x86_64::_mm_prefetch(slot, std::arch::x86_64::_MM_HINT_T0);
+                std::arch::x86_64::_mm_prefetch(slot.add(32), std::arch::x86_64::_MM_HINT_T0);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = hash;
     }
 
     fn insert(&mut self, key: &[u8], canonical: &[u8], hash: u64) {
@@ -565,8 +598,17 @@ impl FrozenIdentity {
     }
 
     #[inline(always)]
+    fn prefetch(&self, hash: u64) {
+        self.short.prefetch(hash);
+    }
+
+    #[inline(always)]
     fn get_compact_with_shard(&self, user: &[u8]) -> (CompactId, u8) {
-        let hash = identity_hash(user);
+        self.resolve_hashed(user, identity_hash(user))
+    }
+
+    #[inline(always)]
+    fn resolve_hashed(&self, user: &[u8], hash: u64) -> (CompactId, u8) {
         let shard = hash as usize & (NUM_SHARDS - 1);
         if let Some(slot) = self.short.get(user, hash) {
             return (CompactId::from_bytes(&slot.canonical[..slot.canonical_len as usize]), slot.person_shard);
@@ -581,6 +623,97 @@ impl FrozenIdentity {
 
     pub fn len(&self) -> usize {
         self.unique_count
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn advise_huge_pages(ptr: *const u8, len: usize) {
+    unsafe extern "C" {
+        fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+    }
+    const MADV_HUGEPAGE: i32 = 14;
+    const HUGE_PAGE: usize = 2 * 1024 * 1024;
+    let start = (ptr as usize).next_multiple_of(HUGE_PAGE);
+    let end = (ptr as usize + len) & !(HUGE_PAGE - 1);
+    if end > start {
+        // Advisory only: failure leaves ordinary pages and identical results.
+        unsafe { madvise(start as *mut std::ffi::c_void, end - start, MADV_HUGEPAGE) };
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_huge_pages(_ptr: *const u8, _len: usize) {}
+
+trait PersonRow {
+    fn person(&self) -> &CompactId;
+    fn set_person(&mut self, person: CompactId, shard: u8);
+}
+
+impl PersonRow for RawEvent {
+    fn person(&self) -> &CompactId { &self.person }
+    fn set_person(&mut self, person: CompactId, shard: u8) {
+        self.person = person;
+        self.p_shard = shard;
+    }
+}
+
+impl PersonRow for RawClick {
+    fn person(&self) -> &CompactId { &self.person }
+    fn set_person(&mut self, person: CompactId, shard: u8) {
+        self.person = person;
+        self.p_shard = shard;
+    }
+}
+
+const IDENTITY_BATCH: usize = 32;
+
+// Parsed rows wait here briefly so identity-slot prefetches issued at parse
+// time overlap instead of stalling each row. Resolution and output order are
+// exactly those of resolving every row immediately.
+struct IdentityBatch<T> {
+    rows: Vec<(T, u32, u64, bool)>,
+}
+
+impl<T: PersonRow> IdentityBatch<T> {
+    fn new() -> Self {
+        Self { rows: Vec::with_capacity(IDENTITY_BATCH) }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, mut row: T, out_shard: usize, user: Option<&[u8]>, ids: &FrozenIdentity, out: &mut [Vec<T>]) {
+        let (hash, pending) = match user {
+            // Short IDs stay inline in CompactId; resolve them after the prefetch.
+            Some(user) if user.len() <= 15 => {
+                let hash = identity_hash(user);
+                ids.prefetch(hash);
+                row.set_person(CompactId::from_bytes(user), 0);
+                (hash, true)
+            }
+            Some(user) => {
+                let (person, shard) = ids.get_compact_with_shard(user);
+                row.set_person(person, shard);
+                (0, false)
+            }
+            None => {
+                row.set_person(CompactId::default(), 0);
+                (0, false)
+            }
+        };
+        self.rows.push((row, out_shard as u32, hash, pending));
+        if self.rows.len() >= IDENTITY_BATCH {
+            self.flush(ids, out);
+        }
+    }
+
+    #[inline(never)]
+    fn flush(&mut self, ids: &FrozenIdentity, out: &mut [Vec<T>]) {
+        for (mut row, out_shard, hash, pending) in self.rows.drain(..) {
+            if pending {
+                let (person, shard) = ids.resolve_hashed(row.person().as_bytes(), hash);
+                row.set_person(person, shard);
+            }
+            out[out_shard as usize].push(row);
+        }
     }
 }
 
@@ -1556,6 +1689,7 @@ pub fn run_pipeline(
                         };
                         let mut date_cache = LocalDateCache::default();
                         let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(1024)).collect();
+                        let mut identity_batch = IdentityBatch::new();
                         let mut last_camp_bytes = [0u8; 32];
                         let mut last_camp_len = 0usize;
                         let mut last_camp_idx: Option<u16> = None;
@@ -1594,19 +1728,18 @@ pub fn run_pipeline(
                                 if is_valid {
                                     let click_id = CompactId::from_bytes(click_id_bytes);
                                     let shard_idx = get_shard_bytes(click_id.as_bytes());
-                                    let user_bytes = fields[1].unwrap();
-                                    let (person, p_shard) = ids.get_compact_with_shard(user_bytes);
-                                    local_shards[shard_idx].push(RawClick {
+                                    identity_batch.push(RawClick {
                                         click_id,
-                                        person,
+                                        person: CompactId::default(),
                                         camp_idx: camp_idx_opt.unwrap(),
                                         ts_ms: ts_ms.unwrap(),
-                                        p_shard: p_shard as u8,
-                                    });
+                                        p_shard: 0,
+                                    }, shard_idx, fields[1], ids, &mut local_shards);
                                 }
                                 Ok(())
                             })?;
                         }
+                        identity_batch.flush(ids, &mut local_shards);
                         let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
                         Ok((local_shards, cpu_ns))
                     }));
@@ -1717,6 +1850,7 @@ pub fn run_pipeline(
                         shards: (0..NUM_EVENT_SHARDS).map(|_| Vec::with_capacity(2048)).collect(),
                         wide_times: Vec::new(),
                     };
+                    let mut identity_batch = IdentityBatch::new();
 
                     while !cancelled.load(Ordering::Relaxed) {
                         let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -1781,30 +1915,25 @@ pub fn run_pipeline(
                             };
 
                             let (eid_hash, shard_idx) = hash_event_id_128(event_id_bytes);
-                            let (person, p_shard) = if let Some(user_bytes) = fields[1] {
-                                ids.get_compact_with_shard(user_bytes)
-                            } else {
-                                (CompactId::default(), 0u8)
-                            };
-
                             let (ingest_offset, ts_offset, time_flags) =
                                 parsed.encode_times(window_start, ingest_ms, ts_ms_opt);
                             let flags = time_flags
                                 | (if is_purchase { PURCHASE } else { 0 })
                                 | (if is_valid { VALID } else { 0 });
-                            parsed.shards[shard_idx].push(RawEvent {
+                            identity_batch.push(RawEvent {
                                 eid_hash,
-                                person,
+                                person: CompactId::default(),
                                 ingest_offset,
                                 ts_offset,
                                 price_cents: price_cents.unwrap_or(0) as i32,
-                                p_shard,
+                                p_shard: 0,
                                 cat_idx: category_idx,
                                 flags,
-                            });
+                            }, shard_idx, fields[1], ids, &mut parsed.shards);
                             Ok(())
                         })?;
                     }
+                    identity_batch.flush(ids, &mut parsed.shards);
                     let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
                     Ok((parsed, cpu_ns))
                 }));
@@ -2730,6 +2859,86 @@ mod tests {
             assert_eq!(ids.get(raw.as_bytes()), expected.as_bytes());
             assert_eq!(shard as usize, super::get_shard_bytes(expected.as_bytes()));
         }
+    }
+
+    #[test]
+    fn compact_id_equality_and_hash_follow_exact_bytes() {
+        let long_a = format!("{}a", "x".repeat(39));
+        let long_b = format!("{}b", "x".repeat(39));
+        let raw: Vec<Vec<u8>> = [
+            "", "a", "A", " a", "a ", "abcdefghijklmno", "abcdefghijklmnp", "abcdefghijklmnop",
+            "abcdefghijklmnoq", long_a.as_str(), long_b.as_str(),
+        ].iter().map(|s| s.as_bytes().to_vec()).chain([long_a.clone().into_bytes()]).collect();
+        let ids: Vec<CompactId> = raw.iter().map(|bytes| CompactId::from_bytes(bytes)).collect();
+        let hash = |id: &CompactId| FastBuildHasher.hash_one(id);
+        for (i, a) in ids.iter().enumerate() {
+            assert_eq!(a.as_bytes(), raw[i].as_slice());
+            for (j, b) in ids.iter().enumerate() {
+                assert_eq!(a == b, raw[i] == raw[j], "{:?} vs {:?}", a, b);
+                if a == b {
+                    assert_eq!(hash(a), hash(b));
+                }
+            }
+        }
+        // Separately allocated copies of one 40-byte ID are still one key.
+        let mut set = HashSet::with_hasher(FastBuildHasher);
+        assert!(set.insert(ids[9]));
+        assert!(!set.insert(ids[11]));
+        assert!(set.insert(ids[10]));
+    }
+
+    #[test]
+    fn identity_batch_matches_immediate_resolution_in_order() {
+        let temporary = TempDir::new("identity-batch");
+        let links = temporary.0.join("links");
+        std::fs::create_dir_all(&links).unwrap();
+        let long_a = format!("{}a", "a".repeat(39));
+        let long_b = format!("{}b", "a".repeat(39));
+        let width = "abcdefghijklmno";
+        let over = "abcdefghijklmnop";
+        std::fs::write(links.join("part.csv"), format!(
+            "user_id_a,user_id_b\nu1,u0\nz,{long_a}\n{long_b},b\n{over},{width}\nU9,u9\n")).unwrap();
+        let ids = super::load_parallel_identity(&links, 2).unwrap();
+        let users: Vec<Option<&str>> = vec![
+            Some("u1"), Some("u0"), Some("U1"), Some("z"), Some(long_a.as_str()), Some(long_b.as_str()),
+            Some("b"), Some(width), Some(over), Some("U9"), Some("u9"), Some("unlinked"), None,
+        ];
+        let mut out: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+        let mut batch = IdentityBatch::new();
+        let rows = users.len() * 7 + 3;
+        for i in 0..rows {
+            let row = RawClick {
+                click_id: CompactId::default(),
+                person: CompactId::default(),
+                ts_ms: i as i64,
+                camp_idx: 0,
+                p_shard: 0,
+            };
+            batch.push(row, i % NUM_SHARDS, users[i % users.len()].map(str::as_bytes), &ids, &mut out);
+        }
+        batch.flush(&ids, &mut out);
+        assert_eq!(out.iter().map(Vec::len).sum::<usize>(), rows);
+        for (shard, clicks) in out.iter().enumerate() {
+            assert!(clicks.windows(2).all(|pair| pair[0].ts_ms < pair[1].ts_ms));
+            for click in clicks {
+                let i = click.ts_ms as usize;
+                assert_eq!(i % NUM_SHARDS, shard);
+                let (person, p_shard) = match users[i % users.len()] {
+                    Some(user) => ids.get_compact_with_shard(user.as_bytes()),
+                    None => (CompactId::default(), 0),
+                };
+                assert_eq!(click.person.as_bytes(), person.as_bytes());
+                assert_eq!(click.p_shard, p_shard);
+            }
+        }
+        let canonical = |user: &str| ids.get_compact_with_shard(user.as_bytes()).0.as_bytes().to_vec();
+        assert_eq!(canonical("u1"), b"u0");
+        assert_eq!(canonical("U1"), b"U1");
+        assert_eq!(canonical(over), width.as_bytes());
+        assert_eq!(canonical("u9"), b"U9");
+        assert_eq!(canonical(long_b.as_str()), long_b.as_bytes());
+        assert_eq!(canonical("b"), long_b.as_bytes());
+        assert_eq!(canonical("z"), long_a.as_bytes());
     }
 
     #[test]
