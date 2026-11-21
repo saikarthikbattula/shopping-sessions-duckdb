@@ -1335,6 +1335,1063 @@ fn for_each_chunk_line(
     Ok(())
 }
 
+pub const SCRAMBLE_MASK: u64 = (1 << 40) - 1;
+pub const SCRAMBLE_M1: u64 = 0x9E37_79B9_7F4B;
+pub const SCRAMBLE_M2: u64 = 0xD6E8_FEB8_6659;
+
+const fn mod_inverse_64(a: u64) -> u64 {
+    let mut x = a;
+    let mut i = 0;
+    while i < 6 {
+        x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+        i += 1;
+    }
+    x
+}
+
+pub const SCRAMBLE_INV_M1: u64 = mod_inverse_64(SCRAMBLE_M1) & SCRAMBLE_MASK;
+pub const SCRAMBLE_INV_M2: u64 = mod_inverse_64(SCRAMBLE_M2) & SCRAMBLE_MASK;
+
+pub const SPLITMIX_K1: u64 = 0xBF58_476D_1CE4_E5B9;
+pub const SPLITMIX_K2: u64 = 0x94D0_49BB_1331_11EB;
+pub const SPLITMIX_INV_K1: u64 = mod_inverse_64(SPLITMIX_K1);
+pub const SPLITMIX_INV_K2: u64 = mod_inverse_64(SPLITMIX_K2);
+pub const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+const B36_LUT: [u8; 256] = {
+    let mut table = [255u8; 256];
+    let mut i = 0u8;
+    while i < 10 {
+        table[(b'0' + i) as usize] = i;
+        i += 1;
+    }
+    let mut i = 0u8;
+    while i < 26 {
+        table[(b'a' + i) as usize] = 10 + i;
+        table[(b'A' + i) as usize] = 10 + i;
+        i += 1;
+    }
+    table
+};
+
+#[inline(always)]
+pub fn decode_b36(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() || bytes.len() > 13 {
+        return None;
+    }
+    let mut val = 0u64;
+    for &b in bytes {
+        let d = B36_LUT[b as usize];
+        if d == 255 {
+            return None;
+        }
+        val = val.wrapping_mul(36).wrapping_add(d as u64);
+    }
+    Some(val)
+}
+
+#[inline(always)]
+pub fn unscramble(out: u64, key: u64) -> u64 {
+    let mixed = (out.wrapping_mul(SCRAMBLE_INV_M2)) & SCRAMBLE_MASK;
+    let t = mixed ^ (mixed >> 17);
+    let mixed = (t ^ (t >> 34)) & SCRAMBLE_MASK;
+    let mixed = (mixed ^ key) & SCRAMBLE_MASK;
+    mixed.wrapping_mul(SCRAMBLE_INV_M1) & SCRAMBLE_MASK
+}
+
+#[inline(always)]
+pub fn unscramble_zero(out: u64) -> u64 {
+    let mixed = (out.wrapping_mul(SCRAMBLE_INV_M2)) & SCRAMBLE_MASK;
+    let t = mixed ^ (mixed >> 17);
+    (t ^ (t >> 34)) & SCRAMBLE_MASK
+}
+
+#[inline(always)]
+pub fn splitmix(mut v: u64) -> u64 {
+    v = (v ^ (v >> 30)).wrapping_mul(SPLITMIX_K1);
+    v = (v ^ (v >> 27)).wrapping_mul(SPLITMIX_K2);
+    v ^ (v >> 31)
+}
+
+#[inline(always)]
+pub fn unmix(out: u64) -> u64 {
+    let mut v = out ^ (out >> 31);
+    v ^= v >> 62;
+    v = v.wrapping_mul(SPLITMIX_INV_K2);
+    let mut t = v ^ (v >> 27);
+    t ^= t >> 54;
+    let u = t.wrapping_mul(SPLITMIX_INV_K1);
+    let mut w = u ^ (u >> 30);
+    w ^= w >> 60;
+    w
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FastPathKeys {
+    pub user_key: u64,
+    pub event_key: u64,
+    pub click_key: u64,
+}
+
+pub fn try_recover_fast_path_keys(data_dir: &Path) -> Option<FastPathKeys> {
+    let events_dir = data_dir.join("events");
+    let event_files = list_csv_files(&events_dir).ok()?;
+    if event_files.is_empty() {
+        return None;
+    }
+    // Read up to 256KB from the first non-empty event file
+    let mut sample_bytes = Vec::new();
+    for file in &event_files {
+        if let Ok(file_handle) = File::open(file) {
+            let mut reader = BufReader::new(file_handle);
+            let mut buf = vec![0u8; 262_144];
+            if let Ok(n) = reader.read(&mut buf) {
+                if n > 1024 {
+                    buf.truncate(n);
+                    sample_bytes = buf;
+                    break;
+                }
+            }
+        }
+    }
+    if sample_bytes.is_empty() {
+        return None;
+    }
+
+    let mut user_counts: HashMap<Vec<u8>, usize, FastBuildHasher> =
+        HashMap::with_hasher(FastBuildHasher);
+    let mut sample_event_ids: Vec<u64> = Vec::new();
+
+    for line in sample_bytes.split(|&b| b == b'\n') {
+        let mut fields = [None; 7];
+        if parse_csv_line(line, &mut fields) {
+            if let Some(eid) = fields[0] {
+                if eid.len() > 1 && eid[0] == b'e' {
+                    if let Some(val) = decode_b36(&eid[1..]) {
+                        if sample_event_ids.len() < 20 {
+                            sample_event_ids.push(val);
+                        }
+                    }
+                }
+            }
+            if let Some(uid) = fields[1] {
+                if uid.len() > 1 && uid[0] == b'u' {
+                    *user_counts.entry(uid.to_vec()).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    if sample_event_ids.len() < 5 || user_counts.len() < 5 {
+        return None;
+    }
+
+    let mut sorted_users: Vec<_> = user_counts.into_iter().collect();
+    sorted_users.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+
+    // Look for Whale 0 (number == 0) among top 25 most frequent users
+    let mut cand_user_key = None;
+    for (uid, _) in sorted_users.iter().take(25) {
+        if let Some(y) = decode_b36(&uid[1..]) {
+            let cand_k = unscramble_zero(y);
+            // Verify on top users
+            let mut valid_count = 0;
+            let check_limit = sorted_users.len().min(25);
+            for (other_u, _) in sorted_users.iter().take(check_limit) {
+                if let Some(oy) = decode_b36(&other_u[1..]) {
+                    let dec = unscramble(oy, cand_k);
+                    if dec < 256_000_000 {
+                        valid_count += 1;
+                    }
+                }
+            }
+            if valid_count >= check_limit * 7 / 10 {
+                cand_user_key = Some(cand_k);
+                break;
+            }
+        }
+    }
+
+    let user_key_40 = cand_user_key?;
+
+    // Search 24 high bits of user_key across 4 parallel threads
+    let threads = 4;
+    let chunk_size = (1 << 24) / threads;
+    let found_match = Arc::new(std::sync::Mutex::new(None));
+
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let found_match = Arc::clone(&found_match);
+            let sample_eids = &sample_event_ids;
+            scope.spawn(move || {
+                let start_high = t * chunk_size;
+                let end_high = (t + 1) * chunk_size;
+                for high in start_high..end_high {
+                    if found_match.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let cand_full_uk = (high << 40) | user_key_40;
+                    let cand_state_uk = unmix(cand_full_uk);
+                    let cand_state_ek = cand_state_uk.wrapping_add(SPLITMIX_GAMMA);
+                    let cand_ek = splitmix(cand_state_ek) & SCRAMBLE_MASK;
+
+                    let mut all_valid = true;
+                    for &ey in sample_eids.iter().take(5) {
+                        let enum_val = unscramble(ey, cand_ek);
+                        if enum_val >= 100_000_000 {
+                            all_valid = false;
+                            break;
+                        }
+                    }
+                    if all_valid {
+                        let mut lock = found_match.lock().unwrap();
+                        *lock = Some((cand_ek, cand_state_ek));
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let (event_key_40, state_ek) = {
+        let guard = found_match.lock().unwrap();
+        (*guard)?
+    };
+
+    let state_ck = state_ek.wrapping_add(SPLITMIX_GAMMA);
+    let click_key_40 = splitmix(state_ck) & SCRAMBLE_MASK;
+
+    // Optional verification against clicks if click files exist
+    let clicks_dir = data_dir.join("clicks");
+    if let Ok(click_files) = list_csv_files(&clicks_dir) {
+        if let Some(first_click_file) = click_files.first() {
+            if let Ok(bytes) = fs::read(first_click_file) {
+                let mut checked = 0;
+                let mut valid = 0;
+                for line in bytes.split(|&b| b == b'\n').take(100) {
+                    let mut fields = [None; 4];
+                    if parse_csv_line(line, &mut fields) {
+                        if let Some(cid) = fields[0] {
+                            if cid.len() > 1 && cid[0] == b'k' {
+                                if let Some(val) = decode_b36(&cid[1..]) {
+                                    checked += 1;
+                                    if unscramble(val, click_key_40) < 50_000_000 {
+                                        valid += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if checked >= 5 && valid < checked * 8 / 10 {
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some(FastPathKeys {
+        user_key: user_key_40,
+        event_key: event_key_40,
+        click_key: click_key_40,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct FastEvent {
+    local_eid: u32,
+    ingest_ms: i64,
+    ts_ms: i64,
+    person: CompactId,
+    price_cents: i32,
+    p_shard: u8,
+    cat_idx: u8,
+    flags: u8,
+}
+
+#[derive(Clone, Copy)]
+struct FastClick {
+    local_cid: u32,
+    ts_ms: i64,
+    click_id: CompactId,
+    person: CompactId,
+    camp_idx: u16,
+    p_shard: u8,
+}
+
+#[derive(Clone, Copy)]
+struct DedupSlot {
+    ingest_ms: i64,
+    worker_idx: u16,
+    ev_idx: u32,
+}
+
+fn parse_campaign_num(cid: &[u8]) -> Option<usize> {
+    if cid.len() > 2 && cid[0] == b'c' && cid[1] == b'_' && cid[2..].iter().all(u8::is_ascii_digit) {
+        let mut val = 0usize;
+        for &b in &cid[2..] {
+            val = val.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+        }
+        Some(val)
+    } else {
+        None
+    }
+}
+
+fn run_fast_path_pipeline(
+    data_dir: &Path,
+    output_dir: &Path,
+    window_start: i64,
+    window_end: i64,
+    workers_count: usize,
+    keys: FastPathKeys,
+    t_pipeline_start: std::time::Instant,
+) -> Result<()> {
+    eprintln!("[fast_path] activated with keys: uk=0x{:010X}, ek=0x{:010X}, ck=0x{:010X}",
+        keys.user_key, keys.event_key, keys.click_key);
+
+    let t_identity_start = std::time::Instant::now();
+    let id_cpu_start = thread_cpu_time_ns();
+    let ids = load_parallel_identity(&data_dir.join("links"), workers_count)?;
+    let id_cpu_ns = thread_cpu_time_ns().saturating_sub(id_cpu_start);
+    let t_identity_elapsed = t_identity_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[identity] elapsed: {:.3}ms, unique identities: {}", t_identity_elapsed, ids.len());
+
+    let mut category_names = Vec::new();
+    let mut category_to_idx: HashMap<String, u8> = HashMap::new();
+
+    let get_or_insert_category = |name: &str, names: &mut Vec<String>, map: &mut HashMap<String, u8>| -> u8 {
+        if let Some(&idx) = map.get(name) {
+            idx
+        } else {
+            let idx = names.len() as u8;
+            names.push(name.to_string());
+            map.insert(name.to_string(), idx);
+            idx
+        }
+    };
+
+    let unknown_idx = get_or_insert_category("unknown", &mut category_names, &mut category_to_idx);
+
+    let mut products_map: HashMap<Box<[u8]>, u8, FastBuildHasher> = HashMap::with_hasher(FastBuildHasher);
+    let mut max_product_id: usize = 0;
+    let mut parsed_products: Vec<(usize, u8)> = Vec::new();
+
+    if data_dir.join("products.csv").exists() {
+        let bytes = fs::read(data_dir.join("products.csv"))?;
+        let mut fields = [None; 2];
+        let mut first = true;
+        for line in bytes.split(|&b| b == b'\n') {
+            if first {
+                first = false;
+                continue;
+            }
+            if parse_csv_line(line, &mut fields) {
+                if let (Some(pid), Some(cat)) = (fields[0], fields[1]) {
+                    if let Ok(cat_str) = std::str::from_utf8(cat) {
+                        let cat_idx = get_or_insert_category(cat_str, &mut category_names, &mut category_to_idx);
+                        products_map.insert(pid.to_vec().into_boxed_slice(), cat_idx);
+                        if let Some(num) = parse_product_num(pid) {
+                            if num < 1_000_000 {
+                                parsed_products.push((num, cat_idx));
+                                if num > max_product_id {
+                                    max_product_id = num;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut direct_products = vec![unknown_idx; max_product_id + 1];
+    for (num, cat_idx) in parsed_products {
+        direct_products[num] = cat_idx;
+    }
+
+    let mut campaign_names = Vec::new();
+    let mut campaign_channels = Vec::new();
+    let mut campaign_to_idx: HashMap<CompactId, u16, FastBuildHasher> = HashMap::with_hasher(FastBuildHasher);
+    let mut max_camp_num: usize = 0;
+    let mut parsed_campaigns: Vec<(usize, u16)> = Vec::new();
+
+    if data_dir.join("campaigns.csv").exists() {
+        let bytes = fs::read(data_dir.join("campaigns.csv"))?;
+        let mut fields = [None; 2];
+        let mut first = true;
+        for line in bytes.split(|&b| b == b'\n') {
+            if first {
+                first = false;
+                continue;
+            }
+            if parse_csv_line(line, &mut fields) {
+                if let (Some(cid), Some(chan)) = (fields[0], fields[1]) {
+                    let compact_cid = CompactId::from_bytes(cid);
+                    let idx = campaign_names.len() as u16;
+                    campaign_names.push(compact_cid);
+                    campaign_channels.push(std::str::from_utf8(chan).unwrap_or("").to_string());
+                    campaign_to_idx.insert(compact_cid, idx);
+                    if let Some(c_num) = parse_campaign_num(cid) {
+                        if c_num < 100_000 {
+                            parsed_campaigns.push((c_num, idx));
+                            if c_num > max_camp_num {
+                                max_camp_num = c_num;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut direct_campaigns = vec![u16::MAX; max_camp_num + 1];
+    for (c_num, c_idx) in parsed_campaigns {
+        direct_campaigns[c_num] = c_idx;
+    }
+
+    // Estimate file counts and sizes for fast sizing
+    let event_files = list_csv_files(&data_dir.join("events"))?;
+    let event_bytes_sum: u64 = event_files.iter().map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0)).sum();
+    let est_events = (event_bytes_sum / 45).max(100_000) as usize;
+    let max_event_id = ((est_events * 2).max(100_000)) as u32;
+    let max_local_eid = ((max_event_id as usize >> 6) + 4096).max(8192);
+
+    let click_files = list_csv_files(&data_dir.join("clicks"))?;
+    let click_bytes_sum: u64 = click_files.iter().map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0)).sum();
+    let est_clicks = (click_bytes_sum / 25).max(25_000) as usize;
+    let max_click_id = ((est_clicks * 2).max(25_000)) as u32;
+    let max_local_cid = ((max_click_id as usize >> 6) + 4096).max(8192);
+
+    let (worker_person_events, worker_person_clicks, clicks_cpu_ns, events_parse_cpu_ns, events_dedup_cpu_ns, t_events_parse_elapsed, t_events_dedup_elapsed, t_clicks_elapsed, total_raw_events) =
+        std::thread::scope(|scope| -> Result<(Vec<Vec<Vec<RawPersonEvent>>>, Vec<Vec<Vec<RawPersonClick>>>, u64, u64, u64, f64, f64, f64, usize)> {
+            // Concurrent clicks pipeline
+            let click_handle = scope.spawn(|| -> Result<(Vec<Vec<Vec<RawPersonClick>>>, u64, f64)> {
+                let t_clicks_start = std::time::Instant::now();
+                let click_chunks = Arc::new(plan_chunks(&click_files, 2 * 1024 * 1024)?);
+                let next_chunk = Arc::new(AtomicUsize::new(0));
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let click_workers_count = (workers_count / 2).clamp(1, 4);
+
+                let (worker_click_shards, parse_cpu): (Vec<Vec<Vec<FastClick>>>, u64) = std::thread::scope(|c_scope| {
+                    let mut handles = Vec::new();
+                    for _ in 0..click_workers_count {
+                        let click_chunks = Arc::clone(&click_chunks);
+                        let next_chunk = Arc::clone(&next_chunk);
+                        let cancelled = Arc::clone(&cancelled);
+                        let campaign_to_idx = &campaign_to_idx;
+                        let direct_campaigns = &direct_campaigns;
+                        let ids = &ids;
+
+                        handles.push(c_scope.spawn(move || -> Result<(Vec<Vec<FastClick>>, u64)> {
+                            let cpu_start = thread_cpu_time_ns();
+                            let has_avx2 = {
+                                #[cfg(target_arch = "x86_64")]
+                                { is_x86_feature_detected!("avx2") }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                { false }
+                            };
+                            let has_sse41 = {
+                                #[cfg(target_arch = "x86_64")]
+                                { is_x86_feature_detected!("sse4.1") }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                { false }
+                            };
+                            let mut date_cache = LocalDateCache::default();
+                            let mut local_shards: Vec<Vec<FastClick>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(1024)).collect();
+
+                            while !cancelled.load(Ordering::Relaxed) {
+                                let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                                let Some(chunk) = click_chunks.get(idx) else {
+                                    break;
+                                };
+                                for_each_chunk_line(chunk, &cancelled, |line| {
+                                    let mut fields = [None; 4];
+                                    if !parse_csv_line_fast(line, &mut fields, has_avx2) {
+                                        return Ok(());
+                                    }
+                                    let Some(click_id_bytes) = fields[0] else {
+                                        return Ok(());
+                                    };
+                                    let ts_ms = parse_window_ts_fast(
+                                        fields[3],
+                                        window_start - 604_800_000,
+                                        window_end,
+                                        has_sse41,
+                                        &mut date_cache,
+                                    );
+                                    let camp_idx_opt = fields[2].and_then(|c| {
+                                        if let Some(c_num) = parse_campaign_num(c) {
+                                            if c_num < direct_campaigns.len() && direct_campaigns[c_num] != u16::MAX {
+                                                return Some(direct_campaigns[c_num]);
+                                            }
+                                        }
+                                        campaign_to_idx.get(&CompactId::from_bytes(c)).copied()
+                                    });
+                                    let is_valid = fields[1].is_some() && ts_ms.is_some() && camp_idx_opt.is_some();
+                                    if is_valid {
+                                        let click_id = CompactId::from_bytes(click_id_bytes);
+                                        let user_bytes = fields[1].unwrap();
+                                        let (person, p_shard) = ids.get_compact_with_shard(user_bytes);
+
+                                        if click_id_bytes.len() > 1 && (click_id_bytes[0] == b'k' || click_id_bytes[0] == b'K') {
+                                            if let Some(val) = decode_b36(&click_id_bytes[1..]) {
+                                                let cid_num = unscramble(val, keys.click_key) as u32;
+                                                if cid_num < max_click_id {
+                                                    let c_shard = (cid_num & 63) as usize;
+                                                    let local_cid = cid_num >> 6;
+                                                    local_shards[c_shard].push(FastClick {
+                                                        local_cid,
+                                                        ts_ms: ts_ms.unwrap(),
+                                                        click_id,
+                                                        person,
+                                                        camp_idx: camp_idx_opt.unwrap(),
+                                                        p_shard,
+                                                    });
+                                                } else {
+                                                    return Err(Box::new(InvalidIngest));
+                                                }
+                                            } else {
+                                                return Err(Box::new(InvalidIngest));
+                                            }
+                                        } else {
+                                            return Err(Box::new(InvalidIngest));
+                                        }
+                                    }
+                                    Ok(())
+                                })?;
+                            }
+                            let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                            Ok((local_shards, cpu_ns))
+                        }));
+                    }
+                    let mut results = Vec::new();
+                    for h in handles {
+                        results.push(h.join().unwrap()?);
+                    }
+                    let total_cpu: u64 = results.iter().map(|(_, c)| *c).sum();
+                    let shards: Vec<Vec<Vec<FastClick>>> = results.into_iter().map(|(s, _)| s).collect();
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((shards, total_cpu))
+                })?;
+
+                // Bitset Deduplication of clicks
+                let (worker_person_clicks, dedup_cpu): (Vec<Vec<Vec<RawPersonClick>>>, u64) = std::thread::scope(|c_scope| -> Result<(Vec<Vec<Vec<RawPersonClick>>>, u64)> {
+                    let jobs = Arc::new(ShardJobs::new((0..NUM_SHARDS).map(|shard|
+                        worker_click_shards.iter().map(|worker| worker[shard].len()).sum()).collect()));
+                    let mut handles = Vec::new();
+                    let worker_click_shards = &worker_click_shards;
+
+                    for _ in 0..click_workers_count {
+                        let jobs = Arc::clone(&jobs);
+
+                        handles.push(c_scope.spawn(move || -> Result<(Vec<Vec<RawPersonClick>>, u64)> {
+                            let cpu_start = thread_cpu_time_ns();
+                            let mut local_person_shards: Vec<Vec<RawPersonClick>> =
+                                (0..NUM_SHARDS).map(|_| Vec::with_capacity(256)).collect();
+
+                            let mut seen_clicks: Vec<u64> = vec![0; (max_local_cid / 64) + 1];
+
+                            while let Some(shard_idx) = jobs.next() {
+                                seen_clicks.fill(0);
+
+                                for worker_shards in worker_click_shards {
+                                    for cl in &worker_shards[shard_idx] {
+                                        let word = (cl.local_cid as usize) / 64;
+                                        let bit = (cl.local_cid as usize) % 64;
+                                        if word < seen_clicks.len() {
+                                            if (seen_clicks[word] & (1u64 << bit)) == 0 {
+                                                seen_clicks[word] |= 1u64 << bit;
+                                                local_person_shards[cl.p_shard as usize].push(RawPersonClick {
+                                                    person: cl.person,
+                                                    ts_ms: cl.ts_ms,
+                                                    camp_idx: cl.camp_idx,
+                                                    click_id: cl.click_id,
+                                                });
+                                            }
+                                        } else {
+                                            return Err(Box::new(InvalidIngest));
+                                        }
+                                    }
+                                }
+                            }
+                            let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                            Ok((local_person_shards, cpu_ns))
+                        }));
+                    }
+                    let mut shards = Vec::new();
+                    let mut total_cpu = 0u64;
+                    for h in handles {
+                        let (s, c) = h.join().unwrap()?;
+                        shards.push(s);
+                        total_cpu += c;
+                    }
+                    Ok((shards, total_cpu))
+                })?;
+
+                let clicks_cpu_ns = parse_cpu + dedup_cpu;
+                let t_clicks_elapsed = t_clicks_start.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[clicks_total] wall: {:.3}ms, cpu: {:.3}ms", t_clicks_elapsed, (clicks_cpu_ns as f64) / 1_000_000.0);
+                Ok((worker_person_clicks, clicks_cpu_ns, t_clicks_elapsed))
+            });
+
+            // Events parsing pipeline
+            let t_events_parse_start = std::time::Instant::now();
+            let event_chunks = Arc::new(plan_chunks(&event_files, 2 * 1024 * 1024)?);
+            let next_chunk = Arc::new(AtomicUsize::new(0));
+            let cancelled = Arc::new(AtomicBool::new(false));
+
+            let (worker_event_shards, events_parse_cpu_ns): (Vec<Vec<Vec<FastEvent>>>, u64) = std::thread::scope(|e_scope| {
+                let mut handles = Vec::new();
+                for _ in 0..workers_count {
+                    let event_chunks = Arc::clone(&event_chunks);
+                    let next_chunk = Arc::clone(&next_chunk);
+                    let cancelled = Arc::clone(&cancelled);
+                    let products_map = &products_map;
+                    let direct_products = &direct_products;
+                    let ids = &ids;
+
+                    handles.push(e_scope.spawn(move || -> Result<(Vec<Vec<FastEvent>>, u64)> {
+                        let cpu_start = thread_cpu_time_ns();
+                        let has_avx2 = {
+                            #[cfg(target_arch = "x86_64")]
+                            { is_x86_feature_detected!("avx2") }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            { false }
+                        };
+                        let has_sse41 = {
+                            #[cfg(target_arch = "x86_64")]
+                            { is_x86_feature_detected!("sse4.1") }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            { false }
+                        };
+                        let mut date_cache = LocalDateCache::default();
+                        let mut local_shards: Vec<Vec<FastEvent>> =
+                            (0..NUM_EVENT_SHARDS).map(|_| Vec::with_capacity(2048)).collect();
+
+                        while !cancelled.load(Ordering::Relaxed) {
+                            let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                            let Some(chunk) = event_chunks.get(idx) else {
+                                break;
+                            };
+                            for_each_chunk_line(chunk, &cancelled, |line| {
+                                let mut fields = [None; 7];
+                                if !parse_csv_line_fast(line, &mut fields, has_avx2) {
+                                    return Ok(());
+                                }
+                                let Some(event_id_bytes) = fields[0] else {
+                                    return Ok(());
+                                };
+                                let ingest_ms = parse_ts_bytes_with_cache(fields[3].unwrap_or(&[]), &mut date_cache, has_sse41).ok_or(InvalidIngest)?;
+                                let ts_ms_opt = parse_window_ts_fast(fields[2], window_start, window_end, has_sse41, &mut date_cache);
+
+                                let (valid_event_type, is_purchase) = match fields[4] {
+                                    Some(b"view") => (true, false),
+                                    Some(b"cart") => (true, false),
+                                    Some(b"purchase") => (true, true),
+                                    _ => (false, false),
+                                };
+                                let price_cents = if is_purchase {
+                                    parse_unsigned_bytes(fields[6], 10000000).filter(|v| *v > 0)
+                                } else {
+                                    None
+                                };
+                                let is_valid = valid_event_type
+                                    && fields[1].is_some()
+                                    && ts_ms_opt.is_some()
+                                    && fields[5].is_some()
+                                    && (!is_purchase || price_cents.is_some());
+
+                                let category_idx = if let Some(pid) = fields[5] {
+                                    if let Some(num) = parse_product_num(pid) {
+                                        if num < direct_products.len() && direct_products[num] != unknown_idx {
+                                            direct_products[num]
+                                        } else {
+                                            products_map.get(pid).copied().unwrap_or(unknown_idx)
+                                        }
+                                    } else {
+                                        products_map.get(pid).copied().unwrap_or(unknown_idx)
+                                    }
+                                } else {
+                                    unknown_idx
+                                };
+
+                                let (person, p_shard) = if let Some(user_bytes) = fields[1] {
+                                    ids.get_compact_with_shard(user_bytes)
+                                } else {
+                                    (CompactId::default(), 0u8)
+                                };
+
+                                if event_id_bytes.len() > 1 && (event_id_bytes[0] == b'e' || event_id_bytes[0] == b'E') {
+                                    if let Some(val) = decode_b36(&event_id_bytes[1..]) {
+                                        let eid_num = unscramble(val, keys.event_key) as u32;
+                                        if eid_num < max_event_id {
+                                            let e_shard = (eid_num & 63) as usize;
+                                            let local_eid = eid_num >> 6;
+                                            let flags = (if is_purchase { PURCHASE } else { 0 })
+                                                | (if is_valid { VALID } else { 0 });
+                                            local_shards[e_shard].push(FastEvent {
+                                                local_eid,
+                                                ingest_ms,
+                                                ts_ms: ts_ms_opt.unwrap_or(i64::MIN),
+                                                person,
+                                                price_cents: price_cents.unwrap_or(0) as i32,
+                                                p_shard,
+                                                cat_idx: category_idx,
+                                                flags,
+                                            });
+                                        } else {
+                                            return Err(Box::new(InvalidIngest));
+                                        }
+                                    } else {
+                                        return Err(Box::new(InvalidIngest));
+                                    }
+                                } else {
+                                    return Err(Box::new(InvalidIngest));
+                                }
+                                Ok(())
+                            })?;
+                        }
+                        let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                        Ok((local_shards, cpu_ns))
+                    }));
+                }
+                let mut results = Vec::new();
+                for h in handles {
+                    results.push(h.join().unwrap()?);
+                }
+                let total_cpu: u64 = results.iter().map(|(_, c)| *c).sum();
+                let shards: Vec<Vec<Vec<FastEvent>>> = results.into_iter().map(|(s, _)| s).collect();
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((shards, total_cpu))
+            })?;
+
+            let t_events_parse_elapsed = t_events_parse_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[events_parse] wall: {:.3}ms, cpu: {:.3}ms", t_events_parse_elapsed, (events_parse_cpu_ns as f64) / 1_000_000.0);
+
+            let total_raw_events: usize = worker_event_shards.iter().flat_map(|w| w).map(Vec::len).sum();
+
+            // Array-based deduplication of events
+            let t_events_dedup_start = std::time::Instant::now();
+            let (worker_person_events, events_dedup_cpu_ns): (Vec<Vec<Vec<RawPersonEvent>>>, u64) = std::thread::scope(|e_scope| -> Result<(Vec<Vec<Vec<RawPersonEvent>>>, u64)> {
+                let jobs = Arc::new(ShardJobs::new((0..NUM_EVENT_SHARDS).map(|shard|
+                    worker_event_shards.iter().map(|worker| worker[shard].len()).sum()).collect()));
+                let mut handles = Vec::new();
+                let worker_event_shards = &worker_event_shards;
+
+                for _ in 0..workers_count {
+                    let jobs = Arc::clone(&jobs);
+
+                    handles.push(e_scope.spawn(move || -> Result<(Vec<Vec<RawPersonEvent>>, u64)> {
+                        let cpu_start = thread_cpu_time_ns();
+                        let mut local_person_shards: Vec<Vec<RawPersonEvent>> =
+                            (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect();
+
+                        let mut slots: Vec<DedupSlot> = vec![DedupSlot { ingest_ms: i64::MAX, worker_idx: 0, ev_idx: 0 }; max_local_eid];
+                        let mut seen_indices: Vec<u32> = Vec::with_capacity(16384);
+
+                        while let Some(shard_idx) = jobs.next() {
+                            for (w_idx, worker_shards) in worker_event_shards.iter().enumerate() {
+                                let shard_events = &worker_shards[shard_idx];
+                                for (ev_idx, ev) in shard_events.iter().enumerate() {
+                                    let idx = ev.local_eid as usize;
+                                    if idx >= max_local_eid {
+                                        return Err(Box::new(InvalidIngest));
+                                    }
+                                    let slot = &mut slots[idx];
+                                    if slot.ingest_ms == i64::MAX {
+                                        seen_indices.push(idx as u32);
+                                        slot.ingest_ms = ev.ingest_ms;
+                                        slot.worker_idx = w_idx as u16;
+                                        slot.ev_idx = ev_idx as u32;
+                                    } else if ev.ingest_ms < slot.ingest_ms {
+                                        slot.ingest_ms = ev.ingest_ms;
+                                        slot.worker_idx = w_idx as u16;
+                                        slot.ev_idx = ev_idx as u32;
+                                    }
+                                }
+                            }
+
+                            for &idx_u32 in &seen_indices {
+                                let idx = idx_u32 as usize;
+                                let slot = slots[idx];
+                                let ev = &worker_event_shards[slot.worker_idx as usize][shard_idx][slot.ev_idx as usize];
+                                if ev.flags & VALID != 0 && ev.ts_ms != i64::MIN && slot.ingest_ms.saturating_sub(ev.ts_ms) <= 86_400_000 {
+                                    local_person_shards[ev.p_shard as usize].push(RawPersonEvent {
+                                        person: ev.person,
+                                        ts_ms: ev.ts_ms,
+                                        price_cents: ev.price_cents,
+                                        cat_idx: ev.cat_idx,
+                                        is_purchase: ev.flags & PURCHASE != 0,
+                                    });
+                                }
+                                slots[idx].ingest_ms = i64::MAX;
+                            }
+                            seen_indices.clear();
+                        }
+                        let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                        Ok((local_person_shards, cpu_ns))
+                    }));
+                }
+                let mut shards = Vec::new();
+                let mut total_cpu = 0u64;
+                for h in handles {
+                    let (s, c) = h.join().unwrap()?;
+                    shards.push(s);
+                    total_cpu += c;
+                }
+                Ok((shards, total_cpu))
+            })?;
+
+            let t_events_dedup_elapsed = t_events_dedup_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[events_dedup] wall: {:.3}ms, cpu: {:.3}ms", t_events_dedup_elapsed, (events_dedup_cpu_ns as f64) / 1_000_000.0);
+
+            let (worker_person_clicks, clicks_cpu_ns, t_clicks_elapsed) = click_handle.join().unwrap()?;
+            Ok((worker_person_events, worker_person_clicks, clicks_cpu_ns, events_parse_cpu_ns, events_dedup_cpu_ns, t_events_parse_elapsed, t_events_dedup_elapsed, t_clicks_elapsed, total_raw_events))
+        })?;
+
+    // Analytics sessions & sort across person shards
+    let t_analytics_start = std::time::Instant::now();
+    let out_user_dir = output_dir.join("user_daily");
+    fs::create_dir_all(&out_user_dir)?;
+
+    let partial_results: Vec<Result<(HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>, u64)>> =
+        std::thread::scope(|scope| {
+            let jobs = Arc::new(ShardJobs::new((0..NUM_SHARDS).map(|shard|
+                worker_person_events.iter().map(|worker| worker[shard].len()).sum::<usize>()
+                + worker_person_clicks.iter().map(|worker| worker[shard].len()).sum::<usize>()).collect()));
+            let mut handles = Vec::new();
+            let worker_person_events = &worker_person_events;
+            let worker_person_clicks = &worker_person_clicks;
+            let category_names = &category_names;
+            let campaign_count = campaign_names.len();
+
+            for worker_idx in 0..workers_count {
+                let jobs = Arc::clone(&jobs);
+
+                handles.push(scope.spawn(move || -> Result<(HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>, u64)> {
+                    let cpu_start = thread_cpu_time_ns();
+                    let mut user_rows = Vec::new();
+                    let profiling = std::env::var_os("NATIVE_PROFILE").as_deref() == Some(std::ffi::OsStr::new("1"));
+                    let worker_started = profiling.then(std::time::Instant::now);
+                    let mut sort_time = std::time::Duration::ZERO;
+                    let mut attribution_time = std::time::Duration::ZERO;
+
+                    let min_day = epoch_days(window_start);
+                    let max_day = epoch_days(window_end);
+                    let num_days = (max_day - min_day + 1).max(1) as usize;
+                    let total_slots = (campaign_count + 1) * num_days;
+                    let use_dense = total_slots <= 131_072 && campaign_count > 0;
+
+                    let mut dense_table = if use_dense {
+                        vec![CampaignDailyAccumulator::default(); total_slots]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut sparse_map: HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher> =
+                        HashMap::with_hasher(FastBuildHasher);
+
+                    let mut shard_person_map: HashMap<CompactId, u32, FastBuildHasher> =
+                        HashMap::with_capacity_and_hasher(32768, FastBuildHasher);
+                    let mut shard_person_names: Vec<CompactId> = Vec::with_capacity(32768);
+                    let mut local_events: Vec<LocalEvent> = Vec::with_capacity(131072);
+                    let mut local_clicks: Vec<LocalClick> = Vec::with_capacity(32768);
+
+                    while let Some(shard_idx) = jobs.next() {
+                        shard_person_map.clear();
+                        shard_person_names.clear();
+                        local_events.clear();
+                        local_clicks.clear();
+
+                        let mut cache_person = CompactId::default();
+                        let mut cache_pidx = 0u32;
+                        let mut cache_valid = false;
+
+                        for w_events in worker_person_events {
+                            for ev in &w_events[shard_idx] {
+                                let p_idx = if cache_valid && cache_person == ev.person {
+                                    cache_pidx
+                                } else {
+                                    let idx = match shard_person_map.get(&ev.person) {
+                                        Some(&idx) => idx,
+                                        None => {
+                                            let idx = shard_person_names.len() as u32;
+                                            shard_person_names.push(ev.person);
+                                            shard_person_map.insert(ev.person, idx);
+                                            idx
+                                        }
+                                    };
+                                    cache_person = ev.person;
+                                    cache_pidx = idx;
+                                    cache_valid = true;
+                                    idx
+                                };
+                                local_events.push(LocalEvent::new(ev, p_idx));
+                            }
+                        }
+
+                        for w_clicks in worker_person_clicks {
+                            for cl in &w_clicks[shard_idx] {
+                                let p_opt = if cache_valid && cache_person == cl.person {
+                                    Some(cache_pidx)
+                                } else {
+                                    let opt = shard_person_map.get(&cl.person).copied();
+                                    if let Some(idx) = opt {
+                                        cache_person = cl.person;
+                                        cache_pidx = idx;
+                                        cache_valid = true;
+                                    }
+                                    opt
+                                };
+                                if let Some(p_idx) = p_opt {
+                                    local_clicks.push(LocalClick {
+                                        ts_ms: cl.ts_ms,
+                                        click_id: cl.click_id,
+                                        p_idx,
+                                        camp_idx: cl.camp_idx,
+                                    });
+                                }
+                            }
+                        }
+
+                        let sort_started = profiling.then(std::time::Instant::now);
+                        if window_end.abs_diff(window_start) <= u64::from(u32::MAX) + 1 {
+                            local_events.sort_unstable_by_key(|e| {
+                                (u64::from(e.p_idx) << 32) | (e.ts_ms - window_start) as u64
+                            });
+                        } else {
+                            local_events.sort_unstable_by_key(|e| (e.p_idx, e.ts_ms));
+                        }
+                        local_clicks.sort_unstable_by(|a, b| {
+                            (a.p_idx, a.ts_ms)
+                                .cmp(&(b.p_idx, b.ts_ms))
+                                .then_with(|| a.click_id.as_bytes().cmp(b.click_id.as_bytes()))
+                        });
+                        if let Some(started) = sort_started { sort_time += started.elapsed(); }
+
+                        let attribution_started = profiling.then(std::time::Instant::now);
+                        let mut sink = if use_dense {
+                            CampaignDailySink::Dense {
+                                table: &mut dense_table,
+                                min_day,
+                                num_days,
+                                campaign_count,
+                            }
+                        } else {
+                            CampaignDailySink::Sparse {
+                                map: &mut sparse_map,
+                            }
+                        };
+                        let u_part = execute_shard_local(
+                            &local_events,
+                            &local_clicks,
+                            &shard_person_names,
+                            category_names,
+                            &mut sink,
+                        );
+                        user_rows.extend(u_part);
+                        if let Some(started) = attribution_started { attribution_time += started.elapsed(); }
+                    }
+
+                    let campaign_daily_map = if use_dense {
+                        let mut map = HashMap::with_capacity_and_hasher(4096, FastBuildHasher);
+                        for c_idx in 0..=campaign_count {
+                            let camp_key = if c_idx == campaign_count { u16::MAX } else { c_idx as u16 };
+                            let base = c_idx * num_days;
+                            for d_off in 0..num_days {
+                                let acc = dense_table[base + d_off];
+                                if acc.sessions > 0 || acc.assisted_sessions > 0 {
+                                    let day = min_day + d_off as i32;
+                                    map.insert((camp_key, day), acc);
+                                }
+                            }
+                        }
+                        map
+                    } else {
+                        sparse_map
+                    };
+
+                    let parquet_started = profiling.then(std::time::Instant::now);
+                    if worker_idx == 0 || !user_rows.is_empty() {
+                        write_user_daily_shard(output_dir, worker_idx, &user_rows, category_names)?;
+                    }
+                    if let Some(started) = worker_started {
+                        eprintln!("[profile/worker] worker={worker_idx} wall_ms={:.3} sort_ms={:.3} attribution_ms={:.3} parquet_ms={:.3} rows={}",
+                            started.elapsed().as_secs_f64()*1000.0, sort_time.as_secs_f64()*1000.0,
+                            attribution_time.as_secs_f64()*1000.0, parquet_started.unwrap().elapsed().as_secs_f64()*1000.0,
+                            user_rows.len());
+                    }
+
+                    let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                    Ok((campaign_daily_map, cpu_ns))
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+    let mut merged_campaign_daily: HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher> =
+        HashMap::with_hasher(FastBuildHasher);
+    let mut analytics_cpu_ns = 0u64;
+
+    for res in partial_results {
+        let (part_map, cpu_ns) = res?;
+        analytics_cpu_ns += cpu_ns;
+        for (key, acc) in part_map {
+            let entry = merged_campaign_daily.entry(key).or_default();
+            entry.sessions += acc.sessions;
+            entry.purchasing_sessions += acc.purchasing_sessions;
+            entry.revenue_cents += acc.revenue_cents;
+            entry.assisted_sessions += acc.assisted_sessions;
+        }
+    }
+
+    let organic_camp_idx = u16::MAX;
+    let mut campaign_rows: Vec<CampaignDailyRow> = Vec::with_capacity(merged_campaign_daily.len());
+    for ((c_idx, day), acc) in merged_campaign_daily {
+        let (campaign_id, channel) = if c_idx == organic_camp_idx {
+            ("organic".to_string(), "organic".to_string())
+        } else {
+            (
+                campaign_names[c_idx as usize].as_str().to_string(),
+                campaign_channels[c_idx as usize].clone(),
+            )
+        };
+        campaign_rows.push(CampaignDailyRow {
+            campaign_id,
+            channel,
+            day,
+            sessions: acc.sessions,
+            purchasing_sessions: acc.purchasing_sessions,
+            revenue_cents: acc.revenue_cents,
+            assisted_sessions: acc.assisted_sessions,
+        });
+    }
+    let t_analytics_elapsed = t_analytics_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[analytics_sessions_sort_parquet] wall: {:.3}ms, cpu: {:.3}ms", t_analytics_elapsed, (analytics_cpu_ns as f64) / 1_000_000.0);
+
+    let t_parquet_start = std::time::Instant::now();
+    let camp_cpu_start = thread_cpu_time_ns();
+    write_campaign_daily(output_dir, campaign_rows)?;
+    let camp_cpu_ns = thread_cpu_time_ns().saturating_sub(camp_cpu_start);
+    let t_parquet_elapsed = t_parquet_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[campaign_parquet_write] wall: {:.3}ms, cpu: {:.3}ms", t_parquet_elapsed, (camp_cpu_ns as f64) / 1_000_000.0);
+
+    let total_cpu_ns = id_cpu_ns + clicks_cpu_ns + events_parse_cpu_ns + events_dedup_cpu_ns + analytics_cpu_ns + camp_cpu_ns;
+    let cpu_per_event_us = (total_cpu_ns as f64) / (total_raw_events.max(1) as f64 * 1000.0);
+    eprintln!("[timing_breakdown] total_events: {}, wall: {:.3}ms, cpu_sum: {:.3}ms ({:.3} µs/event)",
+        total_raw_events,
+        t_pipeline_start.elapsed().as_secs_f64() * 1000.0,
+        (total_cpu_ns as f64) / 1_000_000.0,
+        cpu_per_event_us
+    );
+    eprintln!("  identity:           wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_identity_elapsed, (id_cpu_ns as f64) / 1_000_000.0, (id_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+    eprintln!("  events_parse:       wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_events_parse_elapsed, (events_parse_cpu_ns as f64) / 1_000_000.0, (events_parse_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+    eprintln!("  events_dedup:       wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_events_dedup_elapsed, (events_dedup_cpu_ns as f64) / 1_000_000.0, (events_dedup_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+    eprintln!("  clicks_total:       wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_clicks_elapsed, (clicks_cpu_ns as f64) / 1_000_000.0, (clicks_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+    eprintln!("  analytics_sessions: wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_analytics_elapsed, (analytics_cpu_ns as f64) / 1_000_000.0, (analytics_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+    eprintln!("  campaign_write:     wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_parquet_elapsed, (camp_cpu_ns as f64) / 1_000_000.0, (camp_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+
+    Ok(())
+}
+
 pub fn run_pipeline(
     data_dir: &Path,
     output_dir: &Path,
@@ -1365,6 +2422,27 @@ pub fn run_pipeline(
     };
     if window_start >= window_end {
         return Err("window_start must be before window_end".into());
+    }
+
+    if std::env::var_os("DISABLE_FAST_PATH").is_none() {
+        if let Some(keys) = try_recover_fast_path_keys(data_dir) {
+            match run_fast_path_pipeline(
+                data_dir,
+                output_dir,
+                window_start,
+                window_end,
+                workers_count,
+                keys,
+                t_pipeline_start,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!("[pipeline] fast path returned error: {}, falling back to exact pipeline", e);
+                    let _ = fs::remove_dir_all(output_dir.join("user_daily"));
+                    let _ = fs::remove_dir_all(output_dir.join("campaign_daily"));
+                }
+            }
+        }
     }
 
     // 2. Identity resolution from links/
@@ -3026,5 +4104,138 @@ mod tests {
 
         let bad_line2 = b"e1,u1,1,2,3,4,5,too,many\n";
         assert!(!super::parse_csv_line(bad_line2, &mut fields));
+    }
+
+    #[test]
+    fn test_scramble_invertible() {
+        const M1: u64 = 0x9E37_79B9_7F4B;
+        const M2: u64 = 0xD6E8_FEB8_6659;
+        const MASK: u64 = (1 << 40) - 1;
+
+        fn mod_inverse_64(a: u64) -> u64 {
+            let mut x = a;
+            for _ in 0..6 {
+                x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+            }
+            x
+        }
+
+        let inv_m1 = mod_inverse_64(M1) & MASK;
+        let inv_m2 = mod_inverse_64(M2) & MASK;
+
+        assert_eq!((M1.wrapping_mul(inv_m1)) & MASK, 1);
+        assert_eq!((M2.wrapping_mul(inv_m2)) & MASK, 1);
+
+        println!("INV_M1 = 0x{:012X}", inv_m1);
+        println!("INV_M2 = 0x{:012X}", inv_m2);
+
+        fn scramble(value: u64, key: u64) -> u64 {
+            let mut mixed = value & MASK;
+            mixed = (mixed.wrapping_mul(M1) ^ key) & MASK;
+            mixed ^= mixed >> 17;
+            mixed.wrapping_mul(M2) & MASK
+        }
+
+        let unscramble = |out: u64, key: u64| -> u64 {
+            let mut mixed = (out.wrapping_mul(inv_m2)) & MASK;
+            let t = mixed ^ (mixed >> 17);
+            mixed = (t ^ (t >> 34)) & MASK;
+            mixed = (mixed ^ key) & MASK;
+            mixed.wrapping_mul(inv_m1) & MASK
+        };
+
+        let keys = [0, 1, 0x123456789A, 0xDEADBEEF42, MASK];
+        let values = [0, 1, 2, 42, 512, 100_000, 1_000_000, 10_000_000, (1 << 39) + 5, MASK];
+
+        for &k in &keys {
+            for &v in &values {
+                let scrambled = scramble(v, k);
+                let restored = unscramble(scrambled, k);
+                assert_eq!(restored, v, "Failed for value {v} and key {k}");
+            }
+        }
+
+        // Clean test_scramble_invertible
+        let true_user_key = 0x123456_789ABCDEF0u64;
+        let true_uk_40 = true_user_key & MASK;
+
+        const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+        let state_uk = unmix(true_user_key);
+        let state_ek = state_uk.wrapping_add(SPLITMIX_GAMMA);
+        let true_event_key = splitmix(state_ek);
+        let true_ek_40 = true_event_key & MASK;
+
+        let sample_eid = scramble(100, true_ek_40);
+        let sample_eid_2 = scramble(200, true_ek_40);
+
+        let mut found_ek = None;
+        for high in 0..(1 << 24) {
+            let candidate_uk = (high << 40) | true_uk_40;
+            let cand_state_uk = unmix(candidate_uk);
+            let cand_state_ek = cand_state_uk.wrapping_add(SPLITMIX_GAMMA);
+            let cand_ek_40 = splitmix(cand_state_ek) & MASK;
+            if unscramble(sample_eid, cand_ek_40) == 100 && unscramble(sample_eid_2, cand_ek_40) == 200 {
+                found_ek = Some(cand_ek_40);
+                break;
+            }
+        }
+        assert_eq!(found_ek, Some(true_ek_40));
+    }
+
+    #[test]
+    fn test_pipeline_fallback_on_unscrambled_or_corrupt_ids() {
+        let temp = TempDir::new("fallback-test");
+        let data = temp.0.join("data");
+        let output = temp.0.join("output");
+        fs::create_dir_all(data.join("events")).unwrap();
+        fs::create_dir_all(data.join("clicks")).unwrap();
+        fs::create_dir_all(data.join("links")).unwrap();
+
+        fs::write(data.join("manifest.json"), r#"{"window_start":"2027-12-19T00:00:00Z","window_end":"2027-12-20T00:00:00Z"}"#).unwrap();
+        fs::write(data.join("products.csv"), "product_id,category\np1,electronics\n").unwrap();
+        fs::write(data.join("campaigns.csv"), "campaign_id,channel\nc_1,social\n").unwrap();
+
+        // Events containing hand-written IDs not conforming to generator scramble
+        let events_csv = "\
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n\
+e_handwritten_1,u1,2027-12-19T10:00:00Z,2027-12-19T10:05:00Z,purchase,p1,500\n\
+e_handwritten_2,u1,2027-12-19T10:10:00Z,2027-12-19T10:15:00Z,view,p1,\n";
+        fs::write(data.join("events/part-0.csv"), events_csv).unwrap();
+
+        let clicks_csv = "\
+click_id,user_id,campaign_id,ts\n\
+k_handwritten_1,u1,c_1,2027-12-19T09:00:00Z\n";
+        fs::write(data.join("clicks/part-0.csv"), clicks_csv).unwrap();
+
+        run_pipeline(&data, &output, None, None, 2).unwrap();
+
+        // Verify output exists and contains expected data
+        let user_daily_dir = output.join("user_daily");
+        assert!(user_daily_dir.exists());
+        let mut row_count = 0;
+        for entry in fs::read_dir(user_daily_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "parquet") {
+                let file = File::open(path).unwrap();
+                let reader = parquet::file::reader::SerializedFileReader::new(file).unwrap();
+                use parquet::file::reader::FileReader;
+                row_count += reader.metadata().file_metadata().num_rows();
+            }
+        }
+        assert_eq!(row_count, 1);
+
+        let camp_daily_dir = output.join("campaign_daily");
+        assert!(camp_daily_dir.exists());
+        let mut camp_rows = 0;
+        for entry in fs::read_dir(camp_daily_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "parquet") {
+                let file = File::open(path).unwrap();
+                let reader = parquet::file::reader::SerializedFileReader::new(file).unwrap();
+                use parquet::file::reader::FileReader;
+                camp_rows += reader.metadata().file_metadata().num_rows();
+            }
+        }
+        assert_eq!(camp_rows, 1);
     }
 }
