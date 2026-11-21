@@ -267,6 +267,45 @@ struct EventDedupEntry {
     is_valid: bool,
 }
 
+#[derive(Clone, Copy)]
+struct UserCacheSlot {
+    len: u8,
+    bytes: [u8; 31],
+    person: CompactId,
+    p_shard: u8,
+}
+
+#[derive(Clone, Copy)]
+struct DedupSlot {
+    epoch: u32,
+    eid_hash: u128,
+    person: CompactId,
+    ingest_ms: i64,
+    ts_ms: i64,
+    price_cents: i32,
+    p_shard: u8,
+    cat_idx: u8,
+    is_purchase: bool,
+    is_valid: bool,
+}
+
+impl Default for DedupSlot {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            eid_hash: 0,
+            person: CompactId::default(),
+            ingest_ms: 0,
+            ts_ms: 0,
+            price_cents: 0,
+            p_shard: 0,
+            cat_idx: 0,
+            is_purchase: false,
+            is_valid: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RawPersonEvent {
     person: CompactId,
@@ -1251,6 +1290,12 @@ pub fn run_pipeline(
                     handles.push(c_scope.spawn(move || -> Result<(Vec<Vec<RawClick>>, u64)> {
                         let cpu_start = thread_cpu_time_ns();
                         let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(512)).collect();
+                        let mut user_cache = [UserCacheSlot {
+                            len: 0,
+                            bytes: [0u8; 31],
+                            person: CompactId::default(),
+                            p_shard: 0,
+                        }; 64];
 
                         while !cancelled.load(Ordering::Relaxed) {
                             let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -1277,7 +1322,26 @@ pub fn run_pipeline(
                                     let click_id = CompactId::from_bytes(click_id_bytes);
                                     let shard_idx = get_shard_bytes(click_id.as_bytes());
                                     let user_bytes = fields[1].unwrap();
-                                    let (person, p_shard) = ids.get_compact_with_shard(user_bytes);
+                                    let (person, p_shard) = if !user_bytes.is_empty() && user_bytes.len() <= 31 {
+                                        let slot = ((user_bytes[0] as usize)
+                                            ^ (user_bytes[user_bytes.len() - 1] as usize)
+                                            ^ user_bytes.len())
+                                            & 63;
+                                        if user_cache[slot].len == user_bytes.len() as u8
+                                            && &user_cache[slot].bytes[..user_bytes.len()] == user_bytes
+                                        {
+                                            (user_cache[slot].person, user_cache[slot].p_shard)
+                                        } else {
+                                            let (p, s) = ids.get_compact_with_shard(user_bytes);
+                                            user_cache[slot].len = user_bytes.len() as u8;
+                                            user_cache[slot].bytes[..user_bytes.len()].copy_from_slice(user_bytes);
+                                            user_cache[slot].person = p;
+                                            user_cache[slot].p_shard = s;
+                                            (p, s)
+                                        }
+                                    } else {
+                                        ids.get_compact_with_shard(user_bytes)
+                                    };
                                     local_shards[shard_idx].push(RawClick {
                                         click_id,
                                         person,
@@ -1378,6 +1442,12 @@ pub fn run_pipeline(
                         shards: (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect(),
                         wide_times: Vec::new(),
                     };
+                    let mut user_cache = [UserCacheSlot {
+                        len: 0,
+                        bytes: [0u8; 31],
+                        person: CompactId::default(),
+                        p_shard: 0,
+                    }; 64];
 
                     while !cancelled.load(Ordering::Relaxed) {
                         let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -1471,7 +1541,26 @@ pub fn run_pipeline(
 
                             let (eid_hash, shard_idx) = hash_event_id_128(event_id_bytes);
                             let (person, p_shard) = if let Some(user_bytes) = fields[1] {
-                                ids.get_compact_with_shard(user_bytes)
+                                if !user_bytes.is_empty() && user_bytes.len() <= 31 {
+                                    let slot = ((user_bytes[0] as usize)
+                                        ^ (user_bytes[user_bytes.len() - 1] as usize)
+                                        ^ user_bytes.len())
+                                        & 63;
+                                    if user_cache[slot].len == user_bytes.len() as u8
+                                        && &user_cache[slot].bytes[..user_bytes.len()] == user_bytes
+                                    {
+                                        (user_cache[slot].person, user_cache[slot].p_shard)
+                                    } else {
+                                        let (p, s) = ids.get_compact_with_shard(user_bytes);
+                                        user_cache[slot].len = user_bytes.len() as u8;
+                                        user_cache[slot].bytes[..user_bytes.len()].copy_from_slice(user_bytes);
+                                        user_cache[slot].person = p;
+                                        user_cache[slot].p_shard = s;
+                                        (p, s)
+                                    }
+                                } else {
+                                    ids.get_compact_with_shard(user_bytes)
+                                }
                             } else {
                                 (CompactId::default(), 0u8)
                             };
@@ -1527,19 +1616,53 @@ pub fn run_pipeline(
                     let mut local_person_shards: Vec<Vec<RawPersonEvent>> =
                         (0..NUM_SHARDS).map(|_| Vec::with_capacity(1024)).collect();
 
-                    let mut dedup_map: HashMap<u128, EventDedupEntry, FastBuildHasher> =
-                        HashMap::with_capacity_and_hasher(65536, FastBuildHasher);
+                    const DEDUP_CAP: usize = 262_144;
+                    const DEDUP_MASK: usize = DEDUP_CAP - 1;
+
+                    let mut dedup_table = vec![DedupSlot::default(); DEDUP_CAP];
+                    let mut occupied_slots: Vec<u32> = Vec::with_capacity(65536);
+                    let mut epoch: u32 = 1;
+                    let mut fallback_map: HashMap<u128, EventDedupEntry, FastBuildHasher> =
+                        HashMap::with_hasher(FastBuildHasher);
 
                     for shard_idx in start_shard..end_shard {
-                        dedup_map.clear();
+                        occupied_slots.clear();
+                        epoch = epoch.wrapping_add(1);
+                        if epoch == 0 {
+                            dedup_table.fill(DedupSlot::default());
+                            epoch = 1;
+                        }
+                        let mut overflow = false;
+                        fallback_map.clear();
 
                         for worker_shards in worker_event_shards {
                             for ev in &worker_shards.shards[shard_idx] {
                                 let (ingest_ms, ts_ms) = worker_shards.decode_times(ev, window_start);
-                                match dedup_map.get_mut(&ev.eid_hash) {
-                                    Some(existing) => {
-                                        if ingest_ms < existing.ingest_ms {
-                                            *existing = EventDedupEntry {
+                                if !overflow {
+                                    let mut slot_idx = ((ev.eid_hash >> 8) as usize) & DEDUP_MASK;
+                                    let mut found = false;
+                                    while dedup_table[slot_idx].epoch == epoch {
+                                        if dedup_table[slot_idx].eid_hash == ev.eid_hash {
+                                            if ingest_ms < dedup_table[slot_idx].ingest_ms {
+                                                dedup_table[slot_idx].person = ev.person;
+                                                dedup_table[slot_idx].ingest_ms = ingest_ms;
+                                                dedup_table[slot_idx].ts_ms = ts_ms;
+                                                dedup_table[slot_idx].price_cents = ev.price_cents;
+                                                dedup_table[slot_idx].p_shard = ev.p_shard;
+                                                dedup_table[slot_idx].cat_idx = ev.cat_idx;
+                                                dedup_table[slot_idx].is_purchase = ev.flags & PURCHASE != 0;
+                                                dedup_table[slot_idx].is_valid = ev.flags & VALID != 0;
+                                            }
+                                            found = true;
+                                            break;
+                                        }
+                                        slot_idx = (slot_idx + 1) & DEDUP_MASK;
+                                    }
+                                    if !found {
+                                        if occupied_slots.len() < (DEDUP_CAP - 1024) {
+                                            dedup_table[slot_idx] = DedupSlot {
+                                                epoch,
+                                                eid_hash: ev.eid_hash,
                                                 person: ev.person,
                                                 ingest_ms,
                                                 ts_ms,
@@ -1549,38 +1672,90 @@ pub fn run_pipeline(
                                                 is_purchase: ev.flags & PURCHASE != 0,
                                                 is_valid: ev.flags & VALID != 0,
                                             };
+                                            occupied_slots.push(slot_idx as u32);
+                                        } else {
+                                            overflow = true;
+                                            for &idx in &occupied_slots {
+                                                let s = &dedup_table[idx as usize];
+                                                fallback_map.insert(s.eid_hash, EventDedupEntry {
+                                                    person: s.person,
+                                                    ingest_ms: s.ingest_ms,
+                                                    ts_ms: s.ts_ms,
+                                                    price_cents: s.price_cents,
+                                                    p_shard: s.p_shard,
+                                                    cat_idx: s.cat_idx,
+                                                    is_purchase: s.is_purchase,
+                                                    is_valid: s.is_valid,
+                                                });
+                                            }
                                         }
                                     }
-                                    None => {
-                                        dedup_map.insert(
-                                            ev.eid_hash,
-                                            EventDedupEntry {
-                                                person: ev.person,
-                                                ingest_ms,
-                                                ts_ms,
-                                                price_cents: ev.price_cents,
-                                                p_shard: ev.p_shard,
-                                                cat_idx: ev.cat_idx,
-                                                is_purchase: ev.flags & PURCHASE != 0,
-                                                is_valid: ev.flags & VALID != 0,
-                                            },
-                                        );
+                                }
+                                if overflow {
+                                    match fallback_map.get_mut(&ev.eid_hash) {
+                                        Some(existing) => {
+                                            if ingest_ms < existing.ingest_ms {
+                                                *existing = EventDedupEntry {
+                                                    person: ev.person,
+                                                    ingest_ms,
+                                                    ts_ms,
+                                                    price_cents: ev.price_cents,
+                                                    p_shard: ev.p_shard,
+                                                    cat_idx: ev.cat_idx,
+                                                    is_purchase: ev.flags & PURCHASE != 0,
+                                                    is_valid: ev.flags & VALID != 0,
+                                                };
+                                            }
+                                        }
+                                        None => {
+                                            fallback_map.insert(
+                                                ev.eid_hash,
+                                                EventDedupEntry {
+                                                    person: ev.person,
+                                                    ingest_ms,
+                                                    ts_ms,
+                                                    price_cents: ev.price_cents,
+                                                    p_shard: ev.p_shard,
+                                                    cat_idx: ev.cat_idx,
+                                                    is_purchase: ev.flags & PURCHASE != 0,
+                                                    is_valid: ev.flags & VALID != 0,
+                                                },
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
 
-                        for entry in dedup_map.values() {
-                            if entry.is_valid && entry.ts_ms != i64::MIN {
-                                let ts = entry.ts_ms;
-                                if entry.ingest_ms.saturating_sub(ts) <= 86_400_000 {
-                                    local_person_shards[entry.p_shard as usize].push(RawPersonEvent {
-                                        person: entry.person,
-                                        ts_ms: ts,
-                                        price_cents: entry.price_cents,
-                                        cat_idx: entry.cat_idx,
-                                        is_purchase: entry.is_purchase,
-                                    });
+                        if !overflow {
+                            for &idx in &occupied_slots {
+                                let entry = &dedup_table[idx as usize];
+                                if entry.is_valid && entry.ts_ms != i64::MIN {
+                                    let ts = entry.ts_ms;
+                                    if entry.ingest_ms.saturating_sub(ts) <= 86_400_000 {
+                                        local_person_shards[entry.p_shard as usize].push(RawPersonEvent {
+                                            person: entry.person,
+                                            ts_ms: ts,
+                                            price_cents: entry.price_cents,
+                                            cat_idx: entry.cat_idx,
+                                            is_purchase: entry.is_purchase,
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            for entry in fallback_map.values() {
+                                if entry.is_valid && entry.ts_ms != i64::MIN {
+                                    let ts = entry.ts_ms;
+                                    if entry.ingest_ms.saturating_sub(ts) <= 86_400_000 {
+                                        local_person_shards[entry.p_shard as usize].push(RawPersonEvent {
+                                            person: entry.person,
+                                            ts_ms: ts,
+                                            price_cents: entry.price_cents,
+                                            cat_idx: entry.cat_idx,
+                                            is_purchase: entry.is_purchase,
+                                        });
+                                    }
                                 }
                             }
                         }
