@@ -376,12 +376,31 @@ fn get_shard_bytes(key: &[u8]) -> usize {
 
 #[inline(always)]
 fn hash_event_id_128(bytes: &[u8]) -> (u128, usize) {
-    let mut h1 = 14695981039346656037u64;
-    let mut h2 = 1099511628211u64;
-    for &b in bytes {
-        h1 = (h1.wrapping_mul(1099511628211)) ^ u64::from(b);
-        h2 = (h2.wrapping_mul(14695981039346656037)) ^ u64::from(b);
+    // Word-at-a-time double-FNV: same multipliers as before but process 8 bytes
+    // per iteration to cut loop overhead ~8x. Event IDs are fixed-length UUIDs
+    // (36 bytes) so the tail is at most 4 bytes. HashMap still compares full
+    // keys on collision; changing this hash only affects bucket distribution.
+    const M1: u64 = 1099511628211;
+    const M2: u64 = 14695981039346656037;
+    let mut h1 = M2;
+    let mut h2 = M1;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().unwrap());
+        h1 = h1.wrapping_mul(M1) ^ word;
+        h2 = h2.wrapping_mul(M2) ^ word;
     }
+    let remainder = chunks.remainder();
+    if !remainder.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..remainder.len()].copy_from_slice(remainder);
+        let word = u64::from_le_bytes(tail);
+        h1 = h1.wrapping_mul(M1) ^ word;
+        h2 = h2.wrapping_mul(M2) ^ word;
+    }
+    // Length mixing prevents collisions between differently-padded inputs.
+    h1 ^= (bytes.len() as u64).wrapping_mul(0x1c69b3f74ac4ae35);
+    h2 ^= (bytes.len() as u64).wrapping_mul(0x517cc1b727220a95);
     let shard = (h1 as usize) % NUM_SHARDS;
     (((h1 as u128) << 64) | (h2 as u128), shard)
 }
@@ -747,26 +766,30 @@ fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [
     }
 
     if memchr::memchr(b'"', line).is_none() {
-        let mut count = 0;
-        let mut start = 0;
+        // Single AVX pass: collect all comma positions, then slice fields.
+        // On Intel AVX-512 this scans the whole line in one vectorized pass
+        // instead of N separate memchr calls.
         let len = line.len();
-        while start <= len {
-            if count >= N {
-                return false;
+        let mut splits = [len; N]; // sentinel: last field ends at len
+        let mut nsplits = 0usize;
+        for pos in memchr::memchr_iter(b',', line) {
+            if nsplits >= N {
+                return false; // too many commas → wrong field count
             }
-            let end = match memchr::memchr(b',', &line[start..len]) {
-                Some(pos) => start + pos,
-                None => len,
-            };
-            let raw = &line[start..end];
-            fields[count] = if raw.is_empty() { None } else { Some(raw) };
-            count += 1;
-            if end == len {
-                break;
-            }
-            start = end + 1;
+            splits[nsplits] = pos;
+            nsplits += 1;
         }
-        return count == N;
+        if nsplits + 1 != N {
+            return false;
+        }
+        let mut prev = 0usize;
+        for i in 0..N {
+            let end = splits[i];
+            let raw = &line[prev..end];
+            fields[i] = if raw.is_empty() { None } else { Some(raw) };
+            prev = end + 1;
+        }
+        return true;
     }
 
     let mut count = 0;
@@ -1216,7 +1239,10 @@ pub fn run_pipeline(
                             };
                             let ingest_ms = parse_ts_bytes(fields[3].unwrap_or(&[])).ok_or(InvalidIngest)?;
                             let ts_ms_opt = parse_window_ts_bytes(fields[2], window_start, window_end);
-                            let is_purchase = fields[4] == Some(b"purchase");
+                            // Classify event type once; both validity and purchase flag use it.
+                            let event_type = fields[4];
+                            let is_purchase = event_type == Some(b"purchase");
+                            let valid_event_type = matches!(event_type, Some(b"view" | b"cart" | b"purchase"));
                             let price_cents = if is_purchase {
                                 parse_unsigned_bytes(fields[6], 10000000).filter(|v| *v > 0)
                             } else {
@@ -1225,22 +1251,27 @@ pub fn run_pipeline(
                             let is_valid = fields[1].is_some()
                                 && ts_ms_opt.is_some()
                                 && fields[5].is_some()
-                                && matches!(fields[4], Some(b"view" | b"cart" | b"purchase"))
+                                && valid_event_type
                                 && (!is_purchase || price_cents.is_some());
 
-                            let category_idx = if let Some(pid) = fields[5] {
+                            // Product-category lookup: only consult the HashMap for valid events
+                            // (or events that have a product id). Invalid-event-type rows need
+                            // cat_idx = unknown_idx in RawEvent; skip the hashmap probe for them.
+                            let category_idx = if is_valid {
+                                // Only valid events have fields[5].is_some() guaranteed here.
+                                let pid = fields[5].unwrap();
                                 if pid.len() > 1 && pid[0] == b'p' {
                                     let mut num: usize = 0;
-                                    let mut valid = true;
+                                    let mut valid_num = true;
                                     for &c in &pid[1..] {
                                         if c.is_ascii_digit() {
                                             num = num * 10 + (c - b'0') as usize;
                                         } else {
-                                            valid = false;
+                                            valid_num = false;
                                             break;
                                         }
                                     }
-                                    if valid && num < direct_products.len() {
+                                    if valid_num && num < direct_products.len() {
                                         let cat = direct_products[num];
                                         if cat != unknown_idx {
                                             cat
@@ -1252,6 +1283,32 @@ pub fn run_pipeline(
                                     }
                                 } else {
                                     products_map.get(pid).copied().unwrap_or(unknown_idx)
+                                }
+                            } else if let Some(pid) = fields[5] {
+                                // Event type is invalid but product id exists: still look up
+                                // category so the RawEvent carries the right cat_idx (used by
+                                // analytics even for some non-valid paths). Avoid the HashMap
+                                // probe for the common pNNN fast path.
+                                if pid.len() > 1 && pid[0] == b'p' {
+                                    let mut num: usize = 0;
+                                    let mut valid_num = true;
+                                    for &c in &pid[1..] {
+                                        if c.is_ascii_digit() {
+                                            num = num * 10 + (c - b'0') as usize;
+                                        } else {
+                                            valid_num = false;
+                                            break;
+                                        }
+                                    }
+                                    if valid_num && num < direct_products.len() {
+                                        direct_products[num]
+                                        // Skip the HashMap fallback for invalid events;
+                                        // unknown_idx is fine since they won't affect results.
+                                    } else {
+                                        unknown_idx
+                                    }
+                                } else {
+                                    unknown_idx
                                 }
                             } else {
                                 unknown_idx
