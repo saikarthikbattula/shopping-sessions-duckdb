@@ -1067,7 +1067,10 @@ pub fn run_pipeline(
 
     // 9. Parallel Execution of Analytics across Person Shards using 16-byte integer-keyed local events
     let t_analytics_start = std::time::Instant::now();
-    let partial_results: Vec<(Vec<UserDailyRow>, HashMap<(u16, i32), CampaignDailyAccumulator>)> =
+    let out_user_dir = output_dir.join("user_daily");
+    fs::create_dir_all(&out_user_dir)?;
+
+    let partial_results: Vec<Result<HashMap<(u16, i32), CampaignDailyAccumulator>>> =
         std::thread::scope(|scope| {
             let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
             let mut handles = Vec::new();
@@ -1079,7 +1082,7 @@ pub fn run_pipeline(
                 let start_shard = worker_idx * shards_per_worker;
                 let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
 
-                handles.push(scope.spawn(move || {
+                handles.push(scope.spawn(move || -> Result<HashMap<(u16, i32), CampaignDailyAccumulator>> {
                     let mut user_rows = Vec::new();
                     let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
 
@@ -1150,18 +1153,21 @@ pub fn run_pipeline(
                             entry.assisted_sessions += acc.assisted_sessions;
                         }
                     }
-                    (user_rows, campaign_daily_map)
+
+                    if worker_idx == 0 || !user_rows.is_empty() {
+                        write_user_daily_shard(output_dir, worker_idx, user_rows)?;
+                    }
+
+                    Ok(campaign_daily_map)
                 }));
             }
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-    // Combine user rows and merge campaign accumulators
-    let mut total_user_rows = Vec::new();
     let mut merged_campaign_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
 
-    for (u_rows, c_map) in partial_results {
-        total_user_rows.extend(u_rows);
+    for c_map_res in partial_results {
+        let c_map = c_map_res?;
         for (k, acc) in c_map {
             let entry = merged_campaign_map.entry(k).or_default();
             entry.sessions += acc.sessions;
@@ -1192,13 +1198,12 @@ pub fn run_pipeline(
             assisted_sessions: acc.assisted_sessions,
         });
     }
-    eprintln!("[analytics_sessions_sort] elapsed: {:.3}ms", t_analytics_start.elapsed().as_secs_f64() * 1000.0);
+    eprintln!("[analytics_sessions_sort_parquet] elapsed: {:.3}ms", t_analytics_start.elapsed().as_secs_f64() * 1000.0);
 
-    // 10. Write Parquet Files
+    // 10. Write CampaignDaily Parquet File
     let t_parquet_start = std::time::Instant::now();
-    write_user_daily(output_dir, total_user_rows)?;
     write_campaign_daily(output_dir, campaign_rows)?;
-    eprintln!("[parquet_write] elapsed: {:.3}ms", t_parquet_start.elapsed().as_secs_f64() * 1000.0);
+    eprintln!("[campaign_parquet_write] elapsed: {:.3}ms", t_parquet_start.elapsed().as_secs_f64() * 1000.0);
     eprintln!("[pipeline_total] elapsed: {:.3}ms", t_pipeline_start.elapsed().as_secs_f64() * 1000.0);
 
     Ok(())
@@ -1479,10 +1484,10 @@ fn process_person_session(
     }
 }
 
-pub fn write_user_daily(output_dir: &Path, rows: Vec<UserDailyRow>) -> Result<()> {
+pub fn write_user_daily_shard(output_dir: &Path, shard_id: usize, rows: Vec<UserDailyRow>) -> Result<()> {
     let out_dir = output_dir.join("user_daily");
     fs::create_dir_all(&out_dir)?;
-    let file = File::create(out_dir.join("part-0.parquet"))?;
+    let file = File::create(out_dir.join(format!("part-{shard_id}.parquet")))?;
 
     let schema = user_daily_schema();
     let props = WriterProperties::builder()
@@ -1491,12 +1496,12 @@ pub fn write_user_daily(output_dir: &Path, rows: Vec<UserDailyRow>) -> Result<()
 
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
-    let mut user_builder = StringBuilder::new();
-    let mut day_builder = Date32Builder::new();
-    let mut sess_builder = Int64Builder::new();
-    let mut ev_builder = Int64Builder::new();
-    let mut rev_builder = Int64Builder::new();
-    let mut top_cat_builder = StringBuilder::new();
+    let mut user_builder = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+    let mut day_builder = Date32Builder::with_capacity(rows.len());
+    let mut sess_builder = Int64Builder::with_capacity(rows.len());
+    let mut ev_builder = Int64Builder::with_capacity(rows.len());
+    let mut rev_builder = Int64Builder::with_capacity(rows.len());
+    let mut top_cat_builder = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
 
     for row in rows {
         user_builder.append_value(&row.user_id);
