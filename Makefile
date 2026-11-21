@@ -9,13 +9,16 @@ FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
 PYTHON ?= .venv/bin/python
 SCRATCH ?= $(CURDIR)/scratch
 GENERATOR ?= tools/generator/target/release/generate
+CARGO ?= cargo
+RUST_JOBS ?= 2
+NATIVE_INGEST ?= $(CURDIR)/native/ingest/target/release/shopping-ingest
 BENCH_REPORT ?= out-benchmark/report.json
 BENCH_RUNS ?= 3
 BENCH_NCPU ?= 2
 BENCH_MEM_GB ?= 2
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: setup test build fixtures fixtures-local generator dev run-dev run-local check-dev check-dev-fingerprint benchmark
+.PHONY: setup test native-ingest test-native build fixtures fixtures-local generator dev run-dev run-local check-dev check-dev-fingerprint benchmark
 
 ## Create an isolated environment with pinned runtime and checker dependencies
 setup:
@@ -25,6 +28,15 @@ setup:
 ## Unit, contract, and independent staged/raw differential checks
 test:
 	$(PYTHON) -m unittest discover -s tests -v
+
+## Build the optional serial Rust backend; Python remains the default
+native-ingest:
+	cd native/ingest && $(CARGO) build --release --locked --jobs $(RUST_JOBS)
+
+## Require the real native executable; never silently skip native parity checks
+test-native: native-ingest
+	cd native/ingest && $(CARGO) test --release --locked --jobs $(RUST_JOBS)
+	REQUIRE_RUST_INGEST=1 RUST_INGEST_BIN="$(NATIVE_INGEST)" $(PYTHON) -m unittest discover -s tests -p 'test_ingest*.py' -v
 
 ## Official fixtures without Docker for the native development loop
 fixtures-local:
