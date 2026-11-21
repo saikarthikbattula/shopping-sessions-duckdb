@@ -1,0 +1,62 @@
+name: Profile native CPU
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - scripts/profile_native_cpu.py
+      - .github/workflows/profile-cpu.yml
+permissions:
+  contents: read
+jobs:
+  ablations:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: 1.85.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Rust and generate identical 5M seed-1 input
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          make setup
+          make generator
+          tools/generator/target/release/generate --seed 1 --events 5000000 --clicks 1250000 --output "$RUNNER_TEMP/cpu-data"
+          lscpu
+      - name: Scratch-only ablations and optional hardware counters
+        run: |
+          python3 scripts/profile_native_cpu.py "$RUNNER_TEMP/cpu-data" "$RUNNER_TEMP/cpu-study" --workers 2 --sudo-perf
+          python3 - "$RUNNER_TEMP/cpu-study/report.json" <<'PY'
+          import json, os, sys
+          report = json.load(open(sys.argv[1]))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Whole-process CPU study\nTwo-worker Linux x86 host. Ablations deliberately produce incorrect outputs.\n')
+              for variant, result in report['ablations'].items():
+                  summary.write(f'\n### {variant}\n```json\n{json.dumps(result["summary"], indent=2)}\n```\n')
+              summary.write(f'\n### perf\n```json\n{json.dumps(report["perf"], indent=2)}\n```\n')
+          PY
+          cat "$RUNNER_TEMP/cpu-study/report.json"
+      - name: Build candidate and check all three sizes against pinned baseline
+        run: |
+          set -eu
+          cargo test --release --locked --jobs 2 --manifest-path native/ingest/Cargo.toml
+          cargo build --release --locked --jobs 2 --manifest-path native/ingest/Cargo.toml
+          for events in 1000000 5000000 10000000; do
+            if [ "$events" = 5000000 ]; then
+              data="$RUNNER_TEMP/cpu-data"
+            else
+              data=$(mktemp -d "$RUNNER_TEMP/cpu-candidate-data.XXXXXX")
+              tools/generator/target/release/generate --seed 1 --events "$events" --clicks "$((events / 4))" --output "$data"
+            fi
+            report="out-cpu/$events.json"
+            .venv/bin/python scripts/benchmark_cpu_candidate.py "$RUNNER_TEMP/cpu-study/baseline/binary" native/ingest/target/release/shopping-ingest "$data" "$report" --workers 2
+            cat "$report"
+            .venv/bin/python - "$report" <<'PY'
+          import json, os, sys
+          report = json.load(open(sys.argv[1]))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'\n## Correct candidate: {sys.argv[1]}\nExact DuckDB EXCEPT ALL both ways passed for both tables on all three run pairs.\n```json\n{json.dumps(report["summary"], indent=2)}\n```\n')
+          PY
+          done
