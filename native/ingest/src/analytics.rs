@@ -389,30 +389,50 @@ fn get_shard_bytes(key: &[u8]) -> usize {
 #[inline(always)]
 fn hash_event_id_128(bytes: &[u8]) -> (u128, usize) {
     // Word-at-a-time double-FNV: same multipliers as before but process 8 bytes
-    // per iteration to cut loop overhead ~8x. Event IDs are fixed-length UUIDs
-    // (36 bytes) so the tail is at most 4 bytes. HashMap still compares full
-    // keys on collision; changing this hash only affects bucket distribution.
+    // per iteration to cut loop overhead ~8x. Event IDs in benchmark datasets
+    // are typically 8-16 bytes (e.g. 9-11 bytes); an unrolled fast path avoids
+    // chunks_exact iterator and array allocation for these common lengths.
     const M1: u64 = 1099511628211;
     const M2: u64 = 14695981039346656037;
     let mut h1 = M2;
     let mut h2 = M1;
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        let word = u64::from_le_bytes(chunk.try_into().unwrap());
-        h1 = h1.wrapping_mul(M1) ^ word;
-        h2 = h2.wrapping_mul(M2) ^ word;
-    }
-    let remainder = chunks.remainder();
-    if !remainder.is_empty() {
-        let mut tail = [0u8; 8];
-        tail[..remainder.len()].copy_from_slice(remainder);
-        let word = u64::from_le_bytes(tail);
-        h1 = h1.wrapping_mul(M1) ^ word;
-        h2 = h2.wrapping_mul(M2) ^ word;
+    let len = bytes.len();
+    let ptr = bytes.as_ptr();
+
+    if len >= 8 && len <= 16 {
+        let w0 = unsafe { (ptr as *const u64).read_unaligned().to_le() };
+        h1 = h1.wrapping_mul(M1) ^ w0;
+        h2 = h2.wrapping_mul(M2) ^ w0;
+
+        let rem_len = len - 8;
+        if rem_len > 0 {
+            let mut tail = [0u8; 8];
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr.add(8), tail.as_mut_ptr(), rem_len);
+            }
+            let w1 = u64::from_le_bytes(tail);
+            h1 = h1.wrapping_mul(M1) ^ w1;
+            h2 = h2.wrapping_mul(M2) ^ w1;
+        }
+    } else {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            h1 = h1.wrapping_mul(M1) ^ word;
+            h2 = h2.wrapping_mul(M2) ^ word;
+        }
+        let remainder = chunks.remainder();
+        if !remainder.is_empty() {
+            let mut tail = [0u8; 8];
+            tail[..remainder.len()].copy_from_slice(remainder);
+            let word = u64::from_le_bytes(tail);
+            h1 = h1.wrapping_mul(M1) ^ word;
+            h2 = h2.wrapping_mul(M2) ^ word;
+        }
     }
     // Length mixing prevents collisions between differently-padded inputs.
-    h1 ^= (bytes.len() as u64).wrapping_mul(0x1c69b3f74ac4ae35);
-    h2 ^= (bytes.len() as u64).wrapping_mul(0x517cc1b727220a95);
+    h1 ^= (len as u64).wrapping_mul(0x1c69b3f74ac4ae35);
+    h2 ^= (len as u64).wrapping_mul(0x517cc1b727220a95);
     let shard = (h1 as usize) & (NUM_SHARDS - 1);
     (((h1 as u128) << 64) | (h2 as u128), shard)
 }
@@ -910,33 +930,31 @@ unsafe fn csv_scan_avx2(line: &[u8], splits: &mut [usize], max_splits: usize) ->
     let len = line.len();
     let ptr = line.as_ptr();
     let mut nsplits = 0usize;
-    let mut has_quote = false;
+    let mut quote_any = 0u32;
     let mut i = 0usize;
     // 32-byte chunks
     while i + 32 <= len {
         let chunk = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
-        let qmask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, quote_v)) as u32;
-        if qmask != 0 {
-            return (0, true);
-        }
-        let cmask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, comma_v)) as u32;
-        let mut m = cmask;
-        while m != 0 {
-            let bit = m.trailing_zeros() as usize;
+        let is_quote = _mm256_cmpeq_epi8(chunk, quote_v);
+        let is_comma = _mm256_cmpeq_epi8(chunk, comma_v);
+        quote_any |= _mm256_movemask_epi8(is_quote) as u32;
+        let mut cmask = _mm256_movemask_epi8(is_comma) as u32;
+        while cmask != 0 {
+            let bit = cmask.trailing_zeros() as usize;
             if nsplits < max_splits {
                 splits[nsplits] = i + bit;
                 nsplits += 1;
             } else {
-                return (nsplits + m.count_ones() as usize, false); // overflow
+                return (nsplits + cmask.count_ones() as usize, true);
             }
-            m &= m - 1;
+            cmask &= cmask - 1;
         }
         i += 32;
     }
     // Scalar tail (at most 31 bytes)
     while i < len {
-        let b = line[i];
-        if b == b'"' { return (0, true); }
+        let b = *ptr.add(i);
+        if b == b'"' { quote_any |= 1; }
         if b == b',' {
             if nsplits < max_splits {
                 splits[nsplits] = i;
@@ -947,15 +965,16 @@ unsafe fn csv_scan_avx2(line: &[u8], splits: &mut [usize], max_splits: usize) ->
         }
         i += 1;
     }
-    (nsplits, false)
+    (nsplits, quote_any != 0)
 }
 
 /// Scalar fallback CSV scanner used on non-x86_64 or when AVX2 unavailable.
 #[inline(always)]
 fn csv_scan_scalar(line: &[u8], splits: &mut [usize], max_splits: usize) -> (usize, bool) {
     let mut nsplits = 0usize;
+    let mut has_quote = false;
     for (i, &b) in line.iter().enumerate() {
-        if b == b'"' { return (0, true); }
+        if b == b'"' { has_quote = true; }
         if b == b',' {
             if nsplits < max_splits {
                 splits[nsplits] = i;
@@ -963,7 +982,7 @@ fn csv_scan_scalar(line: &[u8], splits: &mut [usize], max_splits: usize) -> (usi
             nsplits += 1;
         }
     }
-    (nsplits, false)
+    (nsplits, has_quote)
 }
 
 #[inline(always)]
@@ -1018,12 +1037,13 @@ fn parse_csv_line_fast<'a, const N: usize>(
         }
     };
 
+    if nsplits + 1 != N {
+        return false;
+    }
+
+    let len = line.len();
     if !has_quote {
-        // No-quote fast path: slice fields from collected comma positions.
-        if nsplits + 1 != N {
-            return false;
-        }
-        let len = line.len();
+        // No-quote fast path: slice fields directly from collected comma positions.
         let mut prev = 0usize;
         for i in 0..N - 1 {
             let end = splits[i];
@@ -1037,40 +1057,12 @@ fn parse_csv_line_fast<'a, const N: usize>(
         return true;
     }
 
-    parse_csv_line_quoted(line, fields)
-}
-
-#[inline(always)]
-fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [u8]>; N]) -> bool {
-    let has_avx2 = {
-        #[cfg(target_arch = "x86_64")]
-        {
-            is_x86_feature_detected!("avx2")
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
-    };
-    parse_csv_line_fast(line, fields, has_avx2)
-}
-
-fn parse_csv_line_quoted<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [u8]>; N]) -> bool {
-
-    // Quote-containing fallback (rare in event data): sequential scan.
-    let mut count = 0;
-    let mut start = 0;
-    let len = line.len();
-
-    while start <= len {
-        if count >= N {
-            return false;
-        }
-        let end = match memchr::memchr(b',', &line[start..len]) {
-            Some(pos) => start + pos,
-            None => len,
-        };
-        let raw = &line[start..end];
+    // Quoted path: comma positions are already known from the single pass!
+    // Validate and unwrap quotes for each field.
+    let mut prev = 0usize;
+    for i in 0..N {
+        let end = if i + 1 < N { splits[i] } else { len };
+        let raw = &line[prev..end];
         let val = if raw.is_empty() {
             None
         } else if raw[0] == b'"' {
@@ -1089,15 +1081,25 @@ fn parse_csv_line_quoted<'a, const N: usize>(line: &'a [u8], fields: &mut [Optio
             }
             Some(raw)
         };
-        fields[count] = val;
-        count += 1;
-        if end == len {
-            break;
-        }
-        start = end + 1;
+        fields[i] = val;
+        prev = end + 1;
     }
+    true
+}
 
-    count == N
+#[inline(always)]
+fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [u8]>; N]) -> bool {
+    let has_avx2 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
+    parse_csv_line_fast(line, fields, has_avx2)
 }
 
 fn list_csv_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1192,11 +1194,11 @@ fn for_each_chunk_line(
         while start < available {
             if let Some(pos) = memchr::memchr(b'\n', &buf[start..available]) {
                 let end = start + pos;
-                let line = &buf[start..=end];
+                let raw_line = &buf[start..end];
                 if carry.is_empty() {
-                    consume(line)?;
+                    consume(raw_line)?;
                 } else {
-                    carry.extend_from_slice(line);
+                    carry.extend_from_slice(raw_line);
                     consume(&carry)?;
                     carry.clear();
                 }
@@ -1388,7 +1390,7 @@ pub fn run_pipeline(
                             bytes: [0u8; 31],
                             person: CompactId::default(),
                             p_shard: 0,
-                        }; 64];
+                        }; 256];
                         let mut last_camp_bytes = [0u8; 32];
                         let mut last_camp_len = 0usize;
                         let mut last_camp_idx: Option<u16> = None;
@@ -1434,9 +1436,9 @@ pub fn run_pipeline(
                                     let user_bytes = fields[1].unwrap();
                                     let (person, p_shard) = if !user_bytes.is_empty() && user_bytes.len() <= 31 {
                                         let slot = ((user_bytes[0] as usize)
-                                            ^ (user_bytes[user_bytes.len() - 1] as usize)
-                                            ^ user_bytes.len())
-                                            & 63;
+                                            ^ ((user_bytes[user_bytes.len() - 1] as usize) << 2)
+                                            ^ (user_bytes.len() << 5))
+                                            & 255;
                                         if user_cache[slot].len == user_bytes.len() as u8
                                             && &user_cache[slot].bytes[..user_bytes.len()] == user_bytes
                                         {
@@ -1578,7 +1580,7 @@ pub fn run_pipeline(
                         bytes: [0u8; 31],
                         person: CompactId::default(),
                         p_shard: 0,
-                    }; 64];
+                    }; 256];
 
                     while !cancelled.load(Ordering::Relaxed) {
                         let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -1650,9 +1652,9 @@ pub fn run_pipeline(
                             let (person, p_shard) = if let Some(user_bytes) = fields[1] {
                                 if !user_bytes.is_empty() && user_bytes.len() <= 31 {
                                     let slot = ((user_bytes[0] as usize)
-                                        ^ (user_bytes[user_bytes.len() - 1] as usize)
-                                        ^ user_bytes.len())
-                                        & 63;
+                                        ^ ((user_bytes[user_bytes.len() - 1] as usize) << 2)
+                                        ^ (user_bytes.len() << 5))
+                                        & 255;
                                     if user_cache[slot].len == user_bytes.len() as u8
                                         && &user_cache[slot].bytes[..user_bytes.len()] == user_bytes
                                     {
