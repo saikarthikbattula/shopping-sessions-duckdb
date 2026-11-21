@@ -1273,6 +1273,9 @@ pub fn run_pipeline(
                             person: CompactId::default(),
                             p_shard: 0,
                         }; 64];
+                        let mut last_camp_bytes = [0u8; 32];
+                        let mut last_camp_len = 0usize;
+                        let mut last_camp_idx: Option<u16> = None;
 
                         while !cancelled.load(Ordering::Relaxed) {
                             let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -1292,7 +1295,19 @@ pub fn run_pipeline(
                                     window_start - 604_800_000,
                                     window_end,
                                 );
-                                let camp_idx_opt = fields[2].and_then(|c| campaign_to_idx.get(&CompactId::from_bytes(c)).copied());
+                                let camp_idx_opt = fields[2].and_then(|c| {
+                                    if c.len() <= 32 && c.len() == last_camp_len && &last_camp_bytes[..last_camp_len] == c {
+                                        last_camp_idx
+                                    } else {
+                                        let idx = campaign_to_idx.get(&CompactId::from_bytes(c)).copied();
+                                        if c.len() <= 32 {
+                                            last_camp_bytes[..c.len()].copy_from_slice(c);
+                                            last_camp_len = c.len();
+                                            last_camp_idx = idx;
+                                        }
+                                        idx
+                                    }
+                                });
                                 let is_valid = fields[1].is_some() && ts_ms.is_some() && camp_idx_opt.is_some();
 
                                 if is_valid {
@@ -1359,7 +1374,7 @@ pub fn run_pipeline(
                             (0..NUM_SHARDS).map(|_| Vec::with_capacity(256)).collect();
 
                         let mut seen_clicks: HashSet<CompactId, FastBuildHasher> =
-                            HashSet::with_capacity_and_hasher(16384, FastBuildHasher);
+                            HashSet::with_capacity_and_hasher(4096, FastBuildHasher);
 
                         for shard_idx in start_shard..end_shard {
                             seen_clicks.clear();
@@ -1442,18 +1457,21 @@ pub fn run_pipeline(
                             let ingest_ms = parse_ts_bytes(fields[3].unwrap_or(&[])).ok_or(InvalidIngest)?;
                             let ts_ms_opt = parse_window_ts_bytes(fields[2], window_start, window_end);
                             // Classify event type once; both validity and purchase flag use it.
-                            let event_type = fields[4];
-                            let is_purchase = event_type == Some(b"purchase");
-                            let valid_event_type = matches!(event_type, Some(b"view" | b"cart" | b"purchase"));
+                            let (valid_event_type, is_purchase) = match fields[4] {
+                                Some(b"view") => (true, false),
+                                Some(b"cart") => (true, false),
+                                Some(b"purchase") => (true, true),
+                                _ => (false, false),
+                            };
                             let price_cents = if is_purchase {
                                 parse_unsigned_bytes(fields[6], 10000000).filter(|v| *v > 0)
                             } else {
                                 None
                             };
-                            let is_valid = fields[1].is_some()
+                            let is_valid = valid_event_type
+                                && fields[1].is_some()
                                 && ts_ms_opt.is_some()
                                 && fields[5].is_some()
-                                && valid_event_type
                                 && (!is_purchase || price_cents.is_some());
 
                             // Product-category lookup: only consult the HashMap for valid events
