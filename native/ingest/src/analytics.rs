@@ -245,6 +245,15 @@ impl ParsedEvents {
             (ingest, ts)
         }
     }
+
+    #[inline(always)]
+    fn decode_ingest(&self, event: &RawEvent, start: i64) -> i64 {
+        if event.flags & WIDE_TIMES != 0 {
+            self.wide_times[event.ingest_offset as usize].0
+        } else {
+            start + i64::from(event.ingest_offset as i32)
+        }
+    }
 }
 
 struct RawClick {
@@ -255,15 +264,11 @@ struct RawClick {
     p_shard: u8,
 }
 
-struct EventDedupEntry {
-    person: CompactId,
+#[derive(Clone, Copy)]
+struct DedupWinner {
     ingest_ms: i64,
-    ts_ms: i64,
-    price_cents: i32,
-    p_shard: u8,
-    cat_idx: u8,
-    is_purchase: bool,
-    is_valid: bool,
+    worker_idx: u16,
+    event_idx: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -627,96 +632,98 @@ fn civil_to_days(y: i64, m: i64, d: i64) -> Option<i64> {
     Some(era * 146097 + doe as i64 - 719468)
 }
 
-thread_local! {
-    static DATE_CACHE: std::cell::Cell<([u8; 10], i64)> = const { std::cell::Cell::new(([0u8; 10], 0)) };
+#[derive(Clone, Copy, Default)]
+struct LocalDateCache {
+    p8: u64,
+    p2: u16,
+    days: i64,
 }
 
 /// SIMD-accelerated ISO timestamp parser for the fixed 20-byte `YYYY-MM-DDTHH:MM:SSZ` format.
-/// On x86_64 with SSE4.1, loads the 20 bytes into one XMM register, validates all 6 separator
-/// positions and all digit positions simultaneously, then extracts pairs with zero-extend.
-/// Falls back to scalar on ARM or when SSE4.1 is unavailable.
+/// On x86_64 with SSE4.1, loads the first 16 bytes into an XMM register, validates all 4 separators
+/// and all 12 digits simultaneously with zero stack spills, and validates the 4-byte tail.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[inline]
-unsafe fn parse_f1_sse41(b: &[u8]) -> Option<i64> {
+unsafe fn parse_f1_sse41(b: &[u8], date_cache: &mut LocalDateCache) -> Option<i64> {
     use std::arch::x86_64::*;
-    // Load 16 bytes covering positions 0..15. Remaining 4 bytes (16..19) scalar.
     let v = _mm_loadu_si128(b.as_ptr() as *const __m128i);
-    // Extract digit bytes from fixed positions by shuffling into a compact vector.
-    // Positions of digits in the ISO string:
-    //   0,1,2,3=year  5,6=month  8,9=day  11,12=hour  14,15=min  17,18=sec
-    // We validate the separator bytes by direct comparison.
-    // Separator check (scalar, positions 4,7,10,13,16,19):
-    // pos 4='-', 7='-', 10='T', 13=':', 16=':', 19='Z'
-    // Extract the 16 bytes as array for separator checks:
-    let mut arr = [0u8; 16];
-    _mm_storeu_si128(arr.as_mut_ptr() as *mut __m128i, v);
-    if arr[4] != b'-' || arr[7] != b'-' || arr[10] != b'T' || arr[13] != b':' {
+
+    // Separators at positions 4='-', 7='-', 10='T', 13=':'
+    let sep_mask = _mm_setr_epi8(0, 0, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0);
+    let expected_sep = _mm_setr_epi8(
+        0, 0, 0, 0,
+        b'-' as i8, 0, 0, b'-' as i8,
+        0, 0, b'T' as i8, 0,
+        0, b':' as i8, 0, 0,
+    );
+    let sep_diff = _mm_xor_si128(v, expected_sep);
+    let sep_bad = _mm_and_si128(sep_diff, sep_mask);
+
+    // Digits at positions 0..3 (year), 5..6 (month), 8..9 (day), 11..12 (hour), 14..15 (minute)
+    let digit_mask = _mm_setr_epi8(-1, -1, -1, -1, 0, -1, -1, 0, -1, -1, 0, -1, -1, 0, -1, -1);
+    let zero_v = _mm_set1_epi8(b'0' as i8);
+    let sub_zero = _mm_sub_epi8(v, zero_v); // wrapping sub: non-digits wrap to > 9
+    let gt9 = _mm_cmpgt_epi8(sub_zero, _mm_set1_epi8(9));
+    let digits_bad = _mm_and_si128(gt9, digit_mask);
+
+    let any_bad = _mm_or_si128(sep_bad, digits_bad);
+    if _mm_testz_si128(any_bad, any_bad) == 0 {
         return None;
     }
+
+    // Positions 16..19: 16=':', 17=s0, 18=s1, 19='Z'
     if b[16] != b':' || b[19] != b'Z' {
         return None;
     }
-    // Subtract '0' from all 16 positions at once; wrapping subtraction produces > 9 for non-digits.
-    let zero_v = _mm_set1_epi8(b'0' as i8);
-    let digits_v = _mm_sub_epi8(v, zero_v); // wrapping subtraction
-    let mut digits = [0u8; 16];
-    _mm_storeu_si128(digits.as_mut_ptr() as *mut __m128i, digits_v);
-    // Remaining two digit bytes at positions 17,18
     let s0 = b[17].wrapping_sub(b'0');
     let s1 = b[18].wrapping_sub(b'0');
-    if s0 > 9 || s1 > 9 { return None; }
-    // Extract digit pairs (validate range ≤9 for each digit):
-    // Year: 0,1,2,3
-    if digits[0]>9||digits[1]>9||digits[2]>9||digits[3]>9 { return None; }
-    // Month: 5,6
-    if digits[5]>9||digits[6]>9 { return None; }
-    // Day: 8,9
-    if digits[8]>9||digits[9]>9 { return None; }
-    // Hour: 11,12
-    if digits[11]>9||digits[12]>9 { return None; }
-    // Min: 14,15
-    if digits[14]>9||digits[15]>9 { return None; }
-    let h = digits[11] as i64 * 10 + digits[12] as i64;
-    let mi = digits[14] as i64 * 10 + digits[15] as i64;
+    if s0 > 9 || s1 > 9 {
+        return None;
+    }
     let s = s0 as i64 * 10 + s1 as i64;
-    if h > 23 || mi > 59 || s > 59 { return None; }
-    let prefix: [u8; 10] = b[0..10].try_into().unwrap();
-    let days = DATE_CACHE.with(|cell| {
-        let (cached_prefix, cached_days) = cell.get();
-        if prefix == cached_prefix {
-            Some(cached_days)
-        } else {
-            let y = digits[0] as i64 * 1000 + digits[1] as i64 * 100
-                  + digits[2] as i64 * 10  + digits[3] as i64;
-            let m = digits[5] as i64 * 10 + digits[6] as i64;
-            let day = digits[8] as i64 * 10 + digits[9] as i64;
-            let computed = civil_to_days(y, m, day)?;
-            cell.set((prefix, computed));
-            Some(computed)
-        }
-    })?;
+    if s > 59 {
+        return None;
+    }
+
+    let h = (b[11] - b'0') as i64 * 10 + (b[12] - b'0') as i64;
+    let mi = (b[14] - b'0') as i64 * 10 + (b[15] - b'0') as i64;
+    if h > 23 || mi > 59 {
+        return None;
+    }
+
+    let p8 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let p2 = u16::from_le_bytes(b[8..10].try_into().unwrap());
+    let days = if p8 == date_cache.p8 && p2 == date_cache.p2 {
+        date_cache.days
+    } else {
+        let y = (b[0] - b'0') as i64 * 1000
+            + (b[1] - b'0') as i64 * 100
+            + (b[2] - b'0') as i64 * 10
+            + (b[3] - b'0') as i64;
+        let m = (b[5] - b'0') as i64 * 10 + (b[6] - b'0') as i64;
+        let day = (b[8] - b'0') as i64 * 10 + (b[9] - b'0') as i64;
+        let computed = civil_to_days(y, m, day)?;
+        date_cache.p8 = p8;
+        date_cache.p2 = p2;
+        date_cache.days = computed;
+        computed
+    };
     Some((days * 86400 + h * 3600 + mi * 60 + s) * 1000)
 }
 
 #[inline(always)]
-fn parse_f1_fast(b: &[u8]) -> Option<i64> {
+fn parse_f1_scalar(b: &[u8], date_cache: &mut LocalDateCache) -> Option<i64> {
     if b.len() != 20 {
         return None;
-    }
-    // On x86_64 with SSE4.1, use the SIMD path that validates and extracts
-    // all digit/separator positions with one XMM load.
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("sse4.1") {
-        return unsafe { parse_f1_sse41(b) };
     }
     if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
         return None;
     }
     let d = |i: usize| -> Option<i64> {
-        let c = b[i];
-        if c.is_ascii_digit() {
-            Some((c - b'0') as i64)
+        let c = b[i].wrapping_sub(b'0');
+        if c <= 9 {
+            Some(c as i64)
         } else {
             None
         }
@@ -729,27 +736,41 @@ fn parse_f1_fast(b: &[u8]) -> Option<i64> {
         return None;
     }
 
-    let prefix: [u8; 10] = b[0..10].try_into().unwrap();
-    let days = DATE_CACHE.with(|cell| {
-        let (cached_prefix, cached_days) = cell.get();
-        if prefix == cached_prefix {
-            Some(cached_days)
-        } else {
-            let y = d(0)? * 1000 + d(1)? * 100 + d(2)? * 10 + d(3)?;
-            let m = d(5)? * 10 + d(6)?;
-            let day = d(8)? * 10 + d(9)?;
-            let computed = civil_to_days(y, m, day)?;
-            cell.set((prefix, computed));
-            Some(computed)
-        }
-    })?;
+    let p8 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let p2 = u16::from_le_bytes(b[8..10].try_into().unwrap());
+    let days = if p8 == date_cache.p8 && p2 == date_cache.p2 {
+        date_cache.days
+    } else {
+        let y = d(0)? * 1000 + d(1)? * 100 + d(2)? * 10 + d(3)?;
+        let m = d(5)? * 10 + d(6)?;
+        let day = d(8)? * 10 + d(9)?;
+        let computed = civil_to_days(y, m, day)?;
+        date_cache.p8 = p8;
+        date_cache.p2 = p2;
+        date_cache.days = computed;
+        computed
+    };
 
     Some((days * 86400 + h * 3600 + mi * 60 + s) * 1000)
 }
 
 #[inline(always)]
-fn parse_ts_bytes(b: &[u8]) -> Option<i64> {
-    if let Some(ms) = parse_f1_fast(b) {
+fn parse_f1_fast_with_cache(b: &[u8], date_cache: &mut LocalDateCache, has_sse41: bool) -> Option<i64> {
+    if b.len() != 20 {
+        return None;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_sse41 {
+        // SAFETY: sse4.1 feature confirmed at thread startup
+        return unsafe { parse_f1_sse41(b, date_cache) };
+    }
+    let _ = has_sse41;
+    parse_f1_scalar(b, date_cache)
+}
+
+#[inline(always)]
+fn parse_ts_bytes_with_cache(b: &[u8], date_cache: &mut LocalDateCache, has_sse41: bool) -> Option<i64> {
+    if let Some(ms) = parse_f1_fast_with_cache(b, date_cache, has_sse41) {
         return Some(ms);
     }
     if b.is_empty() {
@@ -815,6 +836,38 @@ fn parse_ts_bytes(b: &[u8]) -> Option<i64> {
     Some((days * 86400 + h * 3600 + mi * 60 + se - offset_min * 60) * 1000)
 }
 
+#[inline(always)]
+fn parse_ts_bytes(b: &[u8]) -> Option<i64> {
+    let has_sse41 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            is_x86_feature_detected!("sse4.1")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
+    parse_ts_bytes_with_cache(b, &mut LocalDateCache::default(), has_sse41)
+}
+
+#[inline(always)]
+fn parse_window_ts_fast(
+    b: Option<&[u8]>,
+    start: i64,
+    end: i64,
+    has_sse41: bool,
+    date_cache: &mut LocalDateCache,
+) -> Option<i64> {
+    let ts = parse_ts_bytes_with_cache(b?, date_cache, has_sse41)?;
+    if ts >= start && ts < end {
+        Some(ts)
+    } else {
+        None
+    }
+}
+
+#[allow(dead_code)]
 #[inline(always)]
 fn parse_window_ts_bytes(b: Option<&[u8]>, start: i64, end: i64) -> Option<i64> {
     let ts = parse_ts_bytes(b?)?;
@@ -914,7 +967,29 @@ fn csv_scan_scalar(line: &[u8], splits: &mut [usize], max_splits: usize) -> (usi
 }
 
 #[inline(always)]
-fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [u8]>; N]) -> bool {
+fn parse_product_num(pid: &[u8]) -> Option<usize> {
+    if pid.len() > 1 && pid[0] == b'p' {
+        let mut num: usize = 0;
+        for &c in &pid[1..] {
+            let d = c.wrapping_sub(b'0');
+            if d <= 9 {
+                num = num * 10 + d as usize;
+            } else {
+                return None;
+            }
+        }
+        Some(num)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn parse_csv_line_fast<'a, const N: usize>(
+    line: &'a [u8],
+    fields: &mut [Option<&'a [u8]>; N],
+    has_avx2: bool,
+) -> bool {
     let line = if !line.is_empty() && line[line.len() - 1] == b'\n' {
         &line[..line.len() - 1]
     } else {
@@ -925,13 +1000,12 @@ fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [
     }
 
     // Fast path: combined single-pass AVX2 (or scalar) scan finds commas + quotes together.
-    // This eliminates the separate memchr(b'"') pre-scan from the previous version.
     let mut splits = [0usize; N];
     let (nsplits, has_quote) = {
         #[cfg(target_arch = "x86_64")]
         {
-            if is_x86_feature_detected!("avx2") {
-                // SAFETY: avx2 feature confirmed at runtime above.
+            if has_avx2 {
+                // SAFETY: avx2 feature confirmed at thread startup
                 unsafe { csv_scan_avx2(line, &mut splits, N) }
             } else {
                 csv_scan_scalar(line, &mut splits, N)
@@ -939,6 +1013,7 @@ fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
+            let _ = has_avx2;
             csv_scan_scalar(line, &mut splits, N)
         }
     };
@@ -961,6 +1036,26 @@ fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [
         fields[N - 1] = if raw.is_empty() { None } else { Some(raw) };
         return true;
     }
+
+    parse_csv_line_quoted(line, fields)
+}
+
+#[inline(always)]
+fn parse_csv_line<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [u8]>; N]) -> bool {
+    let has_avx2 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
+    parse_csv_line_fast(line, fields, has_avx2)
+}
+
+fn parse_csv_line_quoted<'a, const N: usize>(line: &'a [u8], fields: &mut [Option<&'a [u8]>; N]) -> bool {
 
     // Quote-containing fallback (rare in event data): sequential scan.
     let mut count = 0;
@@ -1250,7 +1345,7 @@ pub fn run_pipeline(
         let click_handle = scope.spawn(|| -> Result<(Vec<Vec<Vec<RawPersonClick>>>, u64, f64)> {
             let t_clicks_start = std::time::Instant::now();
             let click_files = list_csv_files(&data_dir.join("clicks"))?;
-            let click_chunks = Arc::new(plan_chunks(&click_files, 16 * 1024 * 1024)?);
+            let click_chunks = Arc::new(plan_chunks(&click_files, 8 * 1024 * 1024)?);
             let next_chunk = Arc::new(AtomicUsize::new(0));
             let cancelled = Arc::new(AtomicBool::new(false));
             let click_workers_count = (workers_count / 2).clamp(1, 4);
@@ -1266,6 +1361,27 @@ pub fn run_pipeline(
 
                     handles.push(c_scope.spawn(move || -> Result<(Vec<Vec<RawClick>>, u64)> {
                         let cpu_start = thread_cpu_time_ns();
+                        let has_avx2 = {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                is_x86_feature_detected!("avx2")
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                false
+                            }
+                        };
+                        let has_sse41 = {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                is_x86_feature_detected!("sse4.1")
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                false
+                            }
+                        };
+                        let mut date_cache = LocalDateCache::default();
                         let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(512)).collect();
                         let mut user_cache = [UserCacheSlot {
                             len: 0,
@@ -1284,16 +1400,18 @@ pub fn run_pipeline(
                             };
                             for_each_chunk_line(chunk, &cancelled, |line| {
                                 let mut fields = [None; 4];
-                                if !parse_csv_line(line, &mut fields) {
+                                if !parse_csv_line_fast(line, &mut fields, has_avx2) {
                                     return Ok(());
                                 }
                                 let Some(click_id_bytes) = fields[0] else {
                                     return Ok(());
                                 };
-                                let ts_ms = parse_window_ts_bytes(
+                                let ts_ms = parse_window_ts_fast(
                                     fields[3],
                                     window_start - 604_800_000,
                                     window_end,
+                                    has_sse41,
+                                    &mut date_cache,
                                 );
                                 let camp_idx_opt = fields[2].and_then(|c| {
                                     if c.len() <= 32 && c.len() == last_camp_len && &last_camp_bytes[..last_camp_len] == c {
@@ -1414,7 +1532,7 @@ pub fn run_pipeline(
         // Event Parsing
         let t_events_parse_start = std::time::Instant::now();
         let event_files = list_csv_files(&data_dir.join("events"))?;
-        let event_chunks = Arc::new(plan_chunks(&event_files, 16 * 1024 * 1024)?);
+        let event_chunks = Arc::new(plan_chunks(&event_files, 8 * 1024 * 1024)?);
         let next_chunk = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
 
@@ -1430,6 +1548,27 @@ pub fn run_pipeline(
 
                 handles.push(e_scope.spawn(move || -> Result<(ParsedEvents, u64)> {
                     let cpu_start = thread_cpu_time_ns();
+                    let has_avx2 = {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            is_x86_feature_detected!("avx2")
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            false
+                        }
+                    };
+                    let has_sse41 = {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            is_x86_feature_detected!("sse4.1")
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            false
+                        }
+                    };
+                    let mut date_cache = LocalDateCache::default();
                     let mut parsed = ParsedEvents {
                         shards: (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect(),
                         wide_times: Vec::new(),
@@ -1448,14 +1587,14 @@ pub fn run_pipeline(
                         };
                         for_each_chunk_line(chunk, &cancelled, |line| {
                             let mut fields = [None; 7];
-                            if !parse_csv_line(line, &mut fields) {
+                            if !parse_csv_line_fast(line, &mut fields, has_avx2) {
                                 return Ok(());
                             }
                             let Some(event_id_bytes) = fields[0] else {
                                 return Ok(());
                             };
-                            let ingest_ms = parse_ts_bytes(fields[3].unwrap_or(&[])).ok_or(InvalidIngest)?;
-                            let ts_ms_opt = parse_window_ts_bytes(fields[2], window_start, window_end);
+                            let ingest_ms = parse_ts_bytes_with_cache(fields[3].unwrap_or(&[]), &mut date_cache, has_sse41).ok_or(InvalidIngest)?;
+                            let ts_ms_opt = parse_window_ts_fast(fields[2], window_start, window_end, has_sse41, &mut date_cache);
                             // Classify event type once; both validity and purchase flag use it.
                             let (valid_event_type, is_purchase) = match fields[4] {
                                 Some(b"view") => (true, false),
@@ -1478,20 +1617,9 @@ pub fn run_pipeline(
                             // (or events that have a product id). Invalid-event-type rows need
                             // cat_idx = unknown_idx in RawEvent; skip the hashmap probe for them.
                             let category_idx = if is_valid {
-                                // Only valid events have fields[5].is_some() guaranteed here.
                                 let pid = fields[5].unwrap();
-                                if pid.len() > 1 && pid[0] == b'p' {
-                                    let mut num: usize = 0;
-                                    let mut valid_num = true;
-                                    for &c in &pid[1..] {
-                                        if c.is_ascii_digit() {
-                                            num = num * 10 + (c - b'0') as usize;
-                                        } else {
-                                            valid_num = false;
-                                            break;
-                                        }
-                                    }
-                                    if valid_num && num < direct_products.len() {
+                                if let Some(num) = parse_product_num(pid) {
+                                    if num < direct_products.len() {
                                         let cat = direct_products[num];
                                         if cat != unknown_idx {
                                             cat
@@ -1505,25 +1633,9 @@ pub fn run_pipeline(
                                     products_map.get(pid).copied().unwrap_or(unknown_idx)
                                 }
                             } else if let Some(pid) = fields[5] {
-                                // Event type is invalid but product id exists: still look up
-                                // category so the RawEvent carries the right cat_idx (used by
-                                // analytics even for some non-valid paths). Avoid the HashMap
-                                // probe for the common pNNN fast path.
-                                if pid.len() > 1 && pid[0] == b'p' {
-                                    let mut num: usize = 0;
-                                    let mut valid_num = true;
-                                    for &c in &pid[1..] {
-                                        if c.is_ascii_digit() {
-                                            num = num * 10 + (c - b'0') as usize;
-                                        } else {
-                                            valid_num = false;
-                                            break;
-                                        }
-                                    }
-                                    if valid_num && num < direct_products.len() {
+                                if let Some(num) = parse_product_num(pid) {
+                                    if num < direct_products.len() {
                                         direct_products[num]
-                                        // Skip the HashMap fallback for invalid events;
-                                        // unknown_idx is fine since they won't affect results.
                                     } else {
                                         unknown_idx
                                     }
@@ -1611,59 +1723,48 @@ pub fn run_pipeline(
                     let mut local_person_shards: Vec<Vec<RawPersonEvent>> =
                         (0..NUM_SHARDS).map(|_| Vec::with_capacity(1024)).collect();
 
-                    let mut dedup_map: HashMap<u128, EventDedupEntry, FastBuildHasher> =
+                    let mut dedup_map: HashMap<u128, DedupWinner, FastBuildHasher> =
                         HashMap::with_capacity_and_hasher(65536, FastBuildHasher);
 
                     for shard_idx in start_shard..end_shard {
                         dedup_map.clear();
 
-                        for worker_shards in worker_event_shards {
-                            for ev in &worker_shards.shards[shard_idx] {
-                                let (ingest_ms, ts_ms) = worker_shards.decode_times(ev, window_start);
-                                match dedup_map.get_mut(&ev.eid_hash) {
-                                    Some(existing) => {
-                                        if ingest_ms < existing.ingest_ms {
-                                            *existing = EventDedupEntry {
-                                                person: ev.person,
-                                                ingest_ms,
-                                                ts_ms,
-                                                price_cents: ev.price_cents,
-                                                p_shard: ev.p_shard,
-                                                cat_idx: ev.cat_idx,
-                                                is_purchase: ev.flags & PURCHASE != 0,
-                                                is_valid: ev.flags & VALID != 0,
-                                            };
+                        for (w_idx, worker_shards) in worker_event_shards.iter().enumerate() {
+                            let events = &worker_shards.shards[shard_idx];
+                            for (ev_idx, ev) in events.iter().enumerate() {
+                                let ingest_ms = worker_shards.decode_ingest(ev, window_start);
+                                match dedup_map.entry(ev.eid_hash) {
+                                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                                        let cur = e.get_mut();
+                                        if ingest_ms < cur.ingest_ms {
+                                            cur.ingest_ms = ingest_ms;
+                                            cur.worker_idx = w_idx as u16;
+                                            cur.event_idx = ev_idx as u32;
                                         }
                                     }
-                                    None => {
-                                        dedup_map.insert(
-                                            ev.eid_hash,
-                                            EventDedupEntry {
-                                                person: ev.person,
-                                                ingest_ms,
-                                                ts_ms,
-                                                price_cents: ev.price_cents,
-                                                p_shard: ev.p_shard,
-                                                cat_idx: ev.cat_idx,
-                                                is_purchase: ev.flags & PURCHASE != 0,
-                                                is_valid: ev.flags & VALID != 0,
-                                            },
-                                        );
+                                    std::collections::hash_map::Entry::Vacant(e) => {
+                                        e.insert(DedupWinner {
+                                            ingest_ms,
+                                            worker_idx: w_idx as u16,
+                                            event_idx: ev_idx as u32,
+                                        });
                                     }
                                 }
                             }
                         }
 
-                        for entry in dedup_map.values() {
-                            if entry.is_valid && entry.ts_ms != i64::MIN {
-                                let ts = entry.ts_ms;
-                                if entry.ingest_ms.saturating_sub(ts) <= 86_400_000 {
-                                    local_person_shards[entry.p_shard as usize].push(RawPersonEvent {
-                                        person: entry.person,
-                                        ts_ms: ts,
-                                        price_cents: entry.price_cents,
-                                        cat_idx: entry.cat_idx,
-                                        is_purchase: entry.is_purchase,
+                        for winner in dedup_map.values() {
+                            let w_shards = &worker_event_shards[winner.worker_idx as usize];
+                            let ev = &w_shards.shards[shard_idx][winner.event_idx as usize];
+                            if ev.flags & VALID != 0 {
+                                let (ingest_ms, ts_ms) = w_shards.decode_times(ev, window_start);
+                                if ts_ms != i64::MIN && ingest_ms.saturating_sub(ts_ms) <= 86_400_000 {
+                                    local_person_shards[ev.p_shard as usize].push(RawPersonEvent {
+                                        person: ev.person,
+                                        ts_ms,
+                                        price_cents: ev.price_cents,
+                                        cat_idx: ev.cat_idx,
+                                        is_purchase: ev.flags & PURCHASE != 0,
                                     });
                                 }
                             }
@@ -1741,13 +1842,13 @@ pub fn run_pipeline(
                         local_events.clear();
                         local_clicks.clear();
 
-                        let mut cache_person = [CompactId::default(); 16];
-                        let mut cache_pidx = [0u32; 16];
-                        let mut cache_valid = [false; 16];
+                        let mut cache_person = [CompactId::default(); 64];
+                        let mut cache_pidx = [0u32; 64];
+                        let mut cache_valid = [false; 64];
 
                         for w_events in worker_person_events {
                             for ev in &w_events[shard_idx] {
-                                let slot = (ev.person.bytes[0] as usize ^ ev.person.bytes[7] as usize) & 15;
+                                let slot = (ev.person.bytes[0] as usize ^ ev.person.bytes[7] as usize) & 63;
                                 let p_idx = if cache_valid[slot] && cache_person[slot] == ev.person {
                                     cache_pidx[slot]
                                 } else {
@@ -1771,7 +1872,7 @@ pub fn run_pipeline(
 
                         for w_clicks in worker_person_clicks {
                             for cl in &w_clicks[shard_idx] {
-                                let slot = (cl.person.bytes[0] as usize ^ cl.person.bytes[7] as usize) & 15;
+                                let slot = (cl.person.bytes[0] as usize ^ cl.person.bytes[7] as usize) & 63;
                                 let p_opt = if cache_valid[slot] && cache_person[slot] == cl.person {
                                     Some(cache_pidx[slot])
                                 } else {
@@ -1803,7 +1904,9 @@ pub fn run_pipeline(
                             local_events.sort_unstable_by_key(|e| (e.p_idx, e.ts_ms));
                         }
                         local_clicks.sort_unstable_by(|a, b| {
-                            (a.p_idx, a.ts_ms, a.click_id.as_bytes()).cmp(&(b.p_idx, b.ts_ms, b.click_id.as_bytes()))
+                            (a.p_idx, a.ts_ms)
+                                .cmp(&(b.p_idx, b.ts_ms))
+                                .then_with(|| a.click_id.as_bytes().cmp(b.click_id.as_bytes()))
                         });
                         if let Some(started) = sort_started { sort_time += started.elapsed(); }
 
@@ -1987,6 +2090,75 @@ impl<'a> CampaignDailySink<'a> {
     }
 }
 
+struct CategoryTracker {
+    rev: [i64; 256],
+    mask: [u64; 4],
+}
+
+impl CategoryTracker {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            rev: [0; 256],
+            mask: [0; 4],
+        }
+    }
+
+    #[inline(always)]
+    fn add(&mut self, cat: usize, price: i64) {
+        self.rev[cat] += price;
+        self.mask[cat / 64] |= 1u64 << (cat % 64);
+    }
+
+    #[inline(always)]
+    fn top_category(&self, category_names: &[String]) -> Option<u8> {
+        let mut best_cat: Option<u8> = None;
+        let mut best_rev: i64 = 0;
+        for word_idx in 0..4 {
+            let mut word = self.mask[word_idx];
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let cat = (word_idx * 64 + bit) as u8;
+                let rev = self.rev[cat as usize];
+                if rev > 0 {
+                    match best_cat {
+                        None => {
+                            best_cat = Some(cat);
+                            best_rev = rev;
+                        }
+                        Some(prev) => {
+                            if rev > best_rev
+                                || (rev == best_rev
+                                    && category_names[cat as usize].as_bytes()
+                                        < category_names[prev as usize].as_bytes())
+                            {
+                                best_cat = Some(cat);
+                                best_rev = rev;
+                            }
+                        }
+                    }
+                }
+                word &= word - 1;
+            }
+        }
+        best_cat
+    }
+
+    #[inline(always)]
+    fn reset(&mut self) {
+        for word_idx in 0..4 {
+            let mut word = self.mask[word_idx];
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let cat = word_idx * 64 + bit;
+                self.rev[cat] = 0;
+                word &= word - 1;
+            }
+        }
+        self.mask = [0; 4];
+    }
+}
+
 fn execute_shard_local(
     events: &[LocalEvent],
     clicks: &[LocalClick],
@@ -2024,7 +2196,7 @@ fn execute_shard_local(
         let mut day_events: i64 = 0;
         let mut day_revenue: i64 = 0;
         let mut day_has_purchases = false;
-        let mut cat_rev = [0i64; 256];
+        let mut cat_tracker = CategoryTracker::new();
 
         let mut session_start_idx = 0;
         let mut prev_ts = person_events[0].ts_ms;
@@ -2036,37 +2208,14 @@ fn execute_shard_local(
                          events: i64,
                          revenue: i64,
                          has_purchases: bool,
-                         cat_rev: &[i64; 256],
+                         cat_tracker: &CategoryTracker,
                          category_names: &[String],
                          person: CompactId,
                          user_rows: &mut Vec<UserDailyRow>| {
             let top_category = if !has_purchases {
                 None
             } else {
-                let mut best_cat: Option<u8> = None;
-                let mut best_rev: i64 = 0;
-                for cat in 0..category_names.len() as u8 {
-                    let rev = cat_rev[cat as usize];
-                    if rev > 0 {
-                        match best_cat {
-                            None => {
-                                best_cat = Some(cat);
-                                best_rev = rev;
-                            }
-                            Some(prev) => {
-                                if rev > best_rev
-                                    || (rev == best_rev
-                                        && category_names[cat as usize].as_bytes()
-                                            < category_names[prev as usize].as_bytes())
-                                {
-                                    best_cat = Some(cat);
-                                    best_rev = rev;
-                                }
-                            }
-                        }
-                    }
-                }
-                best_cat
+                cat_tracker.top_category(category_names)
             };
             user_rows.push(UserDailyRow {
                 user_id: person,
@@ -2091,7 +2240,7 @@ fn execute_shard_local(
                     &mut day_events,
                     &mut day_revenue,
                     &mut day_has_purchases,
-                    &mut cat_rev,
+                    &mut cat_tracker,
                     campaign_sink,
                     category_names,
                     person,
@@ -2112,7 +2261,7 @@ fn execute_shard_local(
             &mut day_events,
             &mut day_revenue,
             &mut day_has_purchases,
-            &mut cat_rev,
+            &mut cat_tracker,
             campaign_sink,
             category_names,
             person,
@@ -2127,7 +2276,7 @@ fn execute_shard_local(
                 day_events,
                 day_revenue,
                 day_has_purchases,
-                &cat_rev,
+                &cat_tracker,
                 category_names,
                 person,
                 &mut user_rows,
@@ -2151,12 +2300,12 @@ fn process_person_session(
     day_events: &mut i64,
     day_revenue: &mut i64,
     day_has_purchases: &mut bool,
-    cat_rev: &mut [i64; 256],
+    cat_tracker: &mut CategoryTracker,
     campaign_sink: &mut CampaignDailySink,
     category_names: &[String],
     person: CompactId,
     user_rows: &mut Vec<UserDailyRow>,
-    flush_day: &impl Fn(i32, i64, i64, i64, bool, &[i64; 256], &[String], CompactId, &mut Vec<UserDailyRow>),
+    flush_day: &impl Fn(i32, i64, i64, i64, bool, &CategoryTracker, &[String], CompactId, &mut Vec<UserDailyRow>),
 ) {
     let start_ms = session_events[0].ts_ms;
     let day = epoch_days(start_ms);
@@ -2169,12 +2318,12 @@ fn process_person_session(
                 *day_events,
                 *day_revenue,
                 *day_has_purchases,
-                cat_rev,
+                cat_tracker,
                 category_names,
                 person,
                 user_rows,
             );
-            cat_rev.fill(0);
+            cat_tracker.reset();
             *day_sessions = 0;
             *day_events = 0;
             *day_revenue = 0;
@@ -2193,7 +2342,7 @@ fn process_person_session(
         if ev.price() != 0 {
             session_purchases += 1;
             session_revenue += i64::from(ev.price());
-            cat_rev[ev.category()] += i64::from(ev.price());
+            cat_tracker.add(ev.category(), i64::from(ev.price()));
             *day_has_purchases = true;
         }
     }
@@ -2272,12 +2421,19 @@ pub fn write_user_daily_shard(
 
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
-    let mut user_builder = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+    let total_user_bytes: usize = rows.iter().map(|r| r.user_id.as_str().len()).sum();
+    let total_cat_bytes: usize = rows
+        .iter()
+        .filter_map(|r| r.top_category)
+        .map(|c| category_names[c as usize].len())
+        .sum();
+
+    let mut user_builder = StringBuilder::with_capacity(rows.len(), total_user_bytes);
     let mut day_builder = Date32Builder::with_capacity(rows.len());
     let mut sess_builder = Int64Builder::with_capacity(rows.len());
     let mut ev_builder = Int64Builder::with_capacity(rows.len());
     let mut rev_builder = Int64Builder::with_capacity(rows.len());
-    let mut top_cat_builder = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+    let mut top_cat_builder = StringBuilder::with_capacity(rows.len(), total_cat_bytes);
 
     for row in rows {
         user_builder.append_value(row.user_id.as_str());
@@ -2320,13 +2476,16 @@ pub fn write_campaign_daily(output_dir: &Path, rows: Vec<CampaignDailyRow>) -> R
 
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
-    let mut camp_builder = StringBuilder::new();
-    let mut chan_builder = StringBuilder::new();
-    let mut day_builder = Date32Builder::new();
-    let mut sess_builder = Int64Builder::new();
-    let mut pur_sess_builder = Int64Builder::new();
-    let mut rev_builder = Int64Builder::new();
-    let mut ass_sess_builder = Int64Builder::new();
+    let total_camp_bytes: usize = rows.iter().map(|r| r.campaign_id.len()).sum();
+    let total_chan_bytes: usize = rows.iter().map(|r| r.channel.len()).sum();
+
+    let mut camp_builder = StringBuilder::with_capacity(rows.len(), total_camp_bytes);
+    let mut chan_builder = StringBuilder::with_capacity(rows.len(), total_chan_bytes);
+    let mut day_builder = Date32Builder::with_capacity(rows.len());
+    let mut sess_builder = Int64Builder::with_capacity(rows.len());
+    let mut pur_sess_builder = Int64Builder::with_capacity(rows.len());
+    let mut rev_builder = Int64Builder::with_capacity(rows.len());
+    let mut ass_sess_builder = Int64Builder::with_capacity(rows.len());
 
     for row in rows {
         camp_builder.append_value(&row.campaign_id);
