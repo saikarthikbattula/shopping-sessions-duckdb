@@ -27,7 +27,11 @@ def ablate(source, variant):
         end = source.index('                            let (eid_hash, shard_idx)', start)
         return source[:start] + '                            let category_idx = unknown_idx;\n\n' + source[end:]
     if variant == 'raw_user':
-        # Event and click rows both resolve identity through IdentityBatch::push.
+        # The pinned BASELINE looks up identity at each call site; current
+        # sources resolve event and click rows through IdentityBatch::push.
+        anchor = 'ids.get_compact_with_shard(user_bytes)'
+        if source.count(anchor) == 2:
+            return source.replace(anchor, '(CompactId::from_bytes(user_bytes), get_shard_bytes(user_bytes) as u8)')
         source = replace_once(source,
             '''                ids.prefetch(hash);
                 row.set_person(CompactId::from_bytes(user), 0);
