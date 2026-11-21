@@ -1,0 +1,266 @@
+diff --git a/native/ingest/src/analytics.rs b/native/ingest/src/analytics.rs
+index 1b20e23..e2961a0 100644
+--- a/native/ingest/src/analytics.rs
++++ b/native/ingest/src/analytics.rs
+@@ -1323,7 +1323,12 @@ pub fn run_pipeline(
+
+                 handles.push(scope.spawn(move || -> Result<(HashMap<(u16, i32), CampaignDailyAccumulator>, u64)> {
+                     let cpu_start = thread_cpu_time_ns();
++                    let profiling = std::env::var_os("NATIVE_PROFILE").as_deref() == Some(std::ffi::OsStr::new("1"));
++                    let worker_started = std::time::Instant::now();
++                    let mut sort_time = std::time::Duration::ZERO;
++                    let mut attribution_time = std::time::Duration::ZERO;
+                     let mut user_rows = Vec::new();
++                    let mut attribution = AttributionWindow::default();
+                     let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
+
+                     let mut shard_person_map: HashMap<CompactId, u32, FastBuildHasher> =
+@@ -1397,19 +1402,24 @@ pub fn run_pipeline(
+                             }
+                         }
+
++                        let sort_started = profiling.then(std::time::Instant::now);
+                         // Ultra-fast packed 64-bit integer key sort: (p_idx << 32 | ts_offset) compiles to single cmp instruction
+                         local_events.sort_unstable_by_key(|e| ((e.p_idx as u64) << 32) | ((e.ts_ms - window_start) as u32 as u64));
+                         local_clicks.sort_unstable_by(|a, b| {
+                             (a.p_idx, a.ts_ms, a.click_id.as_bytes()).cmp(&(b.p_idx, b.ts_ms, b.click_id.as_bytes()))
+                         });
++                        if let Some(started) = sort_started { sort_time += started.elapsed(); }
+
++                        let attribution_started = profiling.then(std::time::Instant::now);
+                         let (u_part, c_part) = execute_shard_local(
+                             &local_events,
+                             &local_clicks,
+                             &shard_person_names,
+                             category_names,
++                            &mut attribution,
+                         );
+                         user_rows.extend(u_part);
++                        if let Some(started) = attribution_started { attribution_time += started.elapsed(); }
+                         for (k, acc) in c_part {
+                             let entry = campaign_daily_map.entry(k).or_default();
+                             entry.sessions += acc.sessions;
+@@ -1419,9 +1429,17 @@ pub fn run_pipeline(
+                         }
+                     }
+
++                    let parquet_started = profiling.then(std::time::Instant::now);
+                     if worker_idx == 0 || !user_rows.is_empty() {
+                         write_user_daily_shard(output_dir, worker_idx, &user_rows, category_names)?;
+                     }
++                    if let Some(started) = parquet_started {
++                        eprintln!("[profile/worker] worker={worker_idx} wall_ms={:.3} sort_ms={:.3} attribution_ms={:.3} parquet_ms={:.3} rows={} raw_event_bytes={} person_event_bytes={} local_event_bytes={}",
++                            worker_started.elapsed().as_secs_f64()*1000.0, sort_time.as_secs_f64()*1000.0,
++                            attribution_time.as_secs_f64()*1000.0, started.elapsed().as_secs_f64()*1000.0,
++                            user_rows.len(), std::mem::size_of::<RawEvent>(),
++                            std::mem::size_of::<RawPersonEvent>(), std::mem::size_of::<LocalEvent>());
++                    }
+
+                     let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                     Ok((campaign_daily_map, cpu_ns))
+@@ -1495,11 +1513,68 @@ pub fn run_pipeline(
+     Ok(())
+ }
+
++struct AttributionWindow {
++    counts: Vec<usize>,
++    positions: Vec<usize>,
++    active: Vec<u16>,
++    left: usize,
++    right: usize,
++    winner: usize,
++}
++
++impl Default for AttributionWindow {
++    fn default() -> Self {
++        Self { counts: vec![0; 65536], positions: vec![0; 65536],
++            active: Vec::new(), left: 0, right: 0, winner: 0 }
++    }
++}
++
++impl AttributionWindow {
++    fn reset(&mut self) {
++        for &campaign in &self.active { self.counts[campaign as usize] = 0; }
++        self.active.clear();
++        self.left = 0;
++        self.right = 0;
++        self.winner = 0;
++    }
++
++    fn advance(&mut self, clicks: &[LocalClick], start: i64) -> u16 {
++        while self.right < clicks.len() && clicks[self.right].ts_ms <= start {
++            let click = &clicks[self.right];
++            if self.right == 0 || clicks[self.winner].ts_ms != click.ts_ms {
++                self.winner = self.right;
++            }
++            let campaign = click.camp_idx as usize;
++            if self.counts[campaign] == 0 {
++                self.positions[campaign] = self.active.len();
++                self.active.push(click.camp_idx);
++            }
++            self.counts[campaign] += 1;
++            self.right += 1;
++        }
++        let lower = start.saturating_sub(604_800_000);
++        while self.left < self.right && clicks[self.left].ts_ms < lower {
++            let campaign = clicks[self.left].camp_idx as usize;
++            self.counts[campaign] -= 1;
++            if self.counts[campaign] == 0 {
++                let position = self.positions[campaign];
++                self.active.swap_remove(position);
++                if position < self.active.len() {
++                    self.positions[self.active[position] as usize] = position;
++                }
++            }
++            self.left += 1;
++        }
++        if self.left < self.right { clicks[self.winner].camp_idx } else { u16::MAX }
++    }
++}
++
+ fn execute_shard_local(
+     events: &[LocalEvent],
+     clicks: &[LocalClick],
+     person_names: &[CompactId],
+     category_names: &[String],
++    attribution: &mut AttributionWindow,
+ ) -> (Vec<UserDailyRow>, HashMap<(u16, i32), CampaignDailyAccumulator>) {
+     let mut user_rows = Vec::new();
+     let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
+@@ -1536,8 +1611,7 @@ fn execute_shard_local(
+
+         let mut session_start_idx = 0;
+         let mut prev_ts = person_events[0].ts_ms;
+-        let mut click_left = 0usize;
+-        let mut click_right = 0usize;
++        attribution.reset();
+
+         let flush_day = |day: i32,
+                          sessions: i64,
+@@ -1592,8 +1666,7 @@ fn execute_shard_local(
+                 process_person_session(
+                     &person_events[session_start_idx..i],
+                     person_clicks,
+-                    &mut click_left,
+-                    &mut click_right,
++                    attribution,
+                     &mut curr_day,
+                     &mut day_sessions,
+                     &mut day_events,
+@@ -1613,8 +1686,7 @@ fn execute_shard_local(
+         process_person_session(
+             &person_events[session_start_idx..],
+             person_clicks,
+-            &mut click_left,
+-            &mut click_right,
++            attribution,
+             &mut curr_day,
+             &mut day_sessions,
+             &mut day_events,
+@@ -1652,8 +1724,7 @@ fn execute_shard_local(
+ fn process_person_session(
+     session_events: &[LocalEvent],
+     person_clicks: &[LocalClick],
+-    click_left: &mut usize,
+-    click_right: &mut usize,
++    attribution: &mut AttributionWindow,
+     curr_day: &mut i32,
+     day_sessions: &mut i64,
+     day_events: &mut i64,
+@@ -1707,34 +1778,9 @@ fn process_person_session(
+     }
+     *day_revenue += session_revenue;
+
+-    // Sliding window boundaries:
+-    // start_ms - 604_800_000 <= ts_ms <= start_ms
+-    let window_start = start_ms.saturating_sub(604_800_000);
+-
+-    while *click_right < person_clicks.len() && person_clicks[*click_right].ts_ms <= start_ms {
+-        *click_right += 1;
+-    }
+-    while *click_left < *click_right && person_clicks[*click_left].ts_ms < window_start {
+-        *click_left += 1;
+-    }
+-
+-    let left = *click_left;
+-    let right = *click_right;
+-
+-    let winning_camp_idx = if left < right {
+-        let max_ts = person_clicks[right - 1].ts_ms;
+-        let mut best = &person_clicks[right - 1];
+-        let mut idx = right - 1;
+-        while idx > left && person_clicks[idx - 1].ts_ms == max_ts {
+-            idx -= 1;
+-            if person_clicks[idx].click_id.as_bytes() < best.click_id.as_bytes() {
+-                best = &person_clicks[idx];
+-            }
+-        }
+-        best.camp_idx
+-    } else {
+-        u16::MAX // organic
+-    };
++    // Clicks are sorted by timestamp and full click-ID bytes. The first
++    // click in the latest timestamp group wins its tie.
++    let winning_camp_idx = attribution.advance(person_clicks, start_ms);
+
+     let credited_entry = campaign_daily_map.entry((winning_camp_idx, day)).or_default();
+     credited_entry.sessions += 1;
+@@ -1743,30 +1789,8 @@ fn process_person_session(
+     }
+     credited_entry.revenue_cents += session_revenue;
+
+-    if left < right {
+-        let count = right - left;
+-        if count <= 8 {
+-            let mut seen: [u16; 8] = [0; 8];
+-            let mut seen_len = 0;
+-            for i in left..right {
+-                let camp = person_clicks[i].camp_idx;
+-                if !seen[..seen_len].contains(&camp) {
+-                    seen[seen_len] = camp;
+-                    seen_len += 1;
+-                    let assist_entry = campaign_daily_map.entry((camp, day)).or_default();
+-                    assist_entry.assisted_sessions += 1;
+-                }
+-            }
+-        } else {
+-            let mut seen: HashSet<u16, FastBuildHasher> = HashSet::with_hasher(FastBuildHasher);
+-            for i in left..right {
+-                let camp = person_clicks[i].camp_idx;
+-                if seen.insert(camp) {
+-                    let assist_entry = campaign_daily_map.entry((camp, day)).or_default();
+-                    assist_entry.assisted_sessions += 1;
+-                }
+-            }
+-        }
++    for &campaign in &attribution.active {
++        campaign_daily_map.entry((campaign, day)).or_default().assisted_sessions += 1;
+     }
+ }
+
+@@ -1873,6 +1897,26 @@ pub fn write_campaign_daily(output_dir: &Path, rows: Vec<CampaignDailyRow>) -> R
+
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn attribution_window_counts_ties_expiry_and_reset() {
++        let click = |ts_ms, camp_idx, id: &[u8]| LocalClick {
++            ts_ms, camp_idx, click_id: CompactId::from_bytes(id), p_idx: 0
++        };
++        let clicks = vec![click(0, 1, b"a"), click(0, 2, b"b"),
++                          click(1, 1, b"c"), click(10, 3, b"d")];
++        let mut window = AttributionWindow::default();
++        assert_eq!(window.advance(&clicks, 0), 1);
++        assert_eq!(window.active.len(), 2);
++        assert_eq!(window.advance(&clicks, 604_800_000), 3);
++        assert_eq!(window.counts[1], 2);
++        window.advance(&clicks, 604_800_001);
++        assert_eq!(window.counts[1], 1);
++        assert_eq!(window.counts[2], 0);
++        assert_eq!(window.advance(&clicks, 604_800_011), u16::MAX);
++        assert!(window.active.is_empty());
++        window.reset();
++        assert_eq!(window.advance(&clicks, 0), 1);
++    }
+     use super::*;
+     use std::sync::atomic::{AtomicUsize, Ordering};
