@@ -1,3 +1,21 @@
+# Rust-only migration status
+
+Local portable-runtime checks after removing the Python production pipeline:
+40 Rust unit tests, 24 local validation tests, and all 36 official fixtures pass.
+Both published dev tables have zero differences and zero duplicate keys. Python
+is only used for local checks; the production image contains only the static Rust
+binary and BusyBox utilities. The former staging protocol/tests are retired;
+analytical boundary and randomized checks now execute the native binary directly.
+
+The imported MIT-licensed AVX-512 candidate is isolated and unmeasured locally:
+this ARM Mac cannot execute it. Its Linux workflow gates fixtures, public dev,
+independent differential tests, and 5M/20M two-seed measurements before selection.
+Static-musl image construction and restricted container checks are also pending
+Linux CI because Docker is unavailable here. Do not treat earlier Python-backed
+container checks below as validation of the new image or imported candidate.
+
+---
+
 # Integrated pipeline validation
 
 Status as of November 20, 2026: public correctness and reduced-resource container compatibility pass on the integration branch. Full-size scorer performance is not yet established.

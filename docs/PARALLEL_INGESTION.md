@@ -1,3 +1,6 @@
+> Historical workstream record. Python/staging commands below are retired.
+> Use the current README.md and DATA_CONTRACT.md for the Rust-only runtime.
+
 # Parallel Rust ingestion
 
 Karthik owns Step 3. The approved implementation is complete locally on

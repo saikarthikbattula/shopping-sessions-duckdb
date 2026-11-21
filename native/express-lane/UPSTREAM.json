@@ -1,0 +1,29 @@
+{
+  "source": "user-supplied express-lane-main archive",
+  "license": "MIT",
+  "files_sha256": {
+    ".cargo/config.toml": "9bc344fae402b0acaaa98be25e80258480d78efec73df584fabf7ad6fec903f5",
+    "Cargo.lock": "626b3473685c5d5db07778f5d46cca25daeea2d51cffdc67cb0945ba182d90f2",
+    "Cargo.toml": "4d895d227c8414e27091c33855296a56245e5496d293383356278611cde74cb3",
+    "LICENSE": "ccef2155bc46e17ef8502d16ab2f26edb8c3ceddbcd332a5c4f1dd5b3df3be08",
+    "src/ckix.rs": "316240e536049b4874ca02aad153823c63fa070f5bb29b9a19f853628d70b443",
+    "src/complex.rs": "f2f402aad3ca56d77ebcc781e1b828f6fcd33e900db4ded608e742119f707cc7",
+    "src/core.rs": "df79c84325074382ee431d9323022a992d5f3ac257a2b4e8e8219c3861625e15",
+    "src/events.rs": "4eff0021b558707b1fa13375a66b9e814f4d35ce1e9517ef16ded7331321247f",
+    "src/generic/core.rs": "65c762ee31fd397a50d112dc35d1d24059b7403fd2a53dcfa5a48caa71177399",
+    "src/generic/mod.rs": "4854a3f8c4178a59174884c797db0be21970ea600f657e2fa6df26bebe12f998",
+    "src/generic/parse.rs": "10abea1d34a2184ea2a141c379ab5828b4e348a5f14bca37c1178b89c1d1adde",
+    "src/generic/util.rs": "69473be273d584152b97a6c5d0f60dcd1b32726c1b1010e8a2b0e6d7680b2bc5",
+    "src/iface.rs": "739dec659e7c300fe236d36f17367deb9dad9e8dca198e737897930d6bdfaf15",
+    "src/k_free.rs": "d7c04117d7a16fa4424273d1b23a921026b1f20fcd420d9eab758d2a14d30b57",
+    "src/k_ref.rs": "7c4fc4e6fff04470369f9c4ce5faf5e2862004f0a37aa54e30621a7ad23877ec",
+    "src/keyrec.rs": "f9060fb6985f7b531752b64ae1c96905a0e03462544134ec81f887e18a8282ca",
+    "src/links.rs": "88b5cfaf501b68a0e39890ad816c39fd1e411d896367a454850aba736d3e1db5",
+    "src/main.rs": "60869c9f71ee25ef5c7fe6035be439e352d62981002ef8cc981f113697d79be2",
+    "src/out.rs": "1f3e16b2df7ffa7ea0c7304c777a592cad2a058ae7de308a97d9a8c8c04cfda2",
+    "src/parse.rs": "129ff7a357a802f88d0c762a1b2ec2c5a7211dd1837f82263ebc13a41c6cbd67",
+    "src/pqw.rs": "0ec22a254c5866554c9742a69e445c081d2c02ea9586fec65ae53194ebe8c780",
+    "src/setup.rs": "a374b050f23f8f09efa29514769d16c93c54ea32610e7456e802feba17d5cdb5",
+    "src/sys.rs": "59efdc8c03f96ae8977321461f45217794dd03c60881f30388279cb2e2f692c7"
+  }
+}

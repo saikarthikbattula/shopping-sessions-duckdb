@@ -1,82 +1,62 @@
 IMAGE ?= shopping-sessions:latest
-CPUS  ?= 8
-MEM   ?= 24g
-# The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.
+CPUS ?= 8
+MEM ?= 24g
 PLATFORM ?= linux/amd64
-DEV   ?= dev
-# In the monorepo the fixtures live two levels up; the published starter has its own copy.
-FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
+DEV ?= dev
+OUT ?= out
+FIXTURES ?= fixtures
 PYTHON ?= .venv/bin/python
-SCRATCH ?= $(CURDIR)/scratch
-GENERATOR ?= tools/generator/target/release/generate
 CARGO ?= cargo
 RUST_JOBS ?= 2
 NATIVE_INGEST ?= $(CURDIR)/native/ingest/target/release/shopping-ingest
+GENERATOR ?= tools/generator/target/release/generate
+BASELINE_BIN ?= target/baseline/shopping-ingest
 BENCH_REPORT ?= out-benchmark/report.json
-BENCH_RUNS ?= 3
-BENCH_NCPU ?= 2
-BENCH_MEM_GB ?= 2
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: setup test native-ingest test-native build fixtures fixtures-local generator dev run-dev run-local check-dev check-dev-fingerprint benchmark
+.PHONY: setup native-ingest test test-native build fixtures fixtures-local generator dev run-dev run-local check-dev check-dev-fingerprint benchmark
 
-## Create an isolated environment with pinned runtime and checker dependencies
+# Python dependencies are local validation tools; none are installed in the image.
 setup:
 	python3 -m venv .venv
-	.venv/bin/python -m pip install -r requirements-dev.txt
+	$(PYTHON) -m pip install -r requirements-dev.txt
 
-## Unit, contract, and independent staged/raw differential checks
-test:
-	$(PYTHON) -m unittest discover -s tests -v
-
-## Build the optional serial Rust backend; Python remains the default
 native-ingest:
-	cd native/ingest && $(CARGO) build --release --locked --jobs $(RUST_JOBS)
+	$(CARGO) build --release --locked --jobs $(RUST_JOBS) --manifest-path native/ingest/Cargo.toml
 
-## Require the real native executable; never silently skip native parity checks
-test-native: native-ingest
-	cd native/ingest && $(CARGO) test --release --locked --jobs $(RUST_JOBS)
-	REQUIRE_RUST_INGEST=1 RUST_INGEST_BIN="$(NATIVE_INGEST)" $(PYTHON) -m unittest discover -s tests -p 'test_ingest*.py' -v
+test-native:
+	$(CARGO) test --locked --jobs $(RUST_JOBS) --manifest-path native/ingest/Cargo.toml
 
-## Official fixtures without Docker for the native development loop
-fixtures-local:
-	mkdir -p "$(SCRATCH)"
-	SCRATCH_DIR="$(SCRATCH)" $(PYTHON) scripts/run_fixtures.py $(FIXTURES) -- $(PYTHON) -m pipeline.pipeline
+test: native-ingest test-native
+	REQUIRE_RUST_INGEST=1 RUST_INGEST_BIN="$(NATIVE_INGEST)" $(PYTHON) -m unittest discover -s tests -v
 
-## Build the official generator; requires Rust 1.85+
-generator:
-	cargo build --release --manifest-path tools/generator/Cargo.toml
+fixtures-local: native-ingest
+	$(PYTHON) scripts/run_fixtures.py "$(FIXTURES)" -- "$(NATIVE_INGEST)"
 
-## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:
-	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .
+	docker buildx build --platform "$(PLATFORM)" --load -t "$(IMAGE)" .
 
-## Run the image on all 36 edge-case fixtures and diff against the expected tables
 fixtures: build
-	$(PYTHON) scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
+	$(PYTHON) scripts/run_fixtures.py "$(FIXTURES)" -- scripts/docker_run.sh
 
-## Make the 1M-event dev set (make generator first)
-dev:
-	$(GENERATOR) --seed 1 --events 1000000 --clicks 250000 --output $(DEV)
+generator:
+	$(CARGO) build --release --locked --manifest-path tools/generator/Cargo.toml
 
-## Native loop; does not reproduce container limits or scorer timings
-run-local:
-	mkdir -p "$(SCRATCH)" out
-	DATA_DIR="$(DEV)" OUTPUT_DIR="$(CURDIR)/out" SCRATCH_DIR="$(SCRATCH)" $(PYTHON) -m pipeline.pipeline
+dev: generator
+	"$(GENERATOR)" --seed 1 --events 1000000 --clicks 250000 --output "$(DEV)"
 
-## Run on the dev set with scorer flags and time it
+run-local: native-ingest
+	DATA_DIR="$(DEV)" OUTPUT_DIR="$(OUT)" ./run.sh
+
 run-dev: build
-	rm -rf out && time scripts/docker_run.sh $(DEV) out
+	scripts/docker_run.sh "$(DEV)" "$(OUT)"
 
-## Compare your dev output with the published dev answer (dev-answer.zip, unzipped): make check-dev ANSWER=dev-answer
 ANSWER ?= dev-answer
 check-dev:
-	$(PYTHON) scripts/compare.py out $(ANSWER)
+	$(PYTHON) scripts/compare.py "$(OUT)" "$(ANSWER)"
 
-## Public seed-1 comparison without committing or downloading answer rows
 check-dev-fingerprint:
-	$(PYTHON) scripts/check_dev_fingerprints.py out
+	$(PYTHON) scripts/check_dev_fingerprints.py "$(OUT)"
 
-## Native baseline/candidate comparison; each report path must be new
-benchmark:
-	$(PYTHON) scripts/benchmark.py "$(DEV)" --runs $(BENCH_RUNS) --ncpu $(BENCH_NCPU) --mem-gb $(BENCH_MEM_GB) --report "$(BENCH_REPORT)"
+benchmark: native-ingest
+	$(PYTHON) scripts/benchmark_cpu_candidate.py "$(BASELINE_BIN)" "$(NATIVE_INGEST)" "$(DEV)" "$(BENCH_REPORT)" --workers "$(CPUS)"

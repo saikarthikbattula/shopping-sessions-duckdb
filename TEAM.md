@@ -2,4 +2,4 @@
 
 Name: Shopping Sessions
 Members: Karthik, Pranav
-Engine: DuckDB
+Engine: Rust (based on the official DuckDB starter)

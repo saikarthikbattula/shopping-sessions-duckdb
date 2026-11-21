@@ -1,3 +1,6 @@
+> Historical workstream record. Python/staging commands below are retired.
+> Use the current README.md and DATA_CONTRACT.md for the Rust-only runtime.
+
 # DuckDB Analytics Optimization Plan
 
 **Owner:** Karthik  

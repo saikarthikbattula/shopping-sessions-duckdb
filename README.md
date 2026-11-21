@@ -1,75 +1,81 @@
-# Shopping Sessions — DuckDB
+# Shopping Sessions — Rust
 
-Shopping-event cleaning, identity resolution, session attribution, and daily aggregates, based on the official DuckDB starter.
+Production processing is entirely Rust: CSV parsing, identity resolution, global
+deduplication, sessionization, attribution, assists and Parquet output. The default
+container runs a statically linked Rust executable directly. It contains no
+Python interpreter, Python pipeline, DuckDB runtime, or runtime package installer.
 
-**Status:** ingestion and analytics are integrated on this branch. All 26 unit/differential tests and 36 official fixtures pass. Both public dev tables match the published answers exactly. Linux amd64 CI also passes the fixtures and public-dev fingerprints in the restricted container. Representative 20M/60M performance at the scorer's 8 vCPUs/24 GB remains unmeasured.
+Python is used only by local test, fixture, answer-comparison and benchmark tools.
+The exact fallback in the Rust analytics module remains available when the
+specialized generator fast path's invariants do not hold.
 
-## Development setup
+## Layout
 
-Until the integration PR is human-merged into `main`, clone its branch:
+- `native/ingest/`: portable production Rust executable and its unit tests.
+- `native/express-lane/`: imported MIT-licensed AVX-512 evaluation candidate,
+  provenance hashes, license, and optional Dockerfile. Not the default executable.
+- `tools/generator/`: official, unmodified Rust dataset generator.
+- `fixtures/`: all 36 supplied fixtures and expected answers, unchanged.
+- `tests/`: local output/schema checks and small independent brute-force oracles.
+- `scripts/`: fixture, dev-answer, performance and restricted-container runners.
+- `docs/`: current contracts and performance evidence; old workstream notes are
+  explicitly marked historical.
+
+## Build and run
+
+Use Rust 1.85.0 for the portable executable. The AVX-512 candidate pins Rust 1.95.0
+and requires a compatible Linux x86_64 CPU; it cannot run on an ARM Mac.
 
 ```sh
-git clone --branch codex/integration-validation https://github.com/saikarthikbattula/shopping-sessions-duckdb.git
-cd shopping-sessions-duckdb
+make native-ingest
+DATA_DIR=dev OUTPUT_DIR=out NCPU=8 ./run.sh
+# Or invoke Rust directly:
+native/ingest/target/release/shopping-ingest --data-dir dev --output-dir out --workers 8
+make build                  # linux/amd64 static Rust image
+make run-dev DEV=dev OUT=out # scorer-style restricted container run
+```
+
+The container starts the binary directly with `/data` and `/output` defaults or
+DATA_DIR/OUTPUT_DIR overrides. NCPU overrides automatic cgroup-aware CPU detection.
+Output schemas and all millisecond boundaries follow [rules.md](rules.md).
+A missing native executable is an error; there is no interpreter fallback.
+The retired staging CLI (`--stage-dir`, `--batch-rows`) is no longer supported.
+
+## Local validation
+
+Python 3.12+ and the pinned development packages are only needed for checks:
+
+```sh
 make setup
-make test
+make test                    # Rust unit and native end-to-end boundary tests
+make fixtures-local          # all 36 official fixtures
+make generator dev           # official seed-1 dev input
+make run-local DEV=dev OUT=out
+make check-dev               # needs supplied dev-answer/; exact both-table diff
+make check-dev-fingerprint   # public seed-1 expected fingerprints
+make fixtures                # restricted linux/amd64 container fixtures
 ```
 
-For an existing clone, fetch `origin` and open `codex/integration-validation`. After the integration PR is merged, use an updated `main` instead. Use Python 3.12 or 3.13 for local development. Docker is optional for native tests. The Mac is a development environment; the submission image targets Linux amd64.
+Generated datasets, outputs, local environments and build artifacts stay outside
+Git and the image. Obtain dev-answer.zip from the competition; never alter official
+answers to pass a test. Docker is unavailable on the current Mac, so the new image
+must pass Linux CI before it is selected for use.
 
-The handoffs below record the original assignments to Pranav's Cursor Mobile session and Karthik's Codex session. Both implementations are present; do not rerun the original prompts as if the functions were still stubs. Further work uses new task branches and PRs under `AGENTS.md`.
+## Performance and candidate evaluation
 
-## Start here
+[Measured simple-user optimization](docs/SIMPLE_USER_FASTPATH.md) reduced CPU on
+both 5M seeds. Those native Mac timings do not establish sub-second 20M scorer
+performance. [Benchmark instructions](docs/BENCHMARKING.md) describe repeatable
+whole-process measurements and exact comparisons.
 
-- [Agent instructions: task branches and PRs; human-only merging](AGENTS.md)
-- [Implementation plan and integration ownership](docs/IMPLEMENTATION_PLAN.md)
-- [Shared ingestion-to-DuckDB contract](docs/DATA_CONTRACT.md)
-- [Opt-in serial Rust ingestion](docs/RUST_INGESTION.md)
-- [Parallel Rust ingestion](docs/PARALLEL_INGESTION.md)
-- [Native Linux container packaging](docs/NATIVE_CONTAINER.md)
-- [Incremental Rust optimization plan](docs/RUST_OPTIMIZATION_PLAN.md)
-- [Repeatable baseline benchmark](docs/BENCHMARKING.md)
-- [Simple-user bypass, compact sessionization, and measured results](docs/SIMPLE_USER_FASTPATH.md)
-- [Pranav: strict parsing and identity resolution](docs/handoffs/PRANAV.md)
-- [Karthik: DuckDB analytics and output tables](docs/handoffs/KARTHIK.md)
+The imported candidate is evaluated independently on an AVX-512 Linux host.
+Its workflow runs fixtures, public dev fingerprints, independent boundary and
+randomized tests, and 5M/20M benchmarks on seeds 1 and 2. Stock and worker-spin
+variants are compared against the portable Rust pipeline. A tuned variant must
+improve wall time by at least 5% and reduce CPU on both seeds before recommendation.
+No unmeasured candidate replaces the production executable.
 
-Pranav owns ingestion and canonical person IDs. Karthik owns sessions, attribution, assists, and daily aggregates. The integrator owns orchestration, Docker, independent correctness checks, and packaging. The shared input contract is unchanged.
-
-Each original handoff includes its agent prompt, ownership boundaries, and coordination report template for reference.
-
-All agents must push only to task branches and open pull requests targeting `main`. Agents must not push to `main`, merge PRs, or enable auto-merge. Incomplete work or unrun required checks belongs in a draft PR. A human maintainer reviews and merges.
-
-## Required competition materials
-
-The official DuckDB starter is imported at the repository root. `rules.md` is authoritative, `fixtures/` and `scripts/` preserve the official checks, and `tools/generator/` contains the unmodified generator source. The original starter README is preserved in `docs/STARTER_README.md`; use this README for the updated module commands. No ZIP downloads are needed to begin either workstream.
-
-Obtain `dev-answer.zip` from the competition and unpack it as `dev-answer/` for final dev comparison; it is deliberately not committed. Generated datasets, answers, outputs, and scratch directories are ignored by Git and excluded from the image build context.
-
-## Development commands
-
-```sh
-make test                    # unit, staged differential, and raw-CSV integration tests
-NCPU=2 MEM_GB=2 make fixtures-local  # all official fixtures, native development run
-make generator               # Rust 1.85+ required
-make dev                     # generate seed-1 public dev data
-NCPU=2 MEM_GB=2 make run-local # native pipeline run
-make check-dev               # needs unpacked dev-answer/
-make check-dev-fingerprint   # public seed-1 answer hashes; no answer rows required
-make fixtures                # amd64 Docker fixture run; Docker/buildx required
-```
-
-The entrypoint is `python -m pipeline.pipeline`. Set `DATA_DIR`, `OUTPUT_DIR`, `SCRATCH_DIR`, `NCPU`, and `MEM_GB` to run it directly. `run.sh` uses the same module inside the Docker image. All runtime diagnostics go to stderr. The official runner enforces no network, read-only root/data, uid 1000, a 64 MB `/tmp`, and process/memory limits.
-
-The Linux CI workflow builds within ten minutes, verifies image architecture/size, and runs the official fixtures and 1M-event public dev set in Docker at 2 CPUs/2 GB. It compares dev output with canonical SHA-256 fingerprints derived directly from the published CSV answers. No answer rows or generated data are committed or copied into the runtime image. These fingerprints are only for public seed 1, never for hidden or other generated datasets.
-
-See [validation status](docs/VALIDATION.md) for checks performed and outstanding gates.
-
-## Acceptance gates
-
-1. Match all 36 official fixtures exactly.
-2. Match both published dev tables for seed 1, with 1,000,000 events and 250,000 clicks.
-3. Pass additional boundary, randomized differential, and input-order checks.
-4. Validate the linux/amd64 image under the scorer's restricted runtime: 8 CPUs, 24 GB RAM, no network, read-only root, and uid 1000.
-5. Measure runtime and resource use before selecting a submission commit. The committed repository must remain below 50 MB and contain no generated input data.
-
-The baseline has passed public correctness and reduced-resource Linux container checks. Full-scale throughput, memory/disk limits, and scoring still require representative runs; no competition submission has been made.
+See [the output contract](docs/DATA_CONTRACT.md), [container design](docs/NATIVE_CONTAINER.md),
+[implementation plan](docs/IMPLEMENTATION_PLAN.md), and [agent workflow](AGENTS.md).
+Work only on task branches and PRs. Human maintainers review and merge; publishing
+a GitHub candidate does not submit it to the competition.

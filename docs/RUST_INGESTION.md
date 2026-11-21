@@ -1,3 +1,6 @@
+> Historical workstream record. Python/staging commands below are retired.
+> Use the current README.md and DATA_CONTRACT.md for the Rust-only runtime.
+
 # Serial Rust ingestion: opt-in development backend
 
 Karthik owns this increment. It implements Step 2 of the approved incremental

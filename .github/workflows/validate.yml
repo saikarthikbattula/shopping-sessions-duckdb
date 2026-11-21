@@ -75,12 +75,12 @@ jobs:
         run: make setup
       - name: Install Rust 1.85.0
         run: rustup toolchain install 1.85.0 --profile minimal
-      - name: Native build, Rust tests and staging parity
-        run: INGEST_BACKEND=python make test-native
+      - name: Rust build and unit tests
+        run: make native-ingest test-native
       - name: Unit and differential tests
-        run: INGEST_BACKEND=python REQUIRE_RUST_INGEST=1 make test
+        run: REQUIRE_RUST_INGEST=1 make test
       - name: Rust raw-CSV analytical differential checks
-        run: INGEST_BACKEND=rust REQUIRE_RUST_INGEST=1 .venv/bin/python -m unittest tests.test_integration -v
+        run: REQUIRE_RUST_INGEST=1 .venv/bin/python -m unittest tests.test_integration -v
       - name: Build linux/amd64 image within the ten-minute build limit
         run: timeout 600s make build
       - name: Check image architecture and size
@@ -95,16 +95,14 @@ jobs:
           assert image['Size'] <= 8_000_000_000, image['Size']
           print('linux/amd64 image bytes:', image['Size'])
           PY
-      - name: Both backends on official fixtures with scorer runtime restrictions
+      - name: Rust image contains no Python runtime
         run: |
-          for backend in python rust; do
-            INGEST_BACKEND="$backend" .venv/bin/python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
-          done
+          docker run --rm --entrypoint sh shopping-sessions:latest -c '! command -v python && ! command -v python3 && test ! -e /app/pipeline'
+      - name: Rust image on official fixtures with scorer runtime restrictions
+        run: .venv/bin/python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
       - name: Build official generator and create public seed-1 dev data
         run: make generator dev
-      - name: Both backends match published public dev in restricted containers
+      - name: Rust image matches published public dev in restricted container
         run: |
-          for backend in python rust; do
-            INGEST_BACKEND="$backend" scripts/docker_run.sh dev "out-$backend"
-            .venv/bin/python scripts/check_dev_fingerprints.py "out-$backend"
-          done
+          scripts/docker_run.sh dev out-rust
+          .venv/bin/python scripts/check_dev_fingerprints.py out-rust
