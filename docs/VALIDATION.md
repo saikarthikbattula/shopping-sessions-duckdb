@@ -1,22 +1,66 @@
-# Shared setup validation
+# Integrated pipeline validation
 
-Status as of November 20, 2026: bootstrap implemented; competition pipeline not implemented.
+Status as of November 20, 2026: public correctness and reduced-resource container compatibility pass on the integration branch. Full-size scorer performance is not yet established.
 
-## Passed
+## Source and contract
 
-- Installed pinned dependencies in an isolated local Python 3.13 environment on ARM64: DuckDB 1.5.6, PyArrow 18.0.0, and Polars 1.35.2.
-- `make test`: three bootstrap integration tests passed. They cover Arrow/Parquet/DuckDB preservation of exact strings, nulls and int64 precision; typed empty staging; scratch configuration; and stage orchestration with synthetic test doubles, DATE outputs, and temporary-directory cleanup.
-- Verified all 293 official fixture/harness files are byte-identical to the supplied starter, across all 36 fixture cases. This is an integrity check, not a pipeline correctness result.
-- The official checker successfully parsed all 72 expected fixture tables with the pinned Polars version. Local Markdown links were checked, and `git diff --check origin/main` passed. `.gitattributes` preserves official fixture/rules bytes and exempts their intentional whitespace from formatting checks.
-- `sh -n run.sh scripts/docker_run.sh` and Makefile dry runs passed.
-- `python -m pip check`: no broken requirements. A native module-entrypoint smoke check confirmed a nonzero exit with clear stderr, no Parquet outputs, and cleaned invocation scratch while ingestion is unimplemented.
+- Analytics: Karthik commit `92e2fe3`, merged into main through PR #3.
+- Ingestion: Pranav commit `8336d0d`, combined on `codex/integration-validation` without merging PR #4 to main.
+- Integration changes add checks, CI, and documentation; the two implementations, shared signature/schemas, runtime dependencies, official fixtures and expected tables are unchanged.
+- The official generator built with an isolated Rust 1.85 toolchain. Cargo refreshes a stale reference-package entry in the supplied lock during build; the imported lock is preserved unchanged in Git.
 
-## Outstanding
+## Correctness evidence
 
-- Implement `prepare_inputs` (Pranav) and `run_pipeline` (Karthik). Both currently raise `NotImplementedError`. The real pipeline must fail until those implementations are present.
-- Run all 36 official fixtures, public seed-1 dev-answer comparisons, independent differential checks, and performance/resource benchmarks after integration. No correctness or speed claim is made yet.
-- Build the official generator with Rust 1.85+ and generate dev data. Generator source is included, but Rust is not installed locally.
-- Build and validate the linux/amd64 Docker image under scorer restrictions. Docker is not installed locally; the native tests do not validate the container or Python 3.12 image runtime.
-- Obtain `dev-answer.zip` separately for clean-clone dev checks; its contents and generated input data are deliberately excluded from Git.
+- `make test`: 26 tests pass locally on Python 3.13 and in Linux CI on Python 3.12. Includes 12 staged differential seeds, each reversed and repartitioned, plus eight raw-CSV differential cases, each requoted/shuffled/repartitioned into two layouts. Raw cases construct expected semantics independently of production parsing and identity resolution, then use a brute-force analytical oracle.
+- `NCPU=2 MEM_GB=2 make fixtures-local`: **36/36 official fixtures pass** through the ordinary module entrypoint. The 293 official fixture/harness files remain byte-identical to the starter.
+- Generated the official seed-1 dev set with 1,000,000 events and 250,000 clicks. `make check-dev`: **MATCH**, including unique keys and every field in both tables. User daily: **117,038 rows**. Campaign daily: **27,400 rows**. No missing, extra, or differing rows; no duplicate keys.
+- `make check-dev-fingerprint`: matches canonical SHA-256 fingerprints derived directly from the published answer CSVs. Only hashes/row counts are committed. A focused test verifies reordered/partitioned output matches and altered revenue fails. This check is solely for the public seed-1 dev set and is excluded from the runtime image.
 
-The PR must remain a draft while the required container checks are unrun. A human may review or merge the bootstrap separately from competition acceptance; merging setup does not certify the unfinished pipeline.
+## Linux container evidence
+
+[Successful Linux validation run](https://github.com/saikarthikbattula/shopping-sessions-duckdb/actions/runs/44841621029) tested integration code at `a8a57d0`:
+
+- Ubuntu Linux, Python 3.12, native `linux/amd64` Docker image.
+- Image build about 12 seconds, inside the enforced 600-second build cap. Image size **328,054,508 bytes**, below 8 GB.
+- Official fixture runner: **36/36 pass** with no runtime network, read-only root/data, uid 1000, a 64 MB tmpfs, dropped capabilities, no new privileges, 4,096 PID limit, and no swap beyond the memory limit.
+- Generated seed-1 dev data runs successfully in the same restricted image; both table fingerprints match the published answers.
+- CI uses **2 CPUs / 2 GB**, explicitly reduced test limits. It proves compatibility and public correctness under those limits; it does not reproduce the scorer's Xeon CPU, 8 vCPUs, 24 GB, hidden data or final sizes. Docker launcher timing is not a scorer measurement.
+
+The workflow runs on PRs/main and is available for manual dispatch. GitHub Actions logs provide evidence for each revision; no automatic merge or submission is configured.
+
+## Development profile
+
+Native ARM64 Mac, Python 3.13, `NCPU=2`, `MEM_GB=2` (application configuration, not OS CPU/memory quotas), public seed-1 dev data:
+
+| Measurement | Result |
+| --- | --- |
+| Process wall time including startup | 7.73 s |
+| Pipeline preparation | 5.813 s |
+| Pipeline analytics | 0.962 s |
+| Pipeline total excluding startup | 6.775 s |
+| Maximum resident set size | 340,525,056 bytes (about 325 MiB) |
+| Sampled scratch plus output peak in separate profiled run | 46,079,185 bytes |
+
+Preparation is about 86% of measured pipeline time. A separate cProfile run points to timestamp parsing, row parsing and per-row staging as the main Python costs. The profiled run is slower because of instrumentation; its timing is not used as the baseline above. Disk sampling at 100 ms may miss short-lived peaks. These are development measurements, not predictions for the scorer.
+
+Reproduce native checks with Rust 1.85+ on PATH and `dev-answer.zip` unpacked as `dev-answer/`:
+
+```sh
+make setup test
+NCPU=2 MEM_GB=2 make fixtures-local
+make generator dev
+NCPU=2 MEM_GB=2 make run-local
+make check-dev
+make check-dev-fingerprint
+```
+
+For CPU profiling, run the module under `python -m cProfile -o PROFILE_PATH -m pipeline.pipeline` with the same data/output/scratch environment. Runtime stage timing diagnostics go to stderr.
+
+## Remaining gates and owners
+
+- **Performance workstream / integrator:** profile representative 20M/60M datasets on 8 vCPUs and 24 GB, including all seeds/skew, container-start-to-exit time, peak memory and scratch/output disk. The 50 GB combined disk cap and final 180-second limit have not been proven at full size.
+- **Performance workstream / integrator:** optimize preparation if full-size timings require it, preserving every exact comparison. No speed claim follows from a correct public dev run.
+- **Human maintainer:** review and merge the ingestion/integration PRs. The integration PR stays draft pending remaining performance gates; a human can choose to merge the correctness baseline independently of final scoring readiness.
+- **Team:** select a validated commit and submit it on the competition track. No competition submission has been made.
+
+Generated inputs, expected answer rows, output files, profiling artifacts, compiled binaries and virtual environments remain excluded from Git and the runtime image.

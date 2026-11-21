@@ -1,23 +1,23 @@
 # Shopping Sessions — DuckDB
 
-Competition planning and implementation handoffs for an exact shopping-event attribution pipeline, based on the official DuckDB starter.
+Shopping-event cleaning, identity resolution, session attribution, and daily aggregates, based on the official DuckDB starter.
 
-**Status:** shared setup is implemented. The official starter, rules, all 36 fixtures, generator source, shared schemas, and connected workstream entrypoints are present. Three bootstrap integration checks pass. Pranav's ingestion and Karthik's analytics are explicit stubs; this is not yet a working competition submission.
+**Status:** ingestion and analytics are integrated on this branch. All 26 unit/differential tests and 36 official fixtures pass. Both public dev tables match the published answers exactly. Linux amd64 CI also passes the fixtures and public-dev fingerprints in the restricted container. Representative 20M/60M performance at the scorer's 8 vCPUs/24 GB remains unmeasured.
 
-## Pull and start your agent
+## Development setup
 
-Until the setup PR is human-merged into `main`, clone its branch:
+Until the integration PR is human-merged into `main`, clone its branch:
 
 ```sh
-git clone --branch codex/starter-bootstrap https://github.com/saikarthikbattula/shopping-sessions-duckdb.git
+git clone --branch codex/integration-validation https://github.com/saikarthikbattula/shopping-sessions-duckdb.git
 cd shopping-sessions-duckdb
 make setup
 make test
 ```
 
-For an existing clone, fetch `origin` and open `codex/starter-bootstrap` to read the latest handoff. After the setup PR is merged, use an updated `main` instead. Use Python 3.12 or 3.13 for local development. Docker is optional for native workstream tests.
+For an existing clone, fetch `origin` and open `codex/integration-validation`. After the integration PR is merged, use an updated `main` instead. Use Python 3.12 or 3.13 for local development. Docker is optional for native tests. The Mac is a development environment; the submission image targets Linux amd64.
 
-Then open the appropriate handoff below and paste its prompt into your agent. The prompt creates your own task branch from the shared setup; do not code on the setup branch or `main`. Pranav uses Cursor Mobile and Karthik uses Codex. If the mobile agent cannot execute commands, it must report which validations need another environment.
+The handoffs below record the original assignments to Pranav's Cursor Mobile session and Karthik's Codex session. Both implementations are present; do not rerun the original prompts as if the functions were still stubs. Further work uses new task branches and PRs under `AGENTS.md`.
 
 ## Start here
 
@@ -27,9 +27,9 @@ Then open the appropriate handoff below and paste its prompt into your agent. Th
 - [Pranav: strict parsing and identity resolution](docs/handoffs/PRANAV.md)
 - [Karthik: DuckDB analytics and output tables](docs/handoffs/KARTHIK.md)
 
-Pranav owns ingestion and canonical person IDs. Karthik owns sessions, attribution, assists, and daily aggregates. The integrator owns starter setup, orchestration, Docker, independent correctness checks, and packaging. The handoff documents describe proposed ownership; they have not been delivered through an external messaging service.
+Pranav owns ingestion and canonical person IDs. Karthik owns sessions, attribution, assists, and daily aggregates. The integrator owns orchestration, Docker, independent correctness checks, and packaging. The shared input contract is unchanged.
 
-Each handoff includes a ready-to-paste agent prompt: Pranav's is written for Cursor Mobile, and Karthik's for Codex. They include branch names, file boundaries, missing-prerequisite handling, acceptance checks, and a report template to relay between agents.
+Each original handoff includes its agent prompt, ownership boundaries, and coordination report template for reference.
 
 All agents must push only to task branches and open pull requests targeting `main`. Agents must not push to `main`, merge PRs, or enable auto-merge. Incomplete work or unrun required checks belongs in a draft PR. A human maintainer reviews and merges.
 
@@ -42,16 +42,19 @@ Obtain `dev-answer.zip` from the competition and unpack it as `dev-answer/` for 
 ## Development commands
 
 ```sh
-make test                    # shared setup checks; does not prove pipeline correctness
-make fixtures-local          # official fixtures; expected to fail until both workstreams are implemented
+make test                    # unit, staged differential, and raw-CSV integration tests
+NCPU=2 MEM_GB=2 make fixtures-local  # all official fixtures, native development run
 make generator               # Rust 1.85+ required
 make dev                     # generate seed-1 public dev data
-make run-local               # native pipeline run after implementation
+NCPU=2 MEM_GB=2 make run-local # native pipeline run
 make check-dev               # needs unpacked dev-answer/
+make check-dev-fingerprint   # public seed-1 answer hashes; no answer rows required
 make fixtures                # amd64 Docker fixture run; Docker/buildx required
 ```
 
-The entrypoint is `python -m pipeline.pipeline`. Set `DATA_DIR`, `OUTPUT_DIR`, `SCRATCH_DIR`, `NCPU`, and `MEM_GB` to run it directly. `run.sh` uses the same module inside the Docker image. All runtime diagnostics go to stderr; stage stubs deliberately exit with an error rather than writing misleading empty outputs.
+The entrypoint is `python -m pipeline.pipeline`. Set `DATA_DIR`, `OUTPUT_DIR`, `SCRATCH_DIR`, `NCPU`, and `MEM_GB` to run it directly. `run.sh` uses the same module inside the Docker image. All runtime diagnostics go to stderr. The official runner enforces no network, read-only root/data, uid 1000, a 64 MB `/tmp`, and process/memory limits.
+
+The Linux CI workflow builds within ten minutes, verifies image architecture/size, and runs the official fixtures and 1M-event public dev set in Docker at 2 CPUs/2 GB. It compares dev output with canonical SHA-256 fingerprints derived directly from the published CSV answers. No answer rows or generated data are committed or copied into the runtime image. These fingerprints are only for public seed 1, never for hidden or other generated datasets.
 
 See [validation status](docs/VALIDATION.md) for checks performed and outstanding gates.
 
@@ -63,4 +66,4 @@ See [validation status](docs/VALIDATION.md) for checks performed and outstanding
 4. Validate the linux/amd64 image under the scorer's restricted runtime: 8 CPUs, 24 GB RAM, no network, read-only root, and uid 1000.
 5. Measure runtime and resource use before selecting a submission commit. The committed repository must remain below 50 MB and contain no generated input data.
 
-The Dockerfile is present, but the Docker image has not been built or checked on this machine. This repository is not yet a competition submission.
+The baseline has passed public correctness and reduced-resource Linux container checks. Full-scale throughput, memory/disk limits, and scoring still require representative runs; no competition submission has been made.

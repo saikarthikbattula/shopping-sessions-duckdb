@@ -1,6 +1,6 @@
 # Shared ingestion-to-DuckDB contract
 
-Status: implemented in `pipeline/contracts.py`, with connected entrypoint stubs in `pipeline/ingest.py` and `pipeline/analytics.py`. The supplied rules remain authoritative.
+Status: implemented in `pipeline/contracts.py`, with integrated ingestion and analytics implementations. The interface and schemas are unchanged. The supplied rules remain authoritative.
 
 ## Modules and calls
 
