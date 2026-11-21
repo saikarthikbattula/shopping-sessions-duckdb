@@ -107,11 +107,12 @@ impl CompactId {
     }
 }
 
+// 88-byte compact RawEvent with sentinel fields
 struct RawEvent {
     event_id: CompactId,
-    user_id: Option<CompactId>,
+    user_id: CompactId, // len == 0 if None
     ingest_ms: i64,
-    ts_ms: Option<i64>,
+    ts_ms: i64, // i64::MIN if None
     price_cents: i32,
     cat_idx: u8,
     is_purchase: bool,
@@ -127,8 +128,8 @@ struct RawClick {
 
 struct EventDedupEntry {
     ingest_ms: i64,
-    user_id: Option<CompactId>,
-    ts_ms: Option<i64>,
+    user_id: CompactId,
+    ts_ms: i64,
     price_cents: i32,
     cat_idx: u8,
     is_purchase: bool,
@@ -150,6 +151,24 @@ struct RawPersonClick {
     ts_ms: i64,
     camp_idx: u16,
     click_id: CompactId,
+}
+
+// Ultra-compact 16-byte event for instant integer-keyed sorting
+#[derive(Clone, Copy)]
+struct LocalEvent {
+    ts_ms: i64,
+    price_cents: i32,
+    p_idx: u16,
+    cat_idx: u8,
+    is_purchase: bool,
+}
+
+#[derive(Clone, Copy)]
+struct LocalClick {
+    ts_ms: i64,
+    click_id: CompactId,
+    p_idx: u16,
+    camp_idx: u16,
 }
 
 struct FastHasher(u64);
@@ -591,6 +610,7 @@ pub fn run_pipeline(
 
             handles.push(scope.spawn(move || -> Result<Vec<Vec<RawEvent>>> {
                 let mut local_shards: Vec<Vec<RawEvent>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+
                 while !cancelled.load(Ordering::Relaxed) {
                     let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
                     let Some(chunk) = event_chunks.get(idx) else {
@@ -605,7 +625,7 @@ pub fn run_pipeline(
                             return Ok(());
                         };
                         let ingest_ms = parse_ts_bytes(fields[3].unwrap_or(&[])).ok_or(InvalidIngest)?;
-                        let ts_ms = parse_window_ts_bytes(fields[2], i128::from(window_start), i128::from(window_end));
+                        let ts_ms_opt = parse_window_ts_bytes(fields[2], i128::from(window_start), i128::from(window_end));
                         let is_purchase = fields[4] == Some(b"purchase");
                         let price_cents = if is_purchase {
                             parse_unsigned_bytes(fields[6], 10000000).filter(|v| *v > 0)
@@ -613,7 +633,7 @@ pub fn run_pipeline(
                             None
                         };
                         let is_valid = fields[1].is_some()
-                            && ts_ms.is_some()
+                            && ts_ms_opt.is_some()
                             && fields[5].is_some()
                             && matches!(fields[4], Some(b"view" | b"cart" | b"purchase"))
                             && (!is_purchase || price_cents.is_some());
@@ -626,11 +646,13 @@ pub fn run_pipeline(
 
                         let event_id = CompactId::from_bytes(event_id_bytes);
                         let shard_idx = get_shard_bytes(event_id.as_bytes());
+                        let user_id = fields[1].map(CompactId::from_bytes).unwrap_or_default();
+
                         local_shards[shard_idx].push(RawEvent {
                             event_id,
-                            user_id: fields[1].map(CompactId::from_bytes),
+                            user_id,
                             ingest_ms,
-                            ts_ms,
+                            ts_ms: ts_ms_opt.unwrap_or(i64::MIN),
                             price_cents: price_cents.unwrap_or(0) as i32,
                             cat_idx: category_idx,
                             is_purchase,
@@ -665,7 +687,7 @@ pub fn run_pipeline(
                     (0..NUM_SHARDS).map(|_| Vec::new()).collect();
 
                 let mut dedup_map: HashMap<CompactId, EventDedupEntry, FastBuildHasher> =
-                    HashMap::with_hasher(FastBuildHasher);
+                    HashMap::with_capacity_and_hasher(16384, FastBuildHasher);
 
                 for shard_idx in start_shard..end_shard {
                     dedup_map.clear();
@@ -705,10 +727,10 @@ pub fn run_pipeline(
                     }
 
                     for entry in dedup_map.values() {
-                        if entry.is_valid {
-                            let ts = entry.ts_ms.unwrap();
+                        if entry.is_valid && entry.ts_ms != i64::MIN {
+                            let ts = entry.ts_ms;
                             if entry.ingest_ms - ts <= 86_400_000 {
-                                let user = entry.user_id.unwrap();
+                                let user = entry.user_id;
                                 let person_compact = match ids.get(user.as_str()) {
                                     Some(canonical) => CompactId::from_bytes(canonical.as_bytes()),
                                     None => user,
@@ -747,6 +769,7 @@ pub fn run_pipeline(
 
             handles.push(scope.spawn(move || -> Result<Vec<Vec<RawClick>>> {
                 let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+
                 while !cancelled.load(Ordering::Relaxed) {
                     let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
                     let Some(chunk) = click_chunks.get(idx) else {
@@ -806,7 +829,8 @@ pub fn run_pipeline(
                 let mut local_person_shards: Vec<Vec<RawPersonClick>> =
                     (0..NUM_SHARDS).map(|_| Vec::new()).collect();
 
-                let mut seen_clicks: HashSet<CompactId, FastBuildHasher> = HashSet::with_hasher(FastBuildHasher);
+                let mut seen_clicks: HashSet<CompactId, FastBuildHasher> =
+                    HashSet::with_capacity_and_hasher(8192, FastBuildHasher);
 
                 for shard_idx in start_shard..end_shard {
                     seen_clicks.clear();
@@ -835,7 +859,7 @@ pub fn run_pipeline(
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // 9. Parallel Execution of Analytics across Person Shards
+    // 9. Parallel Execution of Analytics across Person Shards using 16-byte integer-keyed local events
     let partial_results: Vec<(Vec<UserDailyRow>, HashMap<(u16, i32), CampaignDailyAccumulator>)> =
         std::thread::scope(|scope| {
             let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
@@ -852,22 +876,64 @@ pub fn run_pipeline(
                     let mut user_rows = Vec::new();
                     let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
 
+                    let mut shard_person_map: HashMap<CompactId, u16, FastBuildHasher> =
+                        HashMap::with_capacity_and_hasher(1024, FastBuildHasher);
+                    let mut shard_person_names: Vec<CompactId> = Vec::with_capacity(1024);
+                    let mut local_events: Vec<LocalEvent> = Vec::with_capacity(65536);
+                    let mut local_clicks: Vec<LocalClick> = Vec::with_capacity(16384);
+
                     for shard_idx in start_shard..end_shard {
-                        let mut total_events = Vec::new();
-                        let mut total_clicks = Vec::new();
+                        shard_person_map.clear();
+                        shard_person_names.clear();
+                        local_events.clear();
+                        local_clicks.clear();
 
                         for w_events in worker_person_events {
-                            total_events.extend_from_slice(&w_events[shard_idx]);
+                            for ev in &w_events[shard_idx] {
+                                let p_idx = match shard_person_map.get(&ev.person) {
+                                    Some(&idx) => idx,
+                                    None => {
+                                        let idx = shard_person_names.len() as u16;
+                                        shard_person_names.push(ev.person);
+                                        shard_person_map.insert(ev.person, idx);
+                                        idx
+                                    }
+                                };
+                                local_events.push(LocalEvent {
+                                    ts_ms: ev.ts_ms,
+                                    price_cents: ev.price_cents,
+                                    p_idx,
+                                    cat_idx: ev.cat_idx,
+                                    is_purchase: ev.is_purchase,
+                                });
+                            }
                         }
+
                         for w_clicks in worker_person_clicks {
-                            total_clicks.extend_from_slice(&w_clicks[shard_idx]);
+                            for cl in &w_clicks[shard_idx] {
+                                if let Some(&p_idx) = shard_person_map.get(&cl.person) {
+                                    local_clicks.push(LocalClick {
+                                        ts_ms: cl.ts_ms,
+                                        click_id: cl.click_id,
+                                        p_idx,
+                                        camp_idx: cl.camp_idx,
+                                    });
+                                }
+                            }
                         }
 
-                        // Parallel-friendly sort
-                        total_events.sort_unstable_by(|a, b| (a.person.as_bytes(), a.ts_ms).cmp(&(b.person.as_bytes(), b.ts_ms)));
-                        total_clicks.sort_unstable_by(|a, b| (a.person.as_bytes(), a.ts_ms, a.click_id.as_bytes()).cmp(&(b.person.as_bytes(), b.ts_ms, b.click_id.as_bytes())));
+                        // Ultra-fast integer-tuple sort: (p_idx: u16, ts_ms: i64) fits in single CPU vector instruction
+                        local_events.sort_unstable_by_key(|e| (e.p_idx, e.ts_ms));
+                        local_clicks.sort_unstable_by(|a, b| {
+                            (a.p_idx, a.ts_ms, a.click_id.as_bytes()).cmp(&(b.p_idx, b.ts_ms, b.click_id.as_bytes()))
+                        });
 
-                        let (u_part, c_part) = execute_sorted_shard(&total_events, &total_clicks, category_names);
+                        let (u_part, c_part) = execute_shard_local(
+                            &local_events,
+                            &local_clicks,
+                            &shard_person_names,
+                            category_names,
+                        );
                         user_rows.extend(u_part);
                         for (k, acc) in c_part {
                             let entry = campaign_daily_map.entry(k).or_default();
@@ -927,9 +993,10 @@ pub fn run_pipeline(
     Ok(())
 }
 
-fn execute_sorted_shard(
-    events: &[RawPersonEvent],
-    clicks: &[RawPersonClick],
+fn execute_shard_local(
+    events: &[LocalEvent],
+    clicks: &[LocalClick],
+    person_names: &[CompactId],
     category_names: &[String],
 ) -> (Vec<UserDailyRow>, HashMap<(u16, i32), CampaignDailyAccumulator>) {
     let mut user_rows = Vec::new();
@@ -939,19 +1006,19 @@ fn execute_sorted_shard(
     let mut cl_cursor = 0;
 
     while ev_start < events.len() {
-        let person = events[ev_start].person;
+        let p_idx = events[ev_start].p_idx;
         let mut ev_end = ev_start + 1;
-        while ev_end < events.len() && events[ev_end].person == person {
+        while ev_end < events.len() && events[ev_end].p_idx == p_idx {
             ev_end += 1;
         }
         let person_events = &events[ev_start..ev_end];
 
-        // Advance click cursor to this person
-        while cl_cursor < clicks.len() && clicks[cl_cursor].person.as_bytes() < person.as_bytes() {
+        // Advance click cursor to this person's p_idx
+        while cl_cursor < clicks.len() && clicks[cl_cursor].p_idx < p_idx {
             cl_cursor += 1;
         }
         let cl_start = cl_cursor;
-        while cl_cursor < clicks.len() && clicks[cl_cursor].person == person {
+        while cl_cursor < clicks.len() && clicks[cl_cursor].p_idx == p_idx {
             cl_cursor += 1;
         }
         let person_clicks = &clicks[cl_start..cl_cursor];
@@ -987,6 +1054,8 @@ fn execute_sorted_shard(
             &mut campaign_daily_map,
         );
 
+        let person_name = person_names[p_idx as usize].as_str();
+
         for (day, acc) in user_daily_map {
             let top_category = if acc.category_revenue.is_empty() {
                 None
@@ -1003,7 +1072,7 @@ fn execute_sorted_shard(
                     .map(|(cat_idx, _)| category_names[*cat_idx as usize].clone())
             };
             user_rows.push(UserDailyRow {
-                user_id: person.as_str().to_string(),
+                user_id: person_name.to_string(),
                 day,
                 sessions: acc.sessions,
                 events: acc.events,
@@ -1020,8 +1089,8 @@ fn execute_sorted_shard(
 
 #[inline(always)]
 fn process_person_session(
-    session_events: &[RawPersonEvent],
-    person_clicks: &[RawPersonClick],
+    session_events: &[LocalEvent],
+    person_clicks: &[LocalClick],
     click_left: &mut usize,
     click_right: &mut usize,
     user_daily_map: &mut HashMap<i32, UserDailyAccumulator>,
