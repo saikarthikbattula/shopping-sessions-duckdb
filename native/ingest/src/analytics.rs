@@ -17,6 +17,30 @@ use parquet::file::properties::WriterProperties;
 
 use crate::{InvalidIngest, Result};
 
+#[cfg(target_os = "macos")]
+const CLOCK_THREAD_CPUTIME_ID: i32 = 16;
+#[cfg(not(target_os = "macos"))]
+const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+unsafe extern "C" {
+    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+}
+
+#[inline(always)]
+fn thread_cpu_time_ns() -> u64 {
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts);
+    }
+    (ts.tv_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(ts.tv_nsec as u64)
+}
+
 pub fn epoch_days(ts_ms: i64) -> i32 {
     ts_ms.div_euclid(86_400_000) as i32
 }
@@ -72,7 +96,7 @@ struct CampaignDailyAccumulator {
     assisted_sessions: i64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Clone, Copy)]
 pub struct CompactId {
     pub len: u8,
     pub bytes: [u8; 31],
@@ -81,21 +105,87 @@ pub struct CompactId {
 impl CompactId {
     #[inline(always)]
     pub fn from_bytes(b: &[u8]) -> Self {
-        let len = b.len().min(31);
-        let mut bytes = [0u8; 31];
-        bytes[..len].copy_from_slice(&b[..len]);
-        CompactId {
-            len: len as u8,
-            bytes,
+        if b.len() <= 31 {
+            let mut bytes = [0u8; 31];
+            bytes[..b.len()].copy_from_slice(b);
+            CompactId {
+                len: b.len() as u8,
+                bytes,
+            }
+        } else {
+            let leaked: &'static [u8] = Box::leak(b.to_vec().into_boxed_slice());
+            let ptr = leaked.as_ptr() as usize;
+            let full_len = leaked.len();
+            let mut bytes = [0u8; 31];
+            bytes[0..8].copy_from_slice(&ptr.to_ne_bytes());
+            bytes[8..16].copy_from_slice(&full_len.to_ne_bytes());
+            CompactId {
+                len: 0xFF,
+                bytes,
+            }
         }
     }
-    #[inline(always)]
-    pub fn as_str(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(&self.bytes[..self.len as usize]) }
-    }
+
     #[inline(always)]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len as usize]
+        if self.len != 0xFF {
+            &self.bytes[..self.len as usize]
+        } else {
+            let ptr = usize::from_ne_bytes(self.bytes[0..8].try_into().unwrap()) as *const u8;
+            let len = usize::from_ne_bytes(self.bytes[8..16].try_into().unwrap());
+            unsafe { std::slice::from_raw_parts(ptr, len) }
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
+    }
+}
+
+impl std::fmt::Debug for CompactId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CompactId({})", self.as_str())
+    }
+}
+
+impl PartialEq for CompactId {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for CompactId {}
+
+impl Ord for CompactId {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl PartialOrd for CompactId {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::hash::Hash for CompactId {
+    #[inline(always)]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write(self.as_bytes());
+    }
+}
+
+impl Default for CompactId {
+    #[inline(always)]
+    fn default() -> Self {
+        CompactId {
+            len: 0,
+            bytes: [0u8; 31],
+        }
     }
 }
 
@@ -751,8 +841,11 @@ pub fn run_pipeline(
 
     // 2. Identity resolution from links/
     let t_identity_start = std::time::Instant::now();
+    let id_cpu_start = thread_cpu_time_ns();
     let ids = load_parallel_identity(&data_dir.join("links"), workers_count)?;
-    eprintln!("[identity] elapsed: {:.3}ms, unique identities: {}", t_identity_start.elapsed().as_secs_f64() * 1000.0, ids.len());
+    let id_cpu_ns = thread_cpu_time_ns().saturating_sub(id_cpu_start);
+    let t_identity_elapsed = t_identity_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[identity] elapsed: {:.3}ms, unique identities: {}", t_identity_elapsed, ids.len());
 
     // 3. Products lookup: product_id -> category_idx
     let mut category_names = Vec::new();
@@ -839,9 +932,9 @@ pub fn run_pipeline(
     }
 
     // 5. Concurrent Overlapped Ingestion: Events and Clicks
-    let (worker_person_events, worker_person_clicks) = std::thread::scope(|scope| -> Result<(Vec<Vec<Vec<RawPersonEvent>>>, Vec<Vec<Vec<RawPersonClick>>>)> {
+    let (worker_person_events, worker_person_clicks, clicks_cpu_ns, events_parse_cpu_ns, events_dedup_cpu_ns, t_events_parse_elapsed, t_events_dedup_elapsed, t_clicks_elapsed, total_raw_events) = std::thread::scope(|scope| -> Result<(Vec<Vec<Vec<RawPersonEvent>>>, Vec<Vec<Vec<RawPersonClick>>>, u64, u64, u64, f64, f64, f64, usize)> {
         // Spawn clicks pipeline concurrently
-        let click_handle = scope.spawn(|| -> Result<Vec<Vec<Vec<RawPersonClick>>>> {
+        let click_handle = scope.spawn(|| -> Result<(Vec<Vec<Vec<RawPersonClick>>>, u64, f64)> {
             let t_clicks_start = std::time::Instant::now();
             let click_files = list_csv_files(&data_dir.join("clicks"))?;
             let click_chunks = Arc::new(plan_chunks(&click_files, 16 * 1024 * 1024)?);
@@ -849,7 +942,7 @@ pub fn run_pipeline(
             let cancelled = Arc::new(AtomicBool::new(false));
             let click_workers_count = (workers_count / 2).clamp(1, 4);
 
-            let worker_click_shards: Vec<Vec<Vec<RawClick>>> = std::thread::scope(|c_scope| {
+            let (worker_click_shards, parse_cpu): (Vec<Vec<Vec<RawClick>>>, u64) = std::thread::scope(|c_scope| {
                 let mut handles = Vec::new();
                 for _ in 0..click_workers_count {
                     let click_chunks = Arc::clone(&click_chunks);
@@ -857,7 +950,8 @@ pub fn run_pipeline(
                     let cancelled = Arc::clone(&cancelled);
                     let campaign_to_idx = &campaign_to_idx;
 
-                    handles.push(c_scope.spawn(move || -> Result<Vec<Vec<RawClick>>> {
+                    handles.push(c_scope.spawn(move || -> Result<(Vec<Vec<RawClick>>, u64)> {
+                        let cpu_start = thread_cpu_time_ns();
                         let mut local_shards: Vec<Vec<RawClick>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(512)).collect();
 
                         while !cancelled.load(Ordering::Relaxed) {
@@ -894,18 +988,21 @@ pub fn run_pipeline(
                                 Ok(())
                             })?;
                         }
-                        Ok(local_shards)
+                        let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                        Ok((local_shards, cpu_ns))
                     }));
                 }
                 let mut results = Vec::new();
                 for h in handles {
                     results.push(h.join().unwrap()?);
                 }
-                Ok::<Vec<Vec<Vec<RawClick>>>, Box<dyn std::error::Error + Send + Sync>>(results)
+                let total_cpu: u64 = results.iter().map(|(_, c)| *c).sum();
+                let shards: Vec<Vec<Vec<RawClick>>> = results.into_iter().map(|(s, _)| s).collect();
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((shards, total_cpu))
             })?;
 
             // Deduplication of clicks
-            let worker_person_clicks: Vec<Vec<Vec<RawPersonClick>>> = std::thread::scope(|c_scope| {
+            let (worker_person_clicks, dedup_cpu): (Vec<Vec<Vec<RawPersonClick>>>, u64) = std::thread::scope(|c_scope| {
                 let shards_per_worker = (NUM_SHARDS + click_workers_count - 1) / click_workers_count;
                 let mut handles = Vec::new();
                 let worker_click_shards = &worker_click_shards;
@@ -915,7 +1012,8 @@ pub fn run_pipeline(
                     let start_shard = worker_idx * shards_per_worker;
                     let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
 
-                    handles.push(c_scope.spawn(move || -> Vec<Vec<RawPersonClick>> {
+                    handles.push(c_scope.spawn(move || -> (Vec<Vec<RawPersonClick>>, u64) {
+                        let cpu_start = thread_cpu_time_ns();
                         let mut local_person_shards: Vec<Vec<RawPersonClick>> =
                             (0..NUM_SHARDS).map(|_| Vec::with_capacity(256)).collect();
 
@@ -941,13 +1039,23 @@ pub fn run_pipeline(
                                 }
                             }
                         }
-                        local_person_shards
+                        let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                        (local_person_shards, cpu_ns)
                     }));
                 }
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
+                let mut shards = Vec::new();
+                let mut total_cpu = 0u64;
+                for h in handles {
+                    let (s, c) = h.join().unwrap();
+                    shards.push(s);
+                    total_cpu += c;
+                }
+                (shards, total_cpu)
             });
-            eprintln!("[clicks_total] elapsed: {:.3}ms", t_clicks_start.elapsed().as_secs_f64() * 1000.0);
-            Ok(worker_person_clicks)
+            let clicks_cpu_ns = parse_cpu + dedup_cpu;
+            let t_clicks_elapsed = t_clicks_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[clicks_total] wall: {:.3}ms, cpu: {:.3}ms", t_clicks_elapsed, (clicks_cpu_ns as f64) / 1_000_000.0);
+            Ok((worker_person_clicks, clicks_cpu_ns, t_clicks_elapsed))
         });
 
         // Event Parsing
@@ -957,7 +1065,7 @@ pub fn run_pipeline(
         let next_chunk = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
 
-        let worker_event_shards: Vec<Vec<Vec<RawEvent>>> = std::thread::scope(|e_scope| {
+        let (worker_event_shards, events_parse_cpu_ns): (Vec<Vec<Vec<RawEvent>>>, u64) = std::thread::scope(|e_scope| {
             let mut handles = Vec::new();
             for _ in 0..workers_count {
                 let event_chunks = Arc::clone(&event_chunks);
@@ -966,7 +1074,8 @@ pub fn run_pipeline(
                 let products_map = &products_map;
                 let direct_products = &direct_products;
 
-                handles.push(e_scope.spawn(move || -> Result<Vec<Vec<RawEvent>>> {
+                handles.push(e_scope.spawn(move || -> Result<(Vec<Vec<RawEvent>>, u64)> {
+                    let cpu_start = thread_cpu_time_ns();
                     let mut local_shards: Vec<Vec<RawEvent>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect();
 
                     while !cancelled.load(Ordering::Relaxed) {
@@ -1041,21 +1150,26 @@ pub fn run_pipeline(
                             Ok(())
                         })?;
                     }
-                    Ok(local_shards)
+                    let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                    Ok((local_shards, cpu_ns))
                 }));
             }
             let mut results = Vec::new();
             for h in handles {
                 results.push(h.join().unwrap()?);
             }
-            Ok::<Vec<Vec<Vec<RawEvent>>>, Box<dyn std::error::Error + Send + Sync>>(results)
+            let total_cpu: u64 = results.iter().map(|(_, c)| *c).sum();
+            let shards: Vec<Vec<Vec<RawEvent>>> = results.into_iter().map(|(s, _)| s).collect();
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((shards, total_cpu))
         })?;
         let t_events_parse_elapsed = t_events_parse_start.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("[events_parse] elapsed: {:.3}ms", t_events_parse_elapsed);
+        eprintln!("[events_parse] wall: {:.3}ms, cpu: {:.3}ms", t_events_parse_elapsed, (events_parse_cpu_ns as f64) / 1_000_000.0);
+
+        let total_raw_events: usize = worker_event_shards.iter().flat_map(|w| w.iter()).map(|s| s.len()).sum();
 
         // 6. Lock-Free Parallel Deduplication of Events and Routing to Person Shards
         let t_events_dedup_start = std::time::Instant::now();
-        let worker_person_events: Vec<Vec<Vec<RawPersonEvent>>> = std::thread::scope(|e_scope| {
+        let (worker_person_events, events_dedup_cpu_ns): (Vec<Vec<Vec<RawPersonEvent>>>, u64) = std::thread::scope(|e_scope| {
             let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
             let mut handles = Vec::new();
             let worker_event_shards = &worker_event_shards;
@@ -1065,7 +1179,8 @@ pub fn run_pipeline(
                 let start_shard = worker_idx * shards_per_worker;
                 let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
 
-                handles.push(e_scope.spawn(move || -> Vec<Vec<RawPersonEvent>> {
+                handles.push(e_scope.spawn(move || -> (Vec<Vec<RawPersonEvent>>, u64) {
+                    let cpu_start = thread_cpu_time_ns();
                     let mut local_person_shards: Vec<Vec<RawPersonEvent>> =
                         (0..NUM_SHARDS).map(|_| Vec::with_capacity(1024)).collect();
 
@@ -1128,15 +1243,24 @@ pub fn run_pipeline(
                             }
                         }
                     }
-                    local_person_shards
+                    let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                    (local_person_shards, cpu_ns)
                 }));
             }
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            let mut shards = Vec::new();
+            let mut total_cpu = 0u64;
+            for h in handles {
+                let (s, c) = h.join().unwrap();
+                shards.push(s);
+                total_cpu += c;
+            }
+            (shards, total_cpu)
         });
-        eprintln!("[events_dedup] elapsed: {:.3}ms", t_events_dedup_start.elapsed().as_secs_f64() * 1000.0);
+        let t_events_dedup_elapsed = t_events_dedup_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[events_dedup] wall: {:.3}ms, cpu: {:.3}ms", t_events_dedup_elapsed, (events_dedup_cpu_ns as f64) / 1_000_000.0);
 
-        let worker_person_clicks = click_handle.join().unwrap()?;
-        Ok((worker_person_events, worker_person_clicks))
+        let (worker_person_clicks, clicks_cpu_ns, t_clicks_elapsed) = click_handle.join().unwrap()?;
+        Ok((worker_person_events, worker_person_clicks, clicks_cpu_ns, events_parse_cpu_ns, events_dedup_cpu_ns, t_events_parse_elapsed, t_events_dedup_elapsed, t_clicks_elapsed, total_raw_events))
     })?;
 
     // 9. Parallel Execution of Analytics across Person Shards using 16-byte integer-keyed local events
@@ -1144,7 +1268,7 @@ pub fn run_pipeline(
     let out_user_dir = output_dir.join("user_daily");
     fs::create_dir_all(&out_user_dir)?;
 
-    let partial_results: Vec<Result<HashMap<(u16, i32), CampaignDailyAccumulator>>> =
+    let partial_results: Vec<Result<(HashMap<(u16, i32), CampaignDailyAccumulator>, u64)>> =
         std::thread::scope(|scope| {
             let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
             let mut handles = Vec::new();
@@ -1156,7 +1280,8 @@ pub fn run_pipeline(
                 let start_shard = worker_idx * shards_per_worker;
                 let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
 
-                handles.push(scope.spawn(move || -> Result<HashMap<(u16, i32), CampaignDailyAccumulator>> {
+                handles.push(scope.spawn(move || -> Result<(HashMap<(u16, i32), CampaignDailyAccumulator>, u64)> {
+                    let cpu_start = thread_cpu_time_ns();
                     let mut user_rows = Vec::new();
                     let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
 
@@ -1232,16 +1357,19 @@ pub fn run_pipeline(
                         write_user_daily_shard(output_dir, worker_idx, user_rows)?;
                     }
 
-                    Ok(campaign_daily_map)
+                    let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
+                    Ok((campaign_daily_map, cpu_ns))
                 }));
             }
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
     let mut merged_campaign_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
+    let mut analytics_cpu_ns = 0u64;
 
     for c_map_res in partial_results {
-        let c_map = c_map_res?;
+        let (c_map, cpu_ns) = c_map_res?;
+        analytics_cpu_ns += cpu_ns;
         for (k, acc) in c_map {
             let entry = merged_campaign_map.entry(k).or_default();
             entry.sessions += acc.sessions;
@@ -1272,13 +1400,31 @@ pub fn run_pipeline(
             assisted_sessions: acc.assisted_sessions,
         });
     }
-    eprintln!("[analytics_sessions_sort_parquet] elapsed: {:.3}ms", t_analytics_start.elapsed().as_secs_f64() * 1000.0);
+    let t_analytics_elapsed = t_analytics_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[analytics_sessions_sort_parquet] wall: {:.3}ms, cpu: {:.3}ms", t_analytics_elapsed, (analytics_cpu_ns as f64) / 1_000_000.0);
 
     // 10. Write CampaignDaily Parquet File
     let t_parquet_start = std::time::Instant::now();
+    let camp_cpu_start = thread_cpu_time_ns();
     write_campaign_daily(output_dir, campaign_rows)?;
-    eprintln!("[campaign_parquet_write] elapsed: {:.3}ms", t_parquet_start.elapsed().as_secs_f64() * 1000.0);
-    eprintln!("[pipeline_total] elapsed: {:.3}ms", t_pipeline_start.elapsed().as_secs_f64() * 1000.0);
+    let camp_cpu_ns = thread_cpu_time_ns().saturating_sub(camp_cpu_start);
+    let t_parquet_elapsed = t_parquet_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[campaign_parquet_write] wall: {:.3}ms, cpu: {:.3}ms", t_parquet_elapsed, (camp_cpu_ns as f64) / 1_000_000.0);
+
+    let total_cpu_ns = id_cpu_ns + clicks_cpu_ns + events_parse_cpu_ns + events_dedup_cpu_ns + analytics_cpu_ns + camp_cpu_ns;
+    let cpu_per_event_us = (total_cpu_ns as f64) / (total_raw_events.max(1) as f64 * 1000.0);
+    eprintln!("[timing_breakdown] total_events: {}, wall: {:.3}ms, cpu_sum: {:.3}ms ({:.3} µs/event)",
+        total_raw_events,
+        t_pipeline_start.elapsed().as_secs_f64() * 1000.0,
+        (total_cpu_ns as f64) / 1_000_000.0,
+        cpu_per_event_us
+    );
+    eprintln!("  identity:           wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_identity_elapsed, (id_cpu_ns as f64) / 1_000_000.0, (id_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+    eprintln!("  events_parse:       wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_events_parse_elapsed, (events_parse_cpu_ns as f64) / 1_000_000.0, (events_parse_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+    eprintln!("  events_dedup:       wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_events_dedup_elapsed, (events_dedup_cpu_ns as f64) / 1_000_000.0, (events_dedup_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+    eprintln!("  clicks_total:       wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_clicks_elapsed, (clicks_cpu_ns as f64) / 1_000_000.0, (clicks_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+    eprintln!("  analytics_sessions: wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_analytics_elapsed, (analytics_cpu_ns as f64) / 1_000_000.0, (analytics_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
+    eprintln!("  campaign_write:     wall: {:>8.3}ms, cpu: {:>8.3}ms ({:>5.1}%)", t_parquet_elapsed, (camp_cpu_ns as f64) / 1_000_000.0, (camp_cpu_ns as f64) * 100.0 / total_cpu_ns.max(1) as f64);
 
     Ok(())
 }
@@ -1652,4 +1798,206 @@ pub fn write_campaign_daily(output_dir: &Path, rows: Vec<CampaignDailyRow>) -> R
     writer.write(&batch)?;
     writer.close()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "shopping-test-{}-{}-{}",
+                name,
+                std::process::id(),
+                TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_compact_id_long_ids_exactness() {
+        let id31 = b"u123456789012345678901234567890"; // exactly 31 bytes
+        let id32 = b"u1234567890123456789012345678901"; // exactly 32 bytes
+        let c31 = CompactId::from_bytes(id31);
+        let c32 = CompactId::from_bytes(id32);
+        assert_eq!(c31.as_bytes(), id31);
+        assert_eq!(c32.as_bytes(), id32);
+        assert_ne!(c31, c32);
+        assert!(c31 < c32);
+
+        // 40-byte IDs differing only at the 40th byte
+        let id40_a = b"uaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
+        let id40_b = b"uaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2";
+        let c40_a = CompactId::from_bytes(id40_a);
+        let c40_b = CompactId::from_bytes(id40_b);
+        assert_eq!(c40_a.as_bytes(), id40_a);
+        assert_eq!(c40_b.as_bytes(), id40_b);
+        assert_ne!(c40_a, c40_b);
+        assert!(c40_a < c40_b);
+
+        // 100-byte ID
+        let id100 = vec![b'x'; 100];
+        let c100 = CompactId::from_bytes(&id100);
+        assert_eq!(c100.as_bytes(), &id100[..]);
+    }
+
+    #[test]
+    fn test_pipeline_long_id_regression_two_40_byte_users() {
+        let temp = TempDir::new("long-user");
+        let data = temp.0.join("data");
+        let output = temp.0.join("output");
+        fs::create_dir_all(data.join("events")).unwrap();
+        fs::create_dir_all(data.join("clicks")).unwrap();
+        fs::create_dir_all(data.join("links")).unwrap();
+
+        fs::write(data.join("manifest.json"), r#"{"window_start":"2027-12-19T00:00:00Z","window_end":"2027-12-20T00:00:00Z"}"#).unwrap();
+        fs::write(data.join("products.csv"), "product_id,category\np1,electronics\n").unwrap();
+        fs::write(data.join("campaigns.csv"), "campaign_id,channel\nc1,social\n").unwrap();
+
+        // Two 40-byte user IDs differing only after byte 31
+        let u1 = "uaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
+        let u2 = "uaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2";
+        let events_csv = format!(
+            "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n\
+             e1,{},2027-12-19T10:00:00Z,2027-12-19T10:05:00Z,view,p1,\n\
+             e2,{},2027-12-19T11:00:00Z,2027-12-19T11:05:00Z,view,p1,\n",
+            u1, u2
+        );
+        fs::write(data.join("events/part-0.csv"), events_csv).unwrap();
+
+        run_pipeline(&data, &output, None, None, 2).unwrap();
+
+        // Read user_daily parquet
+        let user_daily_dir = output.join("user_daily");
+        let mut user_rows = Vec::new();
+        for entry in fs::read_dir(user_daily_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "parquet") {
+                let file = File::open(path).unwrap();
+                let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+                for batch in reader {
+                    let batch = batch.unwrap();
+                    let users = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+                    let events = batch.column(3).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+                    for i in 0..batch.num_rows() {
+                        user_rows.push((users.value(i).to_string(), events.value(i)));
+                    }
+                }
+            }
+        }
+        user_rows.sort();
+        assert_eq!(user_rows.len(), 2, "Expected 2 distinct user rows for 40-byte IDs, got: {:?}", user_rows);
+        assert_eq!(user_rows[0].0, u1);
+        assert_eq!(user_rows[0].1, 1);
+        assert_eq!(user_rows[1].0, u2);
+        assert_eq!(user_rows[1].1, 1);
+    }
+
+    #[test]
+    fn test_pipeline_long_click_id_tie_break_regression() {
+        let temp = TempDir::new("long-click");
+        let data = temp.0.join("data");
+        let output = temp.0.join("output");
+        fs::create_dir_all(data.join("events")).unwrap();
+        fs::create_dir_all(data.join("clicks")).unwrap();
+        fs::create_dir_all(data.join("links")).unwrap();
+
+        fs::write(data.join("manifest.json"), r#"{"window_start":"2027-12-19T00:00:00Z","window_end":"2027-12-20T00:00:00Z"}"#).unwrap();
+        fs::write(data.join("products.csv"), "product_id,category\np1,electronics\n").unwrap();
+        fs::write(data.join("campaigns.csv"), "campaign_id,channel\nc1,social\nc2,search\n").unwrap();
+
+        // 35-byte click IDs differing only after byte 31
+        let cl1 = "click_aaaaaaaaaaaaaaaaaaaaaaaaaa_1"; // byte 34 is '1'
+        let cl2 = "click_aaaaaaaaaaaaaaaaaaaaaaaaaa_2"; // byte 34 is '2'
+
+        // Same timestamp! cl1 is lexicographically smaller than cl2, so cl1 (c1) must win!
+        let clicks_csv = format!(
+            "click_id,user_id,campaign_id,ts\n\
+             {},u1,c2,2027-12-19T09:00:00Z\n\
+             {},u1,c1,2027-12-19T09:00:00Z\n",
+            cl2, cl1
+        );
+        fs::write(data.join("clicks/part-0.csv"), clicks_csv).unwrap();
+
+        let events_csv = "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n\
+                          e1,u1,2027-12-19T10:00:00Z,2027-12-19T10:05:00Z,purchase,p1,500\n";
+        fs::write(data.join("events/part-0.csv"), events_csv).unwrap();
+
+        run_pipeline(&data, &output, None, None, 2).unwrap();
+
+        // Verify campaign_daily: c1 must be credited with 1 session, c2 with 0
+        let c_file = File::open(output.join("campaign_daily/part-0.parquet")).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(c_file).unwrap().build().unwrap();
+        let mut credited = HashMap::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let camps = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+            let sess = batch.column(3).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+            for i in 0..batch.num_rows() {
+                credited.insert(camps.value(i).to_string(), sess.value(i));
+            }
+        }
+        assert_eq!(credited.get("c1"), Some(&1), "Expected c1 to win tie break with smaller click_id");
+    }
+
+    #[test]
+    fn test_pipeline_long_link_id_smallest_canonical() {
+        let temp = TempDir::new("long-link");
+        let data = temp.0.join("data");
+        let output = temp.0.join("output");
+        fs::create_dir_all(data.join("events")).unwrap();
+        fs::create_dir_all(data.join("clicks")).unwrap();
+        fs::create_dir_all(data.join("links")).unwrap();
+
+        fs::write(data.join("manifest.json"), r#"{"window_start":"2027-12-19T00:00:00Z","window_end":"2027-12-20T00:00:00Z"}"#).unwrap();
+        fs::write(data.join("products.csv"), "product_id,category\np1,electronics\n").unwrap();
+        fs::write(data.join("campaigns.csv"), "campaign_id,channel\nc1,social\n").unwrap();
+
+        // Long ID (>31 bytes) that is byte-wise smallest in component
+        let long_small = "u_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0"; // 34 bytes
+        let other = "u_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_9"; // 34 bytes
+
+        let links_csv = format!("{},{}\n", long_small, other);
+        fs::write(data.join("links/part-0.csv"), links_csv).unwrap();
+
+        let events_csv = format!(
+            "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n\
+             e1,{},2027-12-19T10:00:00Z,2027-12-19T10:05:00Z,view,p1,\n",
+            other
+        );
+        fs::write(data.join("events/part-0.csv"), events_csv).unwrap();
+
+        run_pipeline(&data, &output, None, None, 2).unwrap();
+
+        // Check user_daily: user_id must be the full 34-byte long_small!
+        let user_daily_dir = output.join("user_daily");
+        let mut user_names = Vec::new();
+        for entry in fs::read_dir(user_daily_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "parquet") {
+                let file = File::open(path).unwrap();
+                let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+                for batch in reader {
+                    let batch = batch.unwrap();
+                    let users = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+                    for i in 0..batch.num_rows() {
+                        user_names.push(users.value(i).to_string());
+                    }
+                }
+            }
+        }
+        assert_eq!(user_names, vec![long_small.to_string()]);
+    }
 }
