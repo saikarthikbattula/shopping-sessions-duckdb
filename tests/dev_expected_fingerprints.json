@@ -1,0 +1,16 @@
+{
+  "source": "Published dev-answer.zip CSVs",
+  "seed": 1,
+  "events": 1000000,
+  "clicks": 250000,
+  "tables": {
+    "user_daily": {
+      "rows": 117038,
+      "sha256": "7071132300ca8fdff8177f4198902e6314a86da1458550185809b834b564cccd"
+    },
+    "campaign_daily": {
+      "rows": 27400,
+      "sha256": "e20d170e7611c38ffa8f9d74e15bd44dba033d369f4c63f16e8c46ef592f23d6"
+    }
+  }
+}

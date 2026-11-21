@@ -1,6 +1,6 @@
 # Karthik handoff: DuckDB analytics and output tables
 
-Status: shared setup and entrypoint stub are present on the setup PR branch. Analytics logic is not implemented. This handoff has not been sent through an external messaging service.
+Status: analytics implemented at `92e2fe3` (merged PR #3), integrated with ingestion and validated on `codex/integration-validation` (PR #5). The shared contract is unchanged. The prompt below is the original assignment, retained for reference rather than a new implementation request. See [validation status](../VALIDATION.md).
 
 ## Using this with Codex
 

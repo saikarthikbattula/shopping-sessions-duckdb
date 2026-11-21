@@ -11,18 +11,18 @@ SCRATCH ?= $(CURDIR)/scratch
 GENERATOR ?= tools/generator/target/release/generate
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: setup test build fixtures fixtures-local generator dev run-dev run-local check-dev
+.PHONY: setup test build fixtures fixtures-local generator dev run-dev run-local check-dev check-dev-fingerprint
 
 ## Create an isolated environment with pinned runtime and checker dependencies
 setup:
 	python3 -m venv .venv
 	.venv/bin/python -m pip install -r requirements-dev.txt
 
-## Bootstrap/contract checks (not pipeline correctness checks)
+## Unit, contract, and independent staged/raw differential checks
 test:
 	$(PYTHON) -m unittest discover -s tests -v
 
-## Official fixtures without Docker once both workstreams are implemented
+## Official fixtures without Docker for the native development loop
 fixtures-local:
 	mkdir -p "$(SCRATCH)"
 	SCRATCH_DIR="$(SCRATCH)" $(PYTHON) scripts/run_fixtures.py $(FIXTURES) -- $(PYTHON) -m pipeline.pipeline
@@ -56,3 +56,7 @@ run-dev: build
 ANSWER ?= dev-answer
 check-dev:
 	$(PYTHON) scripts/compare.py out $(ANSWER)
+
+## Public seed-1 comparison without committing or downloading answer rows
+check-dev-fingerprint:
+	$(PYTHON) scripts/check_dev_fingerprints.py out

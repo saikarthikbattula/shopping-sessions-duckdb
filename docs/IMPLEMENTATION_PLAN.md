@@ -1,6 +1,6 @@
 # DuckDB competition implementation plan
 
-Status: shared setup is implemented on the setup PR branch. The starter, rules, 36 fixtures, generator source, shared contract, and connected entrypoint stubs are present. Three bootstrap integration checks pass. Workstream implementations, official output comparisons, and container validation remain outstanding; see [validation status](VALIDATION.md).
+Status: both workstreams are integrated on `codex/integration-validation`. All 26 unit/differential tests, 36 official fixtures, and both published dev tables pass. Linux amd64 container checks pass at 2 CPUs/2 GB. Full-scale 8-vCPU/24-GB performance validation and tuning remain; see [validation status](VALIDATION.md).
 
 ## Goal and source of truth
 
@@ -18,11 +18,11 @@ All implementation and integration changes use task branches and pull requests t
 | Karthik | DuckDB event/click processing, sessions, attribution, assists, both output tables | [Karthik](handoffs/KARTHIK.md) |
 | Integrator (Codex) | Starter import, shared contract module, orchestration, dependencies, Docker, independent oracle, full validation and submission candidate | [Shared contract](DATA_CONTRACT.md) |
 
-1. Completed: integrator imported the starter and rules, created the contract module and isolated environment, and pinned Arrow. Supplied fixtures and harness are unchanged. Both agent functions have explicit unimplemented stubs.
-2. Pranav and Karthik can implement independently against the shared contract. Karthik uses synthetic staged tables until ingestion is ready. Keep edits within each owner's files.
-3. Integrator wires `prepare_inputs` to `run_pipeline` in the starter entrypoint and runs all exact comparisons. Resolve correctness failures before tuning.
-4. Measure stages and resource usage across seeds and increasing sizes. Keep only optimizations that preserve exact results.
-5. Build and check the amd64 image under scorer flags, commit the validated candidate, and provide reproducible commands and evidence. The public repository exists; track submission remains a separate handoff action.
+1. Completed: imported the starter, rules and generator; supplied fixtures/harness remain unchanged.
+2. Completed: Pranav ingestion (`8336d0d`) and Karthik analytics (`92e2fe3`) use the unchanged shared contract.
+3. Completed: ordinary entrypoint passes fixtures and published dev-answer comparison; staged and raw-CSV differential checks pass.
+4. Partial: native dev timings, memory and sampled disk profile collected. Preparation dominates, especially timestamp parsing. Increasing-size and representative 8-vCPU/24-GB measurements remain before throughput claims or optimization decisions.
+5. Partial: Linux amd64 image builds and passes restricted-container fixtures/dev checks at 2 CPUs/2 GB in CI. Representative scorer-size limits and submission selection remain. Human maintainer reviews/merges; track submission is a separate action.
 
 ## Processing design
 
@@ -40,7 +40,7 @@ All implementation and integration changes use task branches and pull requests t
 - Add focused tests for parser syntax, CR/spaces, ASCII numbers, overflow and leading zeros, leap dates, earliest invalid duplicates, long link chains, unused minimum IDs, exact time boundaries, nested assist intervals, and byte-order ties.
 - Integrator builds a small independent reference implementation and runs randomized differential and input-order/repartitioning checks. Validate unique output keys, schemas, session/revenue conservation, and assisted-only rows.
 - Log stage timings to stderr; track peak memory and scratch use. Honor environment variables, reserve Python/Arrow headroom, and release intermediates. Output plus scratch must remain below 50 GB. Runtime has no network and root is read-only.
-- Use this ARM64 Mac for native development. Docker and the generator's Rust toolchain still need setup. Validate linux/amd64 separately; local/emulated timings do not predict scorer timings.
+- Use this ARM64 Mac for native development. The official generator builds with an isolated Rust 1.85 toolchain; Docker validation runs on Linux CI. Development/CI timings do not predict scorer timings.
 - Exercise multiple seeds and 20M/60M-event runs where local resources permit. Record any unrun validation explicitly. No paid cloud resources are authorized or assumed. Sub-60-second practice runtime is an objective, not a prediction.
 
 ## Handoff completion rule

@@ -1,6 +1,6 @@
 # Pranav handoff: strict ingestion and identity resolution
 
-Status: shared setup and entrypoint stub are present on the setup PR branch. Ingestion logic is not implemented. This handoff has not been sent through an external messaging service.
+Status: ingestion implemented at `8336d0d` (PR #4), integrated with analytics and validated on `codex/integration-validation` (PR #5). The shared contract is unchanged. The prompt below is the original assignment, retained for reference rather than a new implementation request. See [validation status](../VALIDATION.md).
 
 ## Using this with Cursor Mobile
 
