@@ -306,13 +306,31 @@ struct FastHasher(u64);
 impl Hasher for FastHasher {
     #[inline(always)]
     fn finish(&self) -> u64 {
-        self.0
+        // Mix all input bits before selecting table buckets or person shards.
+        let mut value = self.0;
+        value ^= value >> 33;
+        value = value.wrapping_mul(0xff51afd7ed558ccd);
+        value ^= value >> 33;
+        value = value.wrapping_mul(0xc4ceb9fe1a85ec53);
+        value ^ (value >> 33)
     }
     #[inline(always)]
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.wrapping_mul(1099511628211)) ^ u64::from(b);
+        // Read complete words to avoid a dependent multiply for every ID byte.
+        // HashMap and HashSet still compare full keys when hashes collide.
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            self.0 = (self.0 ^ word).rotate_left(27).wrapping_mul(0x3c79ac492ba7b653);
         }
+        let remainder = chunks.remainder();
+        if !remainder.is_empty() {
+            let mut tail = [0u8; 8];
+            tail[..remainder.len()].copy_from_slice(remainder);
+            let word = u64::from_le_bytes(tail);
+            self.0 = (self.0 ^ word).rotate_left(27).wrapping_mul(0x3c79ac492ba7b653);
+        }
+        self.0 ^= (bytes.len() as u64).wrapping_mul(0x1c69b3f74ac4ae35);
     }
     #[inline(always)]
     fn write_u128(&mut self, i: u128) {
@@ -353,8 +371,14 @@ fn hash_event_id_128(bytes: &[u8]) -> (u128, usize) {
     (((h1 as u128) << 64) | (h2 as u128), shard)
 }
 
+struct ResolvedPerson {
+    // Frozen once per linked ID, then copied directly into parsed rows.
+    id: CompactId,
+    shard: u8,
+}
+
 pub struct FrozenIdentity {
-    shards: Vec<HashMap<Box<[u8]>, Box<[u8]>, FastBuildHasher>>,
+    shards: Vec<HashMap<Box<[u8]>, ResolvedPerson, FastBuildHasher>>,
     unique_count: usize,
 }
 
@@ -374,24 +398,20 @@ impl FrozenIdentity {
         }
         let shard = get_shard_bytes(user);
         match self.shards[shard].get(user) {
-            Some(canon) => canon.as_ref(),
+            Some(canon) => canon.id.as_bytes(),
             None => user,
         }
     }
 
     #[inline(always)]
-    pub fn get_with_shard<'a>(&'a self, user: &'a [u8]) -> (&'a [u8], usize) {
+    fn get_compact_with_shard(&self, user: &[u8]) -> (CompactId, u8) {
         let shard = get_shard_bytes(user);
-        if self.unique_count == 0 {
-            return (user, shard);
-        }
-        match self.shards[shard].get(user) {
-            Some(canon) => {
-                let p_shard = get_shard_bytes(canon);
-                (canon.as_ref(), p_shard)
+        if self.unique_count != 0 {
+            if let Some(person) = self.shards[shard].get(user) {
+                return (person.id, person.shard);
             }
-            None => (user, shard),
         }
+        (CompactId::from_bytes(user), shard as u8)
     }
 
     pub fn len(&self) -> usize {
@@ -520,7 +540,7 @@ fn load_parallel_identity(links_dir: &Path, workers_count: usize) -> Result<Froz
         }
     }
 
-    let mut shards: Vec<HashMap<Box<[u8]>, Box<[u8]>, FastBuildHasher>> =
+    let mut shards: Vec<HashMap<Box<[u8]>, ResolvedPerson, FastBuildHasher>> =
         (0..NUM_SHARDS).map(|_| HashMap::with_hasher(FastBuildHasher)).collect();
 
     let unique_count = names.len();
@@ -530,7 +550,11 @@ fn load_parallel_identity(links_dir: &Path, workers_count: usize) -> Result<Froz
         let orig_name = names[i];
         if orig_name != best_name {
             let shard = get_shard_bytes(orig_name);
-            shards[shard].insert(orig_name.to_vec().into_boxed_slice(), best_name.to_vec().into_boxed_slice());
+            let person = ResolvedPerson {
+                id: CompactId::from_bytes(best_name),
+                shard: get_shard_bytes(best_name) as u8,
+            };
+            shards[shard].insert(orig_name.to_vec().into_boxed_slice(), person);
         }
     }
 
@@ -1061,8 +1085,7 @@ pub fn run_pipeline(
                                     let click_id = CompactId::from_bytes(click_id_bytes);
                                     let shard_idx = get_shard_bytes(click_id.as_bytes());
                                     let user_bytes = fields[1].unwrap();
-                                    let (person_bytes, p_shard) = ids.get_with_shard(user_bytes);
-                                    let person = CompactId::from_bytes(person_bytes);
+                                    let (person, p_shard) = ids.get_compact_with_shard(user_bytes);
                                     local_shards[shard_idx].push(RawClick {
                                         click_id,
                                         person,
@@ -1222,9 +1245,7 @@ pub fn run_pipeline(
 
                             let (eid_hash, shard_idx) = hash_event_id_128(event_id_bytes);
                             let (person, p_shard) = if let Some(user_bytes) = fields[1] {
-                                let (person_bytes, p_shard) = ids.get_with_shard(user_bytes);
-                                let person = CompactId::from_bytes(person_bytes);
-                                (person, p_shard as u8)
+                                ids.get_compact_with_shard(user_bytes)
                             } else {
                                 (CompactId::default(), 0u8)
                             };
@@ -1948,6 +1969,47 @@ pub fn write_campaign_daily(output_dir: &Path, rows: Vec<CampaignDailyRow>) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn word_hash_preserves_borrowed_key_lookup_at_chunk_boundaries() {
+        let mut map = std::collections::HashMap::with_hasher(super::FastBuildHasher);
+        let mut keys = Vec::new();
+        for length in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 100] {
+            for last in [0, b'a', b'z', 255] {
+                let mut key = vec![b'x'; length];
+                key.push(last);
+                let index = keys.len();
+                map.insert(key.clone().into_boxed_slice(), index);
+                keys.push(key);
+            }
+        }
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(map.get(key.as_slice()), Some(&index));
+        }
+        assert_eq!(map.len(), keys.len());
+    }
+    #[test]
+    fn date_cache_interleaving_collisions_and_invalid_dates() {
+        use crate::parsing::timestamp;
+        let mut cases = Vec::new();
+        for year in [1969, 1970, 2000, 2026, 2028, 2100] {
+            for month in [1, 2, 3, 12] {
+                for day in [1, 14, 28, 29, 30, 31] {
+                    cases.push(format!("{year:04}-{month:02}-{day:02}T23:59:59Z"));
+                }
+            }
+        }
+        cases.extend(["0000-01-01T00:00:00Z", "2026-02-29T00:00:00Z",
+                      "2028-02-29T24:00:00Z", "2028-02-29T00:60:00Z",
+                      "2028-02-29T00:00:60Z", "202x-02-28T00:00:00Z"]
+                     .map(str::to_owned));
+        for _ in 0..3 {
+            for value in &cases {
+                assert_eq!(super::parse_ts_bytes(value.as_bytes()),
+                           timestamp(Some(value.as_str())), "{value}");
+            }
+            cases.reverse();
+        }
+    }
     #[test]
     fn compact_event_offsets_preserve_full_timestamps() {
         assert_eq!(std::mem::size_of::<RawEvent>(), 64);
