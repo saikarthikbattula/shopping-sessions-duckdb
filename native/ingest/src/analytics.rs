@@ -193,13 +193,59 @@ impl Default for CompactId {
 struct RawEvent {
     eid_hash: u128,
     person: CompactId,
-    ingest_ms: i64,
-    ts_ms: i64,
+    // Usually signed millisecond offsets from window_start. For wide values,
+    // ingest_offset indexes the parsing worker's exact timestamp pairs.
+    ingest_offset: u32,
+    ts_offset: i32,
     price_cents: i32,
     p_shard: u8,
     cat_idx: u8,
-    is_purchase: bool,
-    is_valid: bool,
+    flags: u8,
+}
+
+const PURCHASE: u8 = 1;
+const VALID: u8 = 2;
+const WIDE_TIMES: u8 = 4;
+const NO_EVENT_TS: u8 = 8;
+
+#[derive(Default)]
+struct ParsedEvents {
+    shards: Vec<Vec<RawEvent>>,
+    wide_times: Vec<(i64, i64)>,
+}
+
+impl ParsedEvents {
+    #[inline]
+    fn encode_times(&mut self, start: i64, ingest: i64, ts: Option<i64>) -> (u32, i32, u8) {
+        let offset = |value: i64| {
+            value.checked_sub(start).and_then(|delta| i32::try_from(delta).ok())
+        };
+        let ingest_offset = offset(ingest);
+        let ts_offset = ts.map_or(Some(0), offset);
+        let missing = if ts.is_none() { NO_EVENT_TS } else { 0 };
+        if let (Some(ingest_offset), Some(ts_offset)) = (ingest_offset, ts_offset) {
+            (ingest_offset as u32, ts_offset, missing)
+        } else {
+            let index = u32::try_from(self.wide_times.len()).expect("too many wide timestamp pairs");
+            self.wide_times.push((ingest, ts.unwrap_or(i64::MIN)));
+            (index, 0, WIDE_TIMES | missing)
+        }
+    }
+
+    #[inline]
+    fn decode_times(&self, event: &RawEvent, start: i64) -> (i64, i64) {
+        if event.flags & WIDE_TIMES != 0 {
+            self.wide_times[event.ingest_offset as usize]
+        } else {
+            let ingest = start + i64::from(event.ingest_offset as i32);
+            let ts = if event.flags & NO_EVENT_TS != 0 {
+                i64::MIN
+            } else {
+                start + i64::from(event.ts_offset)
+            };
+            (ingest, ts)
+        }
+    }
 }
 
 struct RawClick {
@@ -1101,7 +1147,7 @@ pub fn run_pipeline(
         let next_chunk = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
 
-        let (worker_event_shards, events_parse_cpu_ns): (Vec<Vec<Vec<RawEvent>>>, u64) = std::thread::scope(|e_scope| {
+        let (worker_event_shards, events_parse_cpu_ns): (Vec<ParsedEvents>, u64) = std::thread::scope(|e_scope| {
             let mut handles = Vec::new();
             for _ in 0..workers_count {
                 let event_chunks = Arc::clone(&event_chunks);
@@ -1111,9 +1157,12 @@ pub fn run_pipeline(
                 let direct_products = &direct_products;
                 let ids = &ids;
 
-                handles.push(e_scope.spawn(move || -> Result<(Vec<Vec<RawEvent>>, u64)> {
+                handles.push(e_scope.spawn(move || -> Result<(ParsedEvents, u64)> {
                     let cpu_start = thread_cpu_time_ns();
-                    let mut local_shards: Vec<Vec<RawEvent>> = (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect();
+                    let mut parsed = ParsedEvents {
+                        shards: (0..NUM_SHARDS).map(|_| Vec::with_capacity(4096)).collect(),
+                        wide_times: Vec::new(),
+                    };
 
                     while !cancelled.load(Ordering::Relaxed) {
                         let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -1180,22 +1229,26 @@ pub fn run_pipeline(
                                 (CompactId::default(), 0u8)
                             };
 
-                            local_shards[shard_idx].push(RawEvent {
+                            let (ingest_offset, ts_offset, time_flags) =
+                                parsed.encode_times(window_start, ingest_ms, ts_ms_opt);
+                            let flags = time_flags
+                                | (if is_purchase { PURCHASE } else { 0 })
+                                | (if is_valid { VALID } else { 0 });
+                            parsed.shards[shard_idx].push(RawEvent {
                                 eid_hash,
                                 person,
-                                ingest_ms,
-                                ts_ms: ts_ms_opt.unwrap_or(i64::MIN),
+                                ingest_offset,
+                                ts_offset,
                                 price_cents: price_cents.unwrap_or(0) as i32,
                                 p_shard,
                                 cat_idx: category_idx,
-                                is_purchase,
-                                is_valid,
+                                flags,
                             });
                             Ok(())
                         })?;
                     }
                     let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
-                    Ok((local_shards, cpu_ns))
+                    Ok((parsed, cpu_ns))
                 }));
             }
             let mut results = Vec::new();
@@ -1203,13 +1256,13 @@ pub fn run_pipeline(
                 results.push(h.join().unwrap()?);
             }
             let total_cpu: u64 = results.iter().map(|(_, c)| *c).sum();
-            let shards: Vec<Vec<Vec<RawEvent>>> = results.into_iter().map(|(s, _)| s).collect();
+            let shards = results.into_iter().map(|(s, _)| s).collect();
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((shards, total_cpu))
         })?;
         let t_events_parse_elapsed = t_events_parse_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!("[events_parse] wall: {:.3}ms, cpu: {:.3}ms", t_events_parse_elapsed, (events_parse_cpu_ns as f64) / 1_000_000.0);
 
-        let total_raw_events: usize = worker_event_shards.iter().flat_map(|w| w.iter()).map(|s| s.len()).sum();
+        let total_raw_events: usize = worker_event_shards.iter().flat_map(|w| &w.shards).map(Vec::len).sum();
 
         // 6. Lock-Free Parallel Deduplication of Events and Routing to Person Shards
         let t_events_dedup_start = std::time::Instant::now();
@@ -1234,19 +1287,20 @@ pub fn run_pipeline(
                         dedup_map.clear();
 
                         for worker_shards in worker_event_shards {
-                            for ev in &worker_shards[shard_idx] {
+                            for ev in &worker_shards.shards[shard_idx] {
+                                let (ingest_ms, ts_ms) = worker_shards.decode_times(ev, window_start);
                                 match dedup_map.get_mut(&ev.eid_hash) {
                                     Some(existing) => {
-                                        if ev.ingest_ms < existing.ingest_ms {
+                                        if ingest_ms < existing.ingest_ms {
                                             *existing = EventDedupEntry {
                                                 person: ev.person,
-                                                ingest_ms: ev.ingest_ms,
-                                                ts_ms: ev.ts_ms,
+                                                ingest_ms,
+                                                ts_ms,
                                                 price_cents: ev.price_cents,
                                                 p_shard: ev.p_shard,
                                                 cat_idx: ev.cat_idx,
-                                                is_purchase: ev.is_purchase,
-                                                is_valid: ev.is_valid,
+                                                is_purchase: ev.flags & PURCHASE != 0,
+                                                is_valid: ev.flags & VALID != 0,
                                             };
                                         }
                                     }
@@ -1255,13 +1309,13 @@ pub fn run_pipeline(
                                             ev.eid_hash,
                                             EventDedupEntry {
                                                 person: ev.person,
-                                                ingest_ms: ev.ingest_ms,
-                                                ts_ms: ev.ts_ms,
+                                                ingest_ms,
+                                                ts_ms,
                                                 price_cents: ev.price_cents,
                                                 p_shard: ev.p_shard,
                                                 cat_idx: ev.cat_idx,
-                                                is_purchase: ev.is_purchase,
-                                                is_valid: ev.is_valid,
+                                                is_purchase: ev.flags & PURCHASE != 0,
+                                                is_valid: ev.flags & VALID != 0,
                                             },
                                         );
                                     }
@@ -1272,7 +1326,7 @@ pub fn run_pipeline(
                         for entry in dedup_map.values() {
                             if entry.is_valid && entry.ts_ms != i64::MIN {
                                 let ts = entry.ts_ms;
-                                if entry.ingest_ms - ts <= 86_400_000 {
+                                if entry.ingest_ms.saturating_sub(ts) <= 86_400_000 {
                                     local_person_shards[entry.p_shard as usize].push(RawPersonEvent {
                                         person: entry.person,
                                         ts_ms: ts,
@@ -1397,8 +1451,13 @@ pub fn run_pipeline(
                             }
                         }
 
-                        // Ultra-fast packed 64-bit integer key sort: (p_idx << 32 | ts_offset) compiles to single cmp instruction
-                        local_events.sort_unstable_by_key(|e| ((e.p_idx as u64) << 32) | ((e.ts_ms - window_start) as u32 as u64));
+                        if window_end.abs_diff(window_start) <= u64::from(u32::MAX) + 1 {
+                            local_events.sort_unstable_by_key(|e| {
+                                (u64::from(e.p_idx) << 32) | (e.ts_ms - window_start) as u64
+                            });
+                        } else {
+                            local_events.sort_unstable_by_key(|e| (e.p_idx, e.ts_ms));
+                        }
                         local_clicks.sort_unstable_by(|a, b| {
                             (a.p_idx, a.ts_ms, a.click_id.as_bytes()).cmp(&(b.p_idx, b.ts_ms, b.click_id.as_bytes()))
                         });
@@ -1873,6 +1932,35 @@ pub fn write_campaign_daily(output_dir: &Path, rows: Vec<CampaignDailyRow>) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_event_offsets_preserve_full_timestamps() {
+        assert_eq!(std::mem::size_of::<RawEvent>(), 64);
+        let start = 1_790_812_800_000;
+        let mut parsed = ParsedEvents::default();
+        for (ingest, ts, wide) in [
+            (start - 1, Some(start + 1), false),
+            (start + i64::from(i32::MAX), None, false),
+            (start + i64::from(i32::MIN), Some(start), false),
+            (start + i64::from(i32::MAX) + 1, Some(start), true),
+            (start, Some(start + i64::from(u32::MAX) + 1), true),
+            (i64::MIN, None, true),
+            (start, Some(i64::MAX), true),
+        ] {
+            let (ingest_offset, ts_offset, flags) = parsed.encode_times(start, ingest, ts);
+            let event = RawEvent {
+                eid_hash: 0,
+                person: CompactId::default(),
+                ingest_offset,
+                ts_offset,
+                price_cents: 0,
+                p_shard: 0,
+                cat_idx: 0,
+                flags,
+            };
+            assert_eq!(flags & WIDE_TIMES != 0, wide);
+            assert_eq!(parsed.decode_times(&event, start), (ingest, ts.unwrap_or(i64::MIN)));
+        }
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
