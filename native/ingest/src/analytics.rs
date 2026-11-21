@@ -284,14 +284,29 @@ struct RawPersonClick {
     click_id: CompactId,
 }
 
-// Ultra-compact 16-byte event for instant integer-keyed sorting
+// Sixteen-byte local record for person/timestamp sorting.
 #[derive(Clone, Copy)]
 struct LocalEvent {
     ts_ms: i64,
-    price_cents: i32,
     p_idx: u32,
-    cat_idx: u8,
-    is_purchase: bool,
+    price_category: u32,
+}
+
+impl LocalEvent {
+    // Only validated events reach this representation. Purchases have prices
+    // 1..=10_000_000 (24 bits); non-purchases carry zero.
+    fn new(event: &RawPersonEvent, p_idx: u32) -> Self {
+        let price = if event.is_purchase { event.price_cents as u32 } else { 0 };
+        debug_assert!(price <= 10_000_000);
+        Self {
+            ts_ms: event.ts_ms,
+            p_idx,
+            price_category: price | (u32::from(event.cat_idx) << 24),
+        }
+    }
+
+    fn price(&self) -> u32 { self.price_category & 0x00ff_ffff }
+    fn category(&self) -> usize { (self.price_category >> 24) as usize }
 }
 
 #[derive(Clone, Copy)]
@@ -692,10 +707,9 @@ fn parse_ts_bytes(b: &[u8]) -> Option<i64> {
 }
 
 #[inline(always)]
-fn parse_window_ts_bytes(b: Option<&[u8]>, start: i128, end: i128) -> Option<i64> {
+fn parse_window_ts_bytes(b: Option<&[u8]>, start: i64, end: i64) -> Option<i64> {
     let ts = parse_ts_bytes(b?)?;
-    let ts_i128 = i128::from(ts);
-    if ts_i128 >= start && ts_i128 < end {
+    if ts >= start && ts < end {
         Some(ts)
     } else {
         None
@@ -1075,8 +1089,8 @@ pub fn run_pipeline(
                                 };
                                 let ts_ms = parse_window_ts_bytes(
                                     fields[3],
-                                    i128::from(window_start) - 604_800_000,
-                                    i128::from(window_end),
+                                    window_start - 604_800_000,
+                                    window_end,
                                 );
                                 let camp_idx_opt = fields[2].and_then(|c| campaign_to_idx.get(&CompactId::from_bytes(c)).copied());
                                 let is_valid = fields[1].is_some() && ts_ms.is_some() && camp_idx_opt.is_some();
@@ -1201,7 +1215,7 @@ pub fn run_pipeline(
                                 return Ok(());
                             };
                             let ingest_ms = parse_ts_bytes(fields[3].unwrap_or(&[])).ok_or(InvalidIngest)?;
-                            let ts_ms_opt = parse_window_ts_bytes(fields[2], i128::from(window_start), i128::from(window_end));
+                            let ts_ms_opt = parse_window_ts_bytes(fields[2], window_start, window_end);
                             let is_purchase = fields[4] == Some(b"purchase");
                             let price_cents = if is_purchase {
                                 parse_unsigned_bytes(fields[6], 10000000).filter(|v| *v > 0)
@@ -1384,7 +1398,7 @@ pub fn run_pipeline(
     let out_user_dir = output_dir.join("user_daily");
     fs::create_dir_all(&out_user_dir)?;
 
-    let partial_results: Vec<Result<(HashMap<(u16, i32), CampaignDailyAccumulator>, u64)>> =
+    let partial_results: Vec<Result<(HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>, u64)>> =
         std::thread::scope(|scope| {
             let shards_per_worker = (NUM_SHARDS + workers_count - 1) / workers_count;
             let mut handles = Vec::new();
@@ -1396,14 +1410,15 @@ pub fn run_pipeline(
                 let start_shard = worker_idx * shards_per_worker;
                 let end_shard = (start_shard + shards_per_worker).min(NUM_SHARDS);
 
-                handles.push(scope.spawn(move || -> Result<(HashMap<(u16, i32), CampaignDailyAccumulator>, u64)> {
+                handles.push(scope.spawn(move || -> Result<(HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>, u64)> {
                     let cpu_start = thread_cpu_time_ns();
                     let mut user_rows = Vec::new();
                     let profiling = std::env::var_os("NATIVE_PROFILE").as_deref() == Some(std::ffi::OsStr::new("1"));
                     let worker_started = profiling.then(std::time::Instant::now);
                     let mut sort_time = std::time::Duration::ZERO;
                     let mut attribution_time = std::time::Duration::ZERO;
-                    let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
+                    let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher> =
+                        HashMap::with_hasher(FastBuildHasher);
 
                     let mut shard_person_map: HashMap<CompactId, u32, FastBuildHasher> =
                         HashMap::with_capacity_and_hasher(16384, FastBuildHasher);
@@ -1440,13 +1455,7 @@ pub fn run_pipeline(
                                     has_last = true;
                                     idx
                                 };
-                                local_events.push(LocalEvent {
-                                    ts_ms: ev.ts_ms,
-                                    price_cents: ev.price_cents,
-                                    p_idx,
-                                    cat_idx: ev.cat_idx,
-                                    is_purchase: ev.is_purchase,
-                                });
+                                local_events.push(LocalEvent::new(ev, p_idx));
                             }
                         }
 
@@ -1526,7 +1535,8 @@ pub fn run_pipeline(
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-    let mut merged_campaign_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
+    let mut merged_campaign_map: HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher> =
+        HashMap::with_hasher(FastBuildHasher);
     let mut analytics_cpu_ns = 0u64;
 
     for c_map_res in partial_results {
@@ -1596,9 +1606,10 @@ fn execute_shard_local(
     clicks: &[LocalClick],
     person_names: &[CompactId],
     category_names: &[String],
-) -> (Vec<UserDailyRow>, HashMap<(u16, i32), CampaignDailyAccumulator>) {
+) -> (Vec<UserDailyRow>, HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>) {
     let mut user_rows = Vec::new();
-    let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator> = HashMap::new();
+    let mut campaign_daily_map: HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher> =
+        HashMap::with_hasher(FastBuildHasher);
 
     let mut ev_start = 0;
     let mut cl_cursor = 0;
@@ -1756,7 +1767,7 @@ fn process_person_session(
     day_revenue: &mut i64,
     day_has_purchases: &mut bool,
     cat_rev: &mut [i64; 256],
-    campaign_daily_map: &mut HashMap<(u16, i32), CampaignDailyAccumulator>,
+    campaign_daily_map: &mut HashMap<(u16, i32), CampaignDailyAccumulator, FastBuildHasher>,
     category_names: &[String],
     person: CompactId,
     user_rows: &mut Vec<UserDailyRow>,
@@ -1794,10 +1805,10 @@ fn process_person_session(
     let mut session_purchases = 0i64;
 
     for ev in session_events {
-        if ev.is_purchase {
+        if ev.price() != 0 {
             session_purchases += 1;
-            session_revenue += i64::from(ev.price_cents);
-            cat_rev[ev.cat_idx as usize] += i64::from(ev.price_cents);
+            session_revenue += i64::from(ev.price());
+            cat_rev[ev.category()] += i64::from(ev.price());
             *day_has_purchases = true;
         }
     }
@@ -1969,6 +1980,37 @@ pub fn write_campaign_daily(output_dir: &Path, rows: Vec<CampaignDailyRow>) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_event_is_sixteen_bytes_and_preserves_validated_values() {
+        assert_eq!(std::mem::size_of::<super::LocalEvent>(), 16);
+        for price in [1, 250, 10_000_000] {
+            for category in [0, 19, 255] {
+                let input = super::RawPersonEvent {
+                    person: super::CompactId::default(),
+                    ts_ms: i64::MAX,
+                    price_cents: price,
+                    cat_idx: category,
+                    is_purchase: true,
+                };
+                let event = super::LocalEvent::new(&input, u32::MAX);
+                assert_eq!(event.price(), price as u32);
+                assert_eq!(event.category(), category as usize);
+                assert_eq!(event.p_idx, u32::MAX);
+                assert_eq!(event.ts_ms, i64::MAX);
+            }
+        }
+        let input = super::RawPersonEvent {
+            person: super::CompactId::default(),
+            ts_ms: i64::MIN,
+            price_cents: 0,
+            cat_idx: 255,
+            is_purchase: false,
+        };
+        let event = super::LocalEvent::new(&input, 0);
+        assert_eq!(event.price(), 0);
+        assert_eq!(event.category(), 255);
+        assert_eq!(event.ts_ms, i64::MIN);
+    }
     #[test]
     fn word_hash_preserves_borrowed_key_lookup_at_chunk_boundaries() {
         let mut map = std::collections::HashMap::with_hasher(super::FastBuildHasher);
