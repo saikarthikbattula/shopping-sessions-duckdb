@@ -4,6 +4,12 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import tempfile
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from scripts.benchmark_cpu_candidate import compare_outputs
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('profile_native_cpu', ROOT / 'scripts/profile_native_cpu.py')
@@ -12,6 +18,18 @@ spec.loader.exec_module(profile)
 
 
 class CpuProfileTests(unittest.TestCase):
+    def test_duckdb_comparison_checks_duplicates_and_both_tables(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            left, right = (Path(temporary) / arm for arm in ('left', 'right'))
+            for root in (left, right):
+                for table in ('user_daily', 'campaign_daily'):
+                    (root / table).mkdir(parents=True)
+                    pq.write_table(pa.table({'id': ['a', 'a', 'b']}), root / table / 'part.parquet')
+            compare_outputs(left, right)
+            pq.write_table(pa.table({'id': ['a', 'b', 'b']}), right / 'campaign_daily/part.parquet')
+            with self.assertRaisesRegex(RuntimeError, 'campaign_daily: 2 differing rows'):
+                compare_outputs(left, right)
+
     def test_resource_measurement_uses_user_plus_system(self):
         result = SimpleNamespace(returncode=0, stderr='total_events: 1071554\ncpu_sum: 999ms\n'
                                  'CPU_MEASURE 1.21 0.32 0.81 1234 2 876\n')

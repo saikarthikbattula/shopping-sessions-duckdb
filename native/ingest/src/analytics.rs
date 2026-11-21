@@ -408,9 +408,14 @@ impl ShardJobs {
 
 #[inline(always)]
 fn get_shard_bytes(key: &[u8]) -> usize {
+    (identity_hash(key) as usize) & (NUM_SHARDS - 1)
+}
+
+#[inline(always)]
+fn identity_hash(key: &[u8]) -> u64 {
     let mut hasher = FastBuildHasher.build_hasher();
     hasher.write(key);
-    (hasher.finish() as usize) & (NUM_SHARDS - 1)
+    hasher.finish()
 }
 
 #[inline(always)]
@@ -470,15 +475,72 @@ struct ResolvedPerson {
     shard: u8,
 }
 
+// Common short aliases and canonical IDs fit in one contiguous 33-byte cell.
+// Zero key length marks an empty cell; valid link endpoints are nonempty.
+#[derive(Clone, Copy, Default)]
+struct ShortIdentitySlot {
+    key_len: u8,
+    key: [u8; 15],
+    canonical_len: u8,
+    canonical: [u8; 15],
+    person_shard: u8,
+}
+
+struct ShortIdentityTable {
+    slots: Vec<ShortIdentitySlot>,
+}
+
+impl ShortIdentityTable {
+    fn with_entries(entries: usize) -> Self {
+        let capacity = if entries == 0 { 0 } else {
+            // At most 70% occupied, with an empty cell terminating every miss.
+            (entries + entries.div_ceil(2)).next_power_of_two()
+        };
+        Self { slots: vec![ShortIdentitySlot::default(); capacity] }
+    }
+
+    fn insert(&mut self, key: &[u8], canonical: &[u8], hash: u64) {
+        debug_assert!(!key.is_empty() && key.len() <= 15 && canonical.len() <= 15);
+        let mask = self.slots.len() - 1;
+        let mut index = hash as usize & mask;
+        while self.slots[index].key_len != 0 { index = (index + 1) & mask; }
+        let slot = &mut self.slots[index];
+        slot.key_len = key.len() as u8;
+        slot.key[..key.len()].copy_from_slice(key);
+        slot.canonical_len = canonical.len() as u8;
+        slot.canonical[..canonical.len()].copy_from_slice(canonical);
+        slot.person_shard = get_shard_bytes(canonical) as u8;
+    }
+
+    #[inline(always)]
+    fn get(&self, key: &[u8], hash: u64) -> Option<&ShortIdentitySlot> {
+        if self.slots.is_empty() || key.is_empty() || key.len() > 15 { return None; }
+        let mask = self.slots.len() - 1;
+        let mut index = hash as usize & mask;
+        loop {
+            let slot = &self.slots[index];
+            if slot.key_len == 0 { return None; }
+            if slot.key_len as usize == key.len() && &slot.key[..key.len()] == key {
+                return Some(slot);
+            }
+            index = (index + 1) & mask;
+        }
+    }
+}
+
 pub struct FrozenIdentity {
+    short: ShortIdentityTable,
     shards: Vec<HashMap<Box<[u8]>, ResolvedPerson, FastBuildHasher>>,
+    fallback_count: usize,
     unique_count: usize,
 }
 
 impl FrozenIdentity {
     pub fn empty() -> Self {
         Self {
+            short: ShortIdentityTable::with_entries(0),
             shards: (0..NUM_SHARDS).map(|_| HashMap::with_hasher(FastBuildHasher)).collect(),
+            fallback_count: 0,
             unique_count: 0,
         }
     }
@@ -489,7 +551,11 @@ impl FrozenIdentity {
         if self.unique_count == 0 {
             return user;
         }
-        let shard = get_shard_bytes(user);
+        let hash = identity_hash(user);
+        if let Some(slot) = self.short.get(user, hash) {
+            return &slot.canonical[..slot.canonical_len as usize];
+        }
+        let shard = hash as usize & (NUM_SHARDS - 1);
         match self.shards[shard].get(user) {
             Some(canon) => canon.id.as_bytes(),
             None => user,
@@ -498,8 +564,12 @@ impl FrozenIdentity {
 
     #[inline(always)]
     fn get_compact_with_shard(&self, user: &[u8]) -> (CompactId, u8) {
-        let shard = get_shard_bytes(user);
-        if self.unique_count != 0 {
+        let hash = identity_hash(user);
+        let shard = hash as usize & (NUM_SHARDS - 1);
+        if let Some(slot) = self.short.get(user, hash) {
+            return (CompactId::from_bytes(&slot.canonical[..slot.canonical_len as usize]), slot.person_shard);
+        }
+        if self.fallback_count != 0 {
             if let Some(person) = self.shards[shard].get(user) {
                 return (person.id, person.shard);
             }
@@ -637,22 +707,35 @@ fn load_parallel_identity(links_dir: &Path, workers_count: usize) -> Result<Froz
         (0..NUM_SHARDS).map(|_| HashMap::with_hasher(FastBuildHasher)).collect();
 
     let unique_count = names.len();
+    let mut short_entries = Vec::new();
+    let mut fallback_count = 0;
     for i in 0..names.len() {
         let root = find(i as u32, &mut parents);
         let best_name = names[minima[root as usize] as usize];
         let orig_name = names[i];
         if orig_name != best_name {
+            if orig_name.len() <= 15 && best_name.len() <= 15 {
+                short_entries.push((orig_name, best_name));
+                continue;
+            }
             let shard = get_shard_bytes(orig_name);
             let person = ResolvedPerson {
                 id: CompactId::from_bytes(best_name),
                 shard: get_shard_bytes(best_name) as u8,
             };
             shards[shard].insert(orig_name.to_vec().into_boxed_slice(), person);
+            fallback_count += 1;
         }
     }
 
+    let mut short = ShortIdentityTable::with_entries(short_entries.len());
+    for (key, canonical) in short_entries {
+        short.insert(key, canonical, identity_hash(key));
+    }
     Ok(FrozenIdentity {
+        short,
         shards,
+        fallback_count,
         unique_count,
     })
 }
@@ -2501,6 +2584,41 @@ pub fn write_campaign_daily(output_dir: &Path, rows: Vec<CampaignDailyRow>) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frozen_short_identity_checks_full_keys_through_collisions() {
+        let mut table = super::ShortIdentityTable::with_entries(3);
+        table.insert(b"abcdefghijklmno", b"canonical", 7);
+        table.insert(b"abcdefghijklmnp", b"other", 7);
+        table.insert(b"x", b"z", 7);
+        let first = table.get(b"abcdefghijklmno", 7).unwrap();
+        assert_eq!(&first.canonical[..first.canonical_len as usize], b"canonical");
+        let second = table.get(b"abcdefghijklmnp", 7).unwrap();
+        assert_eq!(&second.canonical[..second.canonical_len as usize], b"other");
+        assert!(table.get(b"abcdefghijklmnn", 7).is_none());
+        assert!(table.get(b"", 7).is_none());
+        assert!(table.get(b"abcdefghijklmnop", 7).is_none());
+        assert_eq!(std::mem::size_of::<super::ShortIdentitySlot>(), 33);
+    }
+
+    #[test]
+    fn frozen_identity_retains_long_canonical_and_long_alias_fallbacks() {
+        let temporary = TempDir::new("frozen-identity-fallback");
+        let links = temporary.0.join("links");
+        std::fs::create_dir_all(&links).unwrap();
+        let long_a = format!("{}a", "a".repeat(39));
+        let long_b = format!("{}b", "a".repeat(39));
+        std::fs::write(links.join("part.csv"),
+            format!("user_id_a,user_id_b\nz,{long_a}\n{long_b},b\nshort,alpha\n")).unwrap();
+        let ids = super::load_parallel_identity(&links, 2).unwrap();
+        for (raw, expected) in [("z", long_a.as_str()), (long_b.as_str(), long_b.as_str()),
+                                ("b", long_b.as_str()), ("short", "alpha"), ("unlinked", "unlinked")] {
+            let (person, shard) = ids.get_compact_with_shard(raw.as_bytes());
+            assert_eq!(person.as_bytes(), expected.as_bytes());
+            assert_eq!(ids.get(raw.as_bytes()), expected.as_bytes());
+            assert_eq!(shard as usize, super::get_shard_bytes(expected.as_bytes()));
+        }
+    }
+
     #[test]
     fn chunk_buffer_cannot_read_past_assigned_bytes() {
         use std::io::{BufRead, Cursor};
