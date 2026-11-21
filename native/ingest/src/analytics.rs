@@ -1290,6 +1290,7 @@ fn bounded_chunk_reader<R: Read>(reader: R, length: u64) -> BufReader<std::io::T
     BufReader::with_capacity(512 * 1024, reader.take(length))
 }
 
+#[allow(dead_code)] // Retained as the scalar control used by CPU ablations.
 fn for_each_chunk_line(
     chunk: &Chunk,
     cancelled: &AtomicBool,
@@ -1333,6 +1334,58 @@ fn for_each_chunk_line(
         consume(&carry)?;
     }
     Ok(())
+}
+
+fn for_each_csv_reader<const N: usize>(
+    reader: &mut impl BufRead,
+    cancelled: &AtomicBool,
+    has_avx2: bool,
+    mut consume: impl FnMut(&[Option<&[u8]>; N]) -> Result<()>,
+) -> Result<()> {
+    let mut carry = Vec::new();
+    while !cancelled.load(Ordering::Relaxed) {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() { break; }
+        let available = buf.len();
+        let mut start = 0;
+        if !carry.is_empty() {
+            if let Some(end) = memchr::memchr(b'\n', buf) {
+                carry.extend_from_slice(&buf[..end]);
+                let mut fields = [None; N];
+                if parse_csv_line_fast(&carry, &mut fields, has_avx2) {
+                    consume(&fields)?;
+                }
+                carry.clear();
+                start = end + 1;
+            } else {
+                carry.extend_from_slice(buf);
+                reader.consume(available);
+                continue;
+            }
+        }
+        let completed = crate::csv_batch::scan_rows::<_, N>(&buf[start..], |fields| consume(fields))?;
+        carry.extend_from_slice(&buf[start + completed..]);
+        reader.consume(available);
+    }
+    if !carry.is_empty() {
+        let mut fields = [None; N];
+        if parse_csv_line_fast(&carry, &mut fields, has_avx2) {
+            consume(&fields)?;
+        }
+    }
+    Ok(())
+}
+
+fn for_each_chunk_csv<const N: usize>(
+    chunk: &Chunk,
+    cancelled: &AtomicBool,
+    has_avx2: bool,
+    consume: impl FnMut(&[Option<&[u8]>; N]) -> Result<()>,
+) -> Result<()> {
+    let mut file = File::open(&chunk.path)?;
+    file.seek(SeekFrom::Start(chunk.start))?;
+    let mut reader = bounded_chunk_reader(file, chunk.end - chunk.start);
+    for_each_csv_reader(&mut reader, cancelled, has_avx2, consume)
 }
 
 pub fn run_pipeline(
@@ -1512,11 +1565,7 @@ pub fn run_pipeline(
                             let Some(chunk) = click_chunks.get(idx) else {
                                 break;
                             };
-                            for_each_chunk_line(chunk, &cancelled, |line| {
-                                let mut fields = [None; 4];
-                                if !parse_csv_line_fast(line, &mut fields, has_avx2) {
-                                    return Ok(());
-                                }
+                            for_each_chunk_csv::<4>(chunk, &cancelled, has_avx2, |fields| {
                                 let Some(click_id_bytes) = fields[0] else {
                                     return Ok(());
                                 };
@@ -1674,11 +1723,7 @@ pub fn run_pipeline(
                         let Some(chunk) = event_chunks.get(idx) else {
                             break;
                         };
-                        for_each_chunk_line(chunk, &cancelled, |line| {
-                            let mut fields = [None; 7];
-                            if !parse_csv_line_fast(line, &mut fields, has_avx2) {
-                                return Ok(());
-                            }
+                        for_each_chunk_csv::<7>(chunk, &cancelled, has_avx2, |fields| {
                             let Some(event_id_bytes) = fields[0] else {
                                 return Ok(());
                             };
@@ -2586,6 +2631,72 @@ pub fn write_campaign_daily(output_dir: &Path, rows: Vec<CampaignDailyRow>) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn batched_csv_reader_matches_line_parser_at_every_small_buffer_cut() {
+        use std::io::{BufReader, Cursor};
+        let data = "a,b,c,d\n\"a\",\"b\",\"\",d\n\"x\"q,b,c,d\n\"a\"\"b\",c,d,e\n\n\"λ\",b,c,\"d\r\"\nlast,b,c,d".as_bytes();
+        let mut expected = Vec::new();
+        for line in data.split(|&b| b == b'\n') {
+            let mut fields = [None; 4];
+            if super::parse_csv_line_fast(line, &mut fields, false) {
+                expected.push(fields.map(|value| value.map(<[u8]>::to_vec)));
+            }
+        }
+        for capacity in 1..=65 {
+            let mut reader = BufReader::with_capacity(capacity, Cursor::new(data));
+            let mut actual = Vec::new();
+            super::for_each_csv_reader::<4>(&mut reader, &AtomicBool::new(false), false, |fields| {
+                actual.push(fields.map(|value| value.map(<[u8]>::to_vec)));
+                Ok(())
+            }).unwrap();
+            assert_eq!(actual, expected, "buffer capacity {capacity}");
+        }
+    }
+
+    #[test]
+    fn batched_csv_reader_preserves_long_rows_and_exact_chunk_bounds() {
+        use std::io::{BufReader, Cursor};
+        let mut data = vec![b'x'; 512 * 1024 + 37];
+        data.extend_from_slice(b",b,c,d\nlast,b,c,d");
+        for capacity in [31, 512 * 1024] {
+            let mut reader = BufReader::with_capacity(capacity, Cursor::new(&data));
+            let mut lengths = Vec::new();
+            super::for_each_csv_reader::<4>(&mut reader, &AtomicBool::new(false), false, |fields| {
+                lengths.push(fields[0].unwrap().len());
+                Ok(())
+            }).unwrap();
+            assert_eq!(lengths, [512 * 1024 + 37, 4]);
+        }
+        let mut reader = super::bounded_chunk_reader(Cursor::new(b"a,b,c,d\nhidden,b,c,d\n"), 8);
+        let mut rows = 0;
+        super::for_each_csv_reader::<4>(&mut reader, &AtomicBool::new(false), false, |_| {
+            rows += 1;
+            Ok(())
+        }).unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn batched_csv_reader_propagates_errors_and_honors_cancellation() {
+        use std::io::{BufReader, Cursor, Read};
+        let mut reader = BufReader::new(Cursor::new(b"a,b,c,d\ne,f,g,h\n"));
+        let error = super::for_each_csv_reader::<4>(&mut reader, &AtomicBool::new(false), false,
+            |_| Err("consumer failure".into())).unwrap_err();
+        assert_eq!(error.to_string(), "consumer failure");
+
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("read failure"))
+            }
+        }
+        let error = super::for_each_csv_reader::<4>(&mut BufReader::new(Broken), &AtomicBool::new(false), false,
+            |_| panic!("read failure must propagate before a row")).unwrap_err();
+        assert_eq!(error.to_string(), "read failure");
+        super::for_each_csv_reader::<4>(&mut BufReader::new(Broken), &AtomicBool::new(true), false,
+            |_| panic!("cancelled reader must not emit rows")).unwrap();
+    }
+
     #[test]
     fn frozen_short_identity_checks_full_keys_through_collisions() {
         let mut table = super::ShortIdentityTable::with_entries(3);

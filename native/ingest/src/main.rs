@@ -1,4 +1,5 @@
 mod analytics;
+mod csv_batch;
 mod identity;
 mod parsing;
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
