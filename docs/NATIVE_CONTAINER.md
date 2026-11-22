@@ -21,7 +21,8 @@ candidate, but its Cascade Lake flags require a compatible AVX-512 x86_64 CPU.
 It is isolated from the default image and must pass its own correctness/performance
 gates before selection.
 
-Docker is unavailable in this local environment. CI must build the new images,
+GitHub Actions workflows were removed at `29cf0f5`. On a Linux Docker host,
+maintainers must build the new images,
 verify architecture, size, absence of Python and static linkage, and run official
 fixtures/dev fingerprints under the restricted runner. Historical Python-backed
 image results do not validate this new image.

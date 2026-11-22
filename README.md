@@ -19,7 +19,7 @@ specialized generator fast path's invariants do not hold.
 - `tests/`: local output/schema checks and small independent brute-force oracles.
 - `scripts/`: fixture, dev-answer, performance and restricted-container runners.
 - `docs/`: current contracts and performance evidence; old workstream notes are
-  explicitly marked historical.
+  indexed in [docs/README.md](docs/README.md) with historical notes identified.
 
 ## Build and run
 
@@ -58,8 +58,9 @@ make fixtures                # restricted linux/amd64 container fixtures
 
 Generated datasets, outputs, local environments and build artifacts stay outside
 Git and the image. Obtain dev-answer.zip from the competition; never alter official
-answers to pass a test. Docker is unavailable on the current Mac, so the new image
-must pass Linux CI before it is selected for use.
+answers to pass a test. Linux image and restricted-container checks remain
+required before selecting an image for use. GitHub Actions workflows were removed
+at `29cf0f5`; run the checks manually on a compatible host.
 
 ## Performance and candidate evaluation
 
@@ -69,7 +70,7 @@ performance. [Benchmark instructions](docs/BENCHMARKING.md) describe repeatable
 whole-process measurements and exact comparisons.
 
 The imported candidate is evaluated independently on an AVX-512 Linux host.
-Its workflow runs fixtures, public dev fingerprints, independent boundary and
+Evaluation requires fixtures, public dev fingerprints, independent boundary and
 randomized tests, and 5M/20M benchmarks on seeds 1 and 2. Stock and worker-spin
 variants are compared against the portable Rust pipeline. A tuned variant must
 improve wall time by at least 5% and reduce CPU on both seeds before recommendation.

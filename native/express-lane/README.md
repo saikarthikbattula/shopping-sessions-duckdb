@@ -10,7 +10,8 @@ This candidate is isolated from the default Rust executable. It uses Linux
 syscalls and Cascade Lake AVX-512 instructions and cannot run on an ARM Mac.
 Rust 1.95.0 is pinned for its AVX-512 intrinsics and cold_path hint (stabilized in 1.95). Builds must run from this folder
 so Cargo loads .cargo/config.toml. A newer CPU alone does not prove compatibility;
-the evaluation workflow checks required CPU features before executing the binary.
+verify the required CPU features before executing the binary. Evaluation is
+manual since GitHub Actions workflows were removed at `29cf0f5`.
 
 ```sh
 cd native/express-lane
