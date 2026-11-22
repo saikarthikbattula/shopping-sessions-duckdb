@@ -80,7 +80,16 @@ fn list(dir: &Path) -> Vec<(std::path::PathBuf, usize)> {
         }
         let Ok(md) = std::fs::metadata(&p) else { continue };
         if md.is_file() {
-            v.push((p, md.len() as usize));
+            let len = md.len() as usize;
+            if len > 0 {
+                if let Ok(f) = std::fs::File::open(&p) {
+                    unsafe {
+                        posix_fadvise(f.as_raw_fd(), 0, len as i64, POSIX_FADV_WILLNEED);
+                        posix_fadvise(f.as_raw_fd(), 0, len as i64, POSIX_FADV_SEQUENTIAL);
+                    }
+                }
+            }
+            v.push((p, len));
         }
     }
     v
@@ -264,9 +273,17 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
     let (mut ev_bytes, mut ck_bytes, mut lk_bytes) = (0usize, 0usize, 0usize);
     for (kind, p, len) in &all {
         let Ok(f) = std::fs::File::open(p) else { fallback("open input") };
+        unsafe {
+            posix_fadvise(f.as_raw_fd(), 0, *len as i64, POSIX_FADV_WILLNEED);
+            posix_fadvise(f.as_raw_fd(), 0, *len as i64, POSIX_FADV_SEQUENTIAL);
+        }
         let q = unsafe { mmap(region.add(off), *len, PROT_READ, MAP_PRIVATE | MAP_FIXED, f.as_raw_fd(), 0) };
         if q as isize == -1 {
             fallback("mmap input");
+        }
+        unsafe {
+            madvise(q, *len, MADV_WILLNEED);
+            madvise(q, *len, MADV_SEQUENTIAL);
         }
         match kind {
             Kind::Ev => ev_bytes += len,
@@ -637,9 +654,17 @@ fn map_file(p: &Path) -> (usize, usize) {
     if n == 0 {
         return (8, 0);
     }
+    unsafe {
+        posix_fadvise(f.as_raw_fd(), 0, n as i64, POSIX_FADV_WILLNEED);
+        posix_fadvise(f.as_raw_fd(), 0, n as i64, POSIX_FADV_SEQUENTIAL);
+    }
     let q = unsafe { mmap(std::ptr::null_mut(), n, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
     if q as isize == -1 {
         fallback("cannot read a lookup file");
+    }
+    unsafe {
+        madvise(q, n, MADV_WILLNEED);
+        madvise(q, n, MADV_SEQUENTIAL);
     }
     (q as usize, n)
 }
@@ -864,9 +889,17 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         let mut bytes = [0usize; 3];
         for (i, (kind, p, len)) in all.iter().enumerate() {
             let Ok(f) = std::fs::File::open(p) else { fallback("open input") };
+            unsafe {
+                posix_fadvise(f.as_raw_fd(), 0, *len as i64, POSIX_FADV_WILLNEED);
+                posix_fadvise(f.as_raw_fd(), 0, *len as i64, POSIX_FADV_SEQUENTIAL);
+            }
             let q = unsafe { mmap(region.add(off), *len, PROT_READ, MAP_PRIVATE | MAP_FIXED, f.as_raw_fd(), 0) };
             if q as isize == -1 {
                 fallback("mmap input");
+            }
+            unsafe {
+                madvise(q, *len, MADV_WILLNEED);
+                madvise(q, *len, MADV_SEQUENTIAL);
             }
             bytes[*kind as usize] += len;
             files.push(FileInfo { kind: *kind, off, len: *len, hdr: usize::MAX });
@@ -1081,4 +1114,5 @@ fn io_advise(region: *mut u8, len: usize) {
     if adv == 2 || adv == 1 {
         unsafe { madvise(region, len, adv) };
     }
+    unsafe { madvise(region, len, MADV_WILLNEED) };
 }

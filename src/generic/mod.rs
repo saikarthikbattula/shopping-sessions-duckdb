@@ -8,15 +8,6 @@ use self::parse::{chunk_target, chunks, for_lines, split, B};
 use self::util::{map_dir, new_map, par_run, Map, Mapped};
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
-
-const ES: usize = 256;
-const PS: usize = 256;
-
-fn take<T: Default>(m: &Mutex<T>) -> T {
-    std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner()))
-}
 
 enum P1<'a> {
     None,
@@ -107,28 +98,20 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
     lap("setup");
 
     let ectx = EvCtx { ws, we, products: &products, unknown_cat };
+    const ES: usize = 256;
+    const PS: usize = 256;
+
     let (nl, ne, nc) = (lk_chunks.len(), ev_chunks.len(), ck_chunks.len());
-    let lk_parts: Vec<Mutex<LinkPart>> = (0..nl).map(|_| Mutex::new(Vec::new())).collect();
-    let lk_done = AtomicUsize::new(0);
-    let links_slot: Mutex<Option<LinkMap>> = Mutex::new(None);
-    let (res, _) = par_run(nl + ne + nc, ncpu, P1Bufs::default, |bf, i| {
-        if i < nl {
-            let v = parse_links(lk_chunks[i]);
-            *lk_parts[i].lock().unwrap() = v;
-            if lk_done.fetch_add(1, Ordering::AcqRel) + 1 == nl {
-                let parts: Vec<LinkPart> = lk_parts.iter().map(take).collect();
-                let lm = build_links(&parts);
-                *links_slot.lock().unwrap() = Some(lm);
-            }
-            P1::None
-        } else if i < nl + ne {
-            P1::E(parse_events(ev_chunks[i - nl], &ectx, ES, &mut bf.ev))
+    let (lk_parts, _) = par_run(nl, ncpu, || (), |_, i| parse_links(lk_chunks[i]));
+    let links = build_links(&lk_parts, ncpu);
+
+    let (res, _) = par_run(ne + nc, ncpu, P1Bufs::default, |bf, i| {
+        if i < ne {
+            P1::E(parse_events(ev_chunks[i], &ectx, ES, &mut bf.ev))
         } else {
-            P1::C(parse_clicks(ck_chunks[i - nl - ne], ws, we, &campaigns))
+            P1::C(parse_clicks(ck_chunks[i - ne], ws, we, &campaigns))
         }
     });
-    let links = links_slot.into_inner().unwrap().unwrap_or_else(|| build_links(&[]));
-    drop(lk_parts);
     let mut ev_parts: Vec<Parts<Ev>> = Vec::with_capacity(ne);
     let mut ck_parts: Vec<Vec<Ck0>> = Vec::with_capacity(nc);
     for r in res {

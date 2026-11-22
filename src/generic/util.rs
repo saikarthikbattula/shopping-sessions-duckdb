@@ -81,8 +81,8 @@ pub fn new_map<K, V>(n: usize) -> Map<K, V> {
 }
 
 pub struct Tab {
-    slots: Vec<u64>,
-    mask: usize,
+    pub slots: Vec<u64>,
+    pub mask: usize,
 }
 impl Default for Tab {
     fn default() -> Self {
@@ -186,6 +186,16 @@ pub fn find_sub(h: &[u8], n: &[u8]) -> Option<usize> {
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn posix_fadvise(_fd: i32, _offset: i64, _len: i64, _advice: i32) -> i32 {
+    0
 }
 
 pub struct Mapped {
@@ -202,9 +212,17 @@ impl Mapped {
         if len == 0 {
             return Ok(Mapped { ptr: std::ptr::null_mut(), len: 0 });
         }
+        unsafe {
+            posix_fadvise(f.as_raw_fd(), 0, len as i64, 3 /* POSIX_FADV_WILLNEED */);
+            posix_fadvise(f.as_raw_fd(), 0, len as i64, 2 /* POSIX_FADV_SEQUENTIAL */);
+        }
         let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
         if p as isize == -1 {
             return Err(ctx(io::Error::last_os_error()));
+        }
+        unsafe {
+            madvise(p, len, 3 /* MADV_WILLNEED */);
+            madvise(p, len, 2 /* MADV_SEQUENTIAL */);
         }
         Ok(Mapped { ptr: p, len })
     }

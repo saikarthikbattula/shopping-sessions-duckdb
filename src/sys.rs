@@ -19,9 +19,31 @@ pub const MAP_PRIVATE: i32 = 2;
 pub const MAP_FIXED: i32 = 0x10;
 pub const MAP_ANONYMOUS: i32 = 0x20;
 pub const MAP_NORESERVE: i32 = 0x4000;
+pub const MADV_NORMAL: i32 = 0;
+pub const MADV_RANDOM: i32 = 1;
+pub const MADV_SEQUENTIAL: i32 = 2;
+pub const MADV_WILLNEED: i32 = 3;
 pub const MADV_DONTNEED: i32 = 4;
 pub const MADV_HUGEPAGE: i32 = 14;
 pub const MADV_NOHUGEPAGE: i32 = 15;
+pub const MADV_POPULATE_READ: i32 = 22;
+pub const MADV_POPULATE_WRITE: i32 = 23;
+
+pub const POSIX_FADV_NORMAL: i32 = 0;
+pub const POSIX_FADV_RANDOM: i32 = 1;
+pub const POSIX_FADV_SEQUENTIAL: i32 = 2;
+pub const POSIX_FADV_WILLNEED: i32 = 3;
+pub const POSIX_FADV_DONTNEED: i32 = 4;
+pub const POSIX_FADV_NOREUSE: i32 = 5;
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    pub fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+}
+#[cfg(not(target_os = "linux"))]
+pub unsafe fn posix_fadvise(_fd: i32, _offset: i64, _len: i64, _advice: i32) -> i32 {
+    0
+}
 const HP: usize = 2 << 20;
 
 pub static HUGE: AtomicBool = AtomicBool::new(true);

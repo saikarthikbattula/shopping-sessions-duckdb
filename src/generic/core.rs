@@ -1,5 +1,7 @@
 use super::parse::{day_of, first, first_two, for_lines, count_lines, parse_price, parse_ts, split, B, DAY_MS};
 use super::util::{hash, Map, Tab};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Barrier;
 
 
 pub struct LinkMap<'a> {
@@ -22,7 +24,7 @@ impl<'a> LinkMap<'a> {
     }
 }
 
-fn find(parent: &mut [u32], mut x: u32) -> u32 {
+fn find_seq(parent: &mut [u32], mut x: u32) -> u32 {
     let mut r = x;
     while parent[r as usize] != r {
         r = parent[r as usize];
@@ -49,7 +51,7 @@ pub fn parse_links(c: B<'_>) -> LinkPart<'_> {
     v
 }
 
-pub fn build_links<'a>(parts: &[LinkPart<'a>]) -> LinkMap<'a> {
+pub fn build_links_seq<'a>(parts: &[LinkPart<'a>]) -> LinkMap<'a> {
     let n: usize = parts.iter().map(|p| p.len()).sum();
     let mut tab = Tab::with_capacity(2 * n + 16);
     let mut ids: Vec<B<'a>> = Vec::with_capacity(n);
@@ -72,8 +74,8 @@ pub fn build_links<'a>(parts: &[LinkPart<'a>]) -> LinkMap<'a> {
         for &(a, ha, b, hb) in p {
             let x = intern(a, ha, &mut ids, &mut hashes, &mut parent);
             let y = intern(b, hb, &mut ids, &mut hashes, &mut parent);
-            let rx = find(&mut parent, x);
-            let ry = find(&mut parent, y);
+            let rx = find_seq(&mut parent, x);
+            let ry = find_seq(&mut parent, y);
             if rx != ry {
                 if rx < ry {
                     parent[ry as usize] = rx
@@ -87,7 +89,7 @@ pub fn build_links<'a>(parts: &[LinkPart<'a>]) -> LinkMap<'a> {
     let mut min_of: Vec<u32> = (0..m as u32).collect();
     let mut roots = vec![0u32; m];
     for i in 0..m as u32 {
-        let r = find(&mut parent, i);
+        let r = find_seq(&mut parent, i);
         roots[i as usize] = r;
         if ids[i as usize] < ids[min_of[r as usize] as usize] {
             min_of[r as usize] = i;
@@ -95,6 +97,299 @@ pub fn build_links<'a>(parts: &[LinkPart<'a>]) -> LinkMap<'a> {
     }
     let name_of: Vec<u32> = roots.iter().map(|&r| min_of[r as usize]).collect();
     LinkMap { tab, ids, hashes, name_of }
+}
+
+#[inline]
+fn find_atomic(parent: &[AtomicU32], mut x: u32) -> u32 {
+    let mut p = parent[x as usize].load(Ordering::Relaxed);
+    while p != x {
+        let gp = parent[p as usize].load(Ordering::Relaxed);
+        let _ = parent[x as usize].compare_exchange_weak(p, gp, Ordering::Relaxed, Ordering::Relaxed);
+        x = gp;
+        p = parent[x as usize].load(Ordering::Relaxed);
+    }
+    x
+}
+
+#[inline]
+fn union_atomic(parent: &[AtomicU32], mut x: u32, mut y: u32) {
+    loop {
+        let mut rx = find_atomic(parent, x);
+        let mut ry = find_atomic(parent, y);
+        if rx == ry {
+            return;
+        }
+        if rx > ry {
+            std::mem::swap(&mut rx, &mut ry);
+        }
+        match parent[ry as usize].compare_exchange(ry, rx, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(_) => {
+                x = rx;
+                y = parent[ry as usize].load(Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+pub fn build_links_par<'a>(parts: &[LinkPart<'a>], threads: usize) -> LinkMap<'a> {
+    let total_edges: usize = parts.iter().map(|p| p.len()).sum();
+    if total_edges == 0 {
+        return LinkMap {
+            tab: Tab::with_capacity(16),
+            ids: Vec::new(),
+            hashes: Vec::new(),
+            name_of: Vec::new(),
+        };
+    }
+    let threads = threads.max(1);
+    if threads == 1 || total_edges < 32768 {
+        return build_links_seq(parts);
+    }
+
+    const S: usize = 64;
+    #[inline(always)]
+    fn shard_idx(h: u64) -> usize {
+        ((h >> 32) as usize) & (S - 1)
+    }
+
+    let chunk_size = (total_edges / (threads * 4)).clamp(128, 8192);
+    let mut edge_chunks: Vec<&[(B<'a>, u64, B<'a>, u64)]> = Vec::new();
+    for p in parts {
+        for c in p.chunks(chunk_size) {
+            if !c.is_empty() {
+                edge_chunks.push(c);
+            }
+        }
+    }
+
+    let n_chunks = edge_chunks.len();
+    let chunk_idx = AtomicUsize::new(0);
+
+    struct ShardData<'a> {
+        ids: Vec<B<'a>>,
+        hashes: Vec<u64>,
+        tab: Tab,
+    }
+
+    let thread_shards: Vec<Vec<Vec<(B<'a>, u64)>>> = std::thread::scope(|s| {
+        let chunk_idx_ref = &chunk_idx;
+        let edge_chunks_ref = &edge_chunks;
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            handles.push(s.spawn(move || {
+                let mut local = (0..S).map(|_| Vec::new()).collect::<Vec<_>>();
+                loop {
+                    let idx = chunk_idx_ref.fetch_add(1, Ordering::Relaxed);
+                    if idx >= n_chunks {
+                        break;
+                    }
+                    let chunk = edge_chunks_ref[idx];
+                    for &(a, ha, b, hb) in chunk {
+                        local[shard_idx(ha)].push((a, ha));
+                        local[shard_idx(hb)].push((b, hb));
+                    }
+                }
+                local
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let shard_counter = AtomicUsize::new(0);
+    let shard_outputs: Vec<Vec<(usize, ShardData<'a>)>> = std::thread::scope(|s| {
+        let thread_shards_ref = &thread_shards;
+        let shard_counter_ref = &shard_counter;
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            handles.push(s.spawn(move || {
+                let mut my_shards = Vec::new();
+                loop {
+                    let s_idx = shard_counter_ref.fetch_add(1, Ordering::Relaxed);
+                    if s_idx >= S {
+                        break;
+                    }
+                    let total_items: usize = thread_shards_ref.iter().map(|t| t[s_idx].len()).sum();
+                    let mut tab = Tab::with_capacity(total_items + 16);
+                    let mut ids: Vec<B<'a>> = Vec::with_capacity(total_items / 2 + 8);
+                    let mut hashes: Vec<u64> = Vec::with_capacity(ids.capacity());
+                    for t in thread_shards_ref {
+                        for &(item, h) in &t[s_idx] {
+                            match tab.find(h, |idx| ids[idx as usize] == item) {
+                                Ok(_) => {}
+                                Err(slot) => {
+                                    let idx = ids.len() as u32;
+                                    ids.push(item);
+                                    hashes.push(h);
+                                    tab.set(slot, h, idx);
+                                }
+                            }
+                        }
+                    }
+                    my_shards.push((s_idx, ShardData { ids, hashes, tab }));
+                }
+                my_shards
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut shard_results: Vec<Option<ShardData<'a>>> = (0..S).map(|_| None).collect();
+    for thread_res in shard_outputs {
+        for (s_idx, sdata) in thread_res {
+            shard_results[s_idx] = Some(sdata);
+        }
+    }
+    let shard_results: Vec<ShardData<'a>> = shard_results.into_iter().map(|o| o.unwrap()).collect();
+
+    let mut shard_base = [0usize; S + 1];
+    for s in 0..S {
+        shard_base[s + 1] = shard_base[s] + shard_results[s].ids.len();
+    }
+    let total_unique = shard_base[S];
+    if total_unique == 0 {
+        return LinkMap {
+            tab: Tab::with_capacity(16),
+            ids: Vec::new(),
+            hashes: Vec::new(),
+            name_of: Vec::new(),
+        };
+    }
+
+    let parent: Vec<AtomicU32> = (0..total_unique as u32).map(AtomicU32::new).collect();
+    let mut ids: Vec<B<'a>> = Vec::with_capacity(total_unique);
+    let mut hashes: Vec<u64> = Vec::with_capacity(total_unique);
+    for s in 0..S {
+        ids.extend_from_slice(&shard_results[s].ids);
+        hashes.extend_from_slice(&shard_results[s].hashes);
+    }
+    let min_of: Vec<AtomicU32> = (0..total_unique as u32).map(AtomicU32::new).collect();
+    let roots: Vec<AtomicU32> = (0..total_unique as u32).map(|_| AtomicU32::new(0)).collect();
+    let name_of: Vec<AtomicU32> = (0..total_unique as u32).map(|_| AtomicU32::new(0)).collect();
+
+    let item_chunk_size = (total_unique / (threads * 4)).clamp(64, 4096);
+    let n_item_chunks = (total_unique + item_chunk_size - 1) / item_chunk_size;
+
+    let chunk_idx2 = AtomicUsize::new(0);
+    let item_chunk_counter = AtomicUsize::new(0);
+    let name_chunk_counter = AtomicUsize::new(0);
+    let barrier = Barrier::new(threads);
+
+    std::thread::scope(|s| {
+        let parent_ref = &parent;
+        let shard_res_ref = &shard_results;
+        let edge_chunks_ref = &edge_chunks;
+        let chunk_idx2_ref = &chunk_idx2;
+        let shard_base_ref = &shard_base;
+        let min_of_ref = &min_of;
+        let ids_ref = &ids;
+        let roots_ref = &roots;
+        let name_of_ref = &name_of;
+        let item_chunk_counter_ref = &item_chunk_counter;
+        let name_chunk_counter_ref = &name_chunk_counter;
+        let barrier_ref = &barrier;
+
+        for _ in 0..threads {
+            s.spawn(move || {
+                // Step A: Union edges
+                loop {
+                    let idx = chunk_idx2_ref.fetch_add(1, Ordering::Relaxed);
+                    if idx >= n_chunks {
+                        break;
+                    }
+                    let chunk = edge_chunks_ref[idx];
+                    for &(a, ha, b, hb) in chunk {
+                        let sa = shard_idx(ha);
+                        let sb = shard_idx(hb);
+                        let la = match shard_res_ref[sa].tab.find(ha, |i| shard_res_ref[sa].ids[i as usize] == a) {
+                            Ok((_, i)) => i,
+                            Err(_) => continue,
+                        };
+                        let lb = match shard_res_ref[sb].tab.find(hb, |i| shard_res_ref[sb].ids[i as usize] == b) {
+                            Ok((_, i)) => i,
+                            Err(_) => continue,
+                        };
+                        let x = (shard_base_ref[sa] as u32) + la;
+                        let y = (shard_base_ref[sb] as u32) + lb;
+                        if x != y {
+                            union_atomic(parent_ref, x, y);
+                        }
+                    }
+                }
+
+                // Barrier 1: Wait for all edges to be unified
+                barrier_ref.wait();
+
+                // Step B: Find component roots & update min_of
+                loop {
+                    let c = item_chunk_counter_ref.fetch_add(1, Ordering::Relaxed);
+                    if c >= n_item_chunks {
+                        break;
+                    }
+                    let start = c * item_chunk_size;
+                    let end = (start + item_chunk_size).min(total_unique);
+                    for i in start..end {
+                        let r = find_atomic(parent_ref, i as u32);
+                        roots_ref[i].store(r, Ordering::Relaxed);
+                        let r_idx = r as usize;
+                        let mut curr = min_of_ref[r_idx].load(Ordering::Relaxed);
+                        while ids_ref[i] < ids_ref[curr as usize] {
+                            match min_of_ref[r_idx].compare_exchange_weak(curr, i as u32, Ordering::Release, Ordering::Relaxed) {
+                                Ok(_) => break,
+                                Err(actual) => curr = actual,
+                            }
+                        }
+                    }
+                }
+
+                // Barrier 2: Wait for all minimums to be computed
+                barrier_ref.wait();
+
+                // Step C: Assign canonical name
+                loop {
+                    let c = name_chunk_counter_ref.fetch_add(1, Ordering::Relaxed);
+                    if c >= n_item_chunks {
+                        break;
+                    }
+                    let start = c * item_chunk_size;
+                    let end = (start + item_chunk_size).min(total_unique);
+                    for i in start..end {
+                        let r = roots_ref[i].load(Ordering::Relaxed);
+                        let best = min_of_ref[r as usize].load(Ordering::Relaxed);
+                        name_of_ref[i].store(best, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+
+    let name_of: Vec<u32> = name_of.into_iter().map(AtomicU32::into_inner).collect();
+
+    // Step 8: Build final global Tab
+    let mut tab = Tab::with_capacity(2 * total_unique + 16);
+    for (i, &h) in hashes.iter().enumerate() {
+        let tag = h >> 32;
+        let val = (tag << 32) | (i as u64 + 1);
+        let mut slot = (h as usize) & tab.mask;
+        loop {
+            if tab.slots[slot] == 0 {
+                tab.slots[slot] = val;
+                break;
+            }
+            slot = (slot + 1) & tab.mask;
+        }
+    }
+
+    LinkMap {
+        tab,
+        ids,
+        hashes,
+        name_of,
+    }
+}
+
+pub fn build_links<'a>(parts: &[LinkPart<'a>], threads: usize) -> LinkMap<'a> {
+    build_links_par(parts, threads)
 }
 
 
@@ -631,5 +926,205 @@ fn assists(starts: &[i64], days: &[i32], day_end: &[u32], cks: &[PC], ct: &mut V
             i += 1;
         }
         flush(camp, a, b);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_links_empty() {
+        let lm = build_links(&[], 4);
+        assert_eq!(lm.name(b"user1", hash(b"user1")), (b"user1".as_slice(), hash(b"user1")));
+        let empty_parts: Vec<LinkPart> = vec![Vec::new(), Vec::new()];
+        let lm2 = build_links(&empty_parts, 4);
+        assert_eq!(lm2.name(b"user1", hash(b"user1")), (b"user1".as_slice(), hash(b"user1")));
+    }
+
+    #[test]
+    fn test_build_links_basic_and_transitive() {
+        let parts = vec![
+            vec![
+                (b"user_b".as_slice(), hash(b"user_b"), b"user_c".as_slice(), hash(b"user_c")),
+                (b"user_c".as_slice(), hash(b"user_c"), b"user_a".as_slice(), hash(b"user_a")),
+            ],
+            vec![
+                (b"user_d".as_slice(), hash(b"user_d"), b"user_e".as_slice(), hash(b"user_e")),
+                (b"user_f".as_slice(), hash(b"user_f"), b"user_f".as_slice(), hash(b"user_f")), // self-link
+            ],
+        ];
+
+        for threads in [1, 2, 4, 8] {
+            let lm = build_links(&parts, threads);
+            // user_a, user_b, user_c should all resolve to user_a (lexicographical smallest)
+            assert_eq!(lm.name(b"user_a", hash(b"user_a")).0, b"user_a");
+            assert_eq!(lm.name(b"user_b", hash(b"user_b")).0, b"user_a");
+            assert_eq!(lm.name(b"user_c", hash(b"user_c")).0, b"user_a");
+
+            // user_d, user_e should resolve to user_d
+            assert_eq!(lm.name(b"user_d", hash(b"user_d")).0, b"user_d");
+            assert_eq!(lm.name(b"user_e", hash(b"user_e")).0, b"user_d");
+
+            // user_f is self-linked
+            assert_eq!(lm.name(b"user_f", hash(b"user_f")).0, b"user_f");
+
+            // unlinked user should resolve to itself
+            assert_eq!(lm.name(b"user_z", hash(b"user_z")).0, b"user_z");
+        }
+    }
+
+    #[test]
+    fn test_build_links_arbitrary_utf8() {
+        let parts = vec![vec![
+            (b" \t spaced user ".as_slice(), hash(b" \t spaced user "), b"normal_user".as_slice(), hash(b"normal_user")),
+            (b"\xf0\x9f\x98\x80 emoji".as_slice(), hash(b"\xf0\x9f\x98\x80 emoji"), b"\xe4\xbd\xa0\xe5\xa5\xbd".as_slice(), hash(b"\xe4\xbd\xa0\xe5\xa5\xbd")),
+        ]];
+        for threads in [1, 2, 4] {
+            let lm = build_links(&parts, threads);
+            // space (0x20) is smaller than 'n' (0x6e)
+            assert_eq!(lm.name(b"normal_user", hash(b"normal_user")).0, b" \t spaced user ");
+            assert_eq!(lm.name(b" \t spaced user ", hash(b" \t spaced user ")).0, b" \t spaced user ");
+
+            // UTF-8 bytes comparison
+            let smallest = if b"\xf0\x9f\x98\x80 emoji"[..] < b"\xe4\xbd\xa0\xe5\xa5\xbd"[..] {
+                b"\xf0\x9f\x98\x80 emoji".as_slice()
+            } else {
+                b"\xe4\xbd\xa0\xe5\xa5\xbd".as_slice()
+            };
+            assert_eq!(lm.name(b"\xf0\x9f\x98\x80 emoji", hash(b"\xf0\x9f\x98\x80 emoji")).0, smallest);
+            assert_eq!(lm.name(b"\xe4\xbd\xa0\xe5\xa5\xbd", hash(b"\xe4\xbd\xa0\xe5\xa5\xbd")).0, smallest);
+        }
+    }
+
+    #[test]
+    fn test_parallel_equivalence_large_graph() {
+        let n_nodes = 5000;
+        let node_names: Vec<String> = (0..n_nodes).map(|i| format!("id_{:06x}", (i * 31) % 99991)).collect();
+        let mut parts: Vec<LinkPart> = vec![Vec::new(); 6];
+        let mut rng = 987654321u64;
+
+        // Generate 20,000 edges across 6 parts
+        for i in 0..20_000 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u1 = (rng >> 32) as usize % n_nodes;
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u2 = (rng >> 32) as usize % n_nodes;
+            let s1 = node_names[u1].as_bytes();
+            let s2 = node_names[u2].as_bytes();
+            parts[i % 6].push((s1, hash(s1), s2, hash(s2)));
+        }
+
+        let seq_map = build_links_seq(&parts);
+        for &t in &[2, 4, 8] {
+            let par_map = build_links_par(&parts, t);
+            for node in &node_names {
+                let b = node.as_bytes();
+                let h = hash(b);
+                let (s_name, s_h) = seq_map.name(b, h);
+                let (p_name, p_h) = par_map.name(b, h);
+                assert_eq!(s_name, p_name, "Thread count {t} mismatch on node {node}");
+                assert_eq!(s_h, p_h, "Thread count {t} hash mismatch on node {node}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_long_chain_adversarial() {
+        let n = 20_000;
+        let nodes: Vec<String> = (0..n).map(|i| format!("user_{:06}", i)).collect();
+        let mut edges = Vec::new();
+        for i in 0..n - 1 {
+            let ab = nodes[i].as_bytes();
+            let bb = nodes[i + 1].as_bytes();
+            edges.push((ab, hash(ab), bb, hash(bb)));
+        }
+        let parts = vec![edges];
+        let seq = build_links_seq(&parts);
+        for t in [2, 4, 8] {
+            let par = build_links_par(&parts, t);
+            for i in [0, 1, 500, 1000, 9999, 19999] {
+                let sb = nodes[i].as_bytes();
+                let h = hash(sb);
+                let (s_name, _) = seq.name(sb, h);
+                let (p_name, _) = par.name(sb, h);
+                assert_eq!(s_name, b"user_000000".as_slice());
+                assert_eq!(p_name, b"user_000000".as_slice());
+            }
+        }
+    }
+
+    #[test]
+    fn test_star_graph() {
+        let n = 10_000;
+        let hub = "hub_node";
+        let nodes: Vec<String> = (0..n).map(|i| format!("leaf_{:06}", i)).collect();
+        let mut edges = Vec::new();
+        let hub_b = hub.as_bytes();
+        let hub_h = hash(hub_b);
+        for s in &nodes {
+            let sb = s.as_bytes();
+            edges.push((hub_b, hub_h, sb, hash(sb)));
+        }
+        let parts = vec![edges];
+        let seq = build_links_seq(&parts);
+        for t in [2, 4, 8] {
+            let par = build_links_par(&parts, t);
+            let (sh, _) = seq.name(hub_b, hub_h);
+            let (ph, _) = par.name(hub_b, hub_h);
+            assert_eq!(sh, ph);
+            assert_eq!(sh, b"hub_node".as_slice());
+            for s in &nodes[0..50] {
+                let sb = s.as_bytes();
+                let h = hash(sb);
+                assert_eq!(seq.name(sb, h), par.name(sb, h));
+            }
+        }
+    }
+
+    #[test]
+    fn test_utf8_complex_lexicographical() {
+        let raw_ids: Vec<&[u8]> = vec![
+            b" U1",
+            b"\"U1\"",
+            b"001",
+            b"999",
+            b"U1",
+            b"u1",
+            b"\x7f_del",
+            b"\xc2\xa0_nbsp",
+            b"\xe4\xbd\xa0_chinese",
+            b"\xf0\x9f\x98\x80_emoji",
+        ];
+
+        let mut edges = Vec::new();
+        for i in 0..raw_ids.len() - 1 {
+            let a = raw_ids[i];
+            let b = raw_ids[i + 1];
+            edges.push((a, hash(a), b, hash(b)));
+        }
+        for i in (1..raw_ids.len()).rev() {
+            let a = raw_ids[i];
+            let b = raw_ids[i - 1];
+            edges.push((a, hash(a), b, hash(b)));
+        }
+        for &a in &raw_ids {
+            edges.push((a, hash(a), a, hash(a)));
+        }
+
+        let parts = vec![edges];
+        let seq = build_links_seq(&parts);
+        let min_expected = *raw_ids.iter().min().unwrap();
+
+        for t in [1, 2, 4, 8] {
+            let par = build_links_par(&parts, t);
+            for &id in &raw_ids {
+                let h = hash(id);
+                let (s_name, _) = seq.name(id, h);
+                let (p_name, _) = par.name(id, h);
+                assert_eq!(s_name, min_expected, "Seq name for {:?} failed", id);
+                assert_eq!(p_name, min_expected, "Par name for {:?} failed", id);
+            }
+        }
     }
 }
