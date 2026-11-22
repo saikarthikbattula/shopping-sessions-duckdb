@@ -8,15 +8,20 @@ binary and BusyBox utilities. The former staging protocol/tests are retired;
 analytical boundary and randomized checks now execute the native binary directly.
 
 The imported MIT-licensed AVX-512 candidate is isolated and unmeasured locally:
-this ARM Mac cannot execute it. Its Linux workflow gates fixtures, public dev,
-independent differential tests, and 5M/20M two-seed measurements before selection.
-Static-musl image construction and restricted container checks are also pending
-Linux CI because Docker is unavailable here. Do not treat earlier Python-backed
+this ARM Mac cannot execute it. Selection requires fixtures, public dev,
+independent differential tests, and 5M/20M two-seed measurements on Linux.
+Static-musl image construction and restricted container checks are also pending.
+GitHub Actions workflows were removed at `29cf0f5`; these gates now require
+manual execution on a compatible host. Do not treat earlier Python-backed
 container checks below as validation of the new image or imported candidate.
 
 ---
 
-# Integrated pipeline validation
+# Historical integrated pipeline validation
+
+The following records the former Python/DuckDB implementation and its workflows.
+Commands and CI descriptions below are historical, not current runtime instructions.
+Use the root README for current commands.
 
 Status as of November 20, 2026: public correctness and reduced-resource container compatibility pass on the integration branch. Full-size scorer performance is not yet established.
 

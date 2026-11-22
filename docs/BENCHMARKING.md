@@ -29,7 +29,8 @@ its CPU configuration, then run:
 The candidate harness compares trusted Rust, stock upstream settings, XL_SPIN=0,
 and XL_SPIN=50 in rotating order. Every round must match both tables exactly.
 It records fallback status, executable hashes and whole-process wait4 resources.
-The Linux workflow runs this on 5M and 20M seeds 1/2 after fixtures, public-dev and
-independent differential gates. A tuned variant must improve wall by at least 5%
+Run this manually on Linux with 5M and 20M seeds 1/2 after fixtures, public-dev
+and independent differential gates. GitHub Actions workflows were removed at
+`29cf0f5`. A tuned variant must improve wall by at least 5%
 and reduce CPU against both stock and trusted Rust on both seeds to be recommended.
 No recommendation is a scorer result or permission to submit a competition entry.

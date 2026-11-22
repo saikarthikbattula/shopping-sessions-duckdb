@@ -25,3 +25,14 @@ target/
 
 # Ad-hoc generated benchmark directories
 /gen_*/
+
+# Local editor, tool and profiling artifacts
+/.aws/
+/.codex/
+/.agents/
+/.idea/
+/.vscode/
+.ruff_cache/
+.mypy_cache/
+*.swp
+*.swo

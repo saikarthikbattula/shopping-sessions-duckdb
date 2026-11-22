@@ -10,7 +10,8 @@ current interfaces and README.md for commands.
    local boundary/randomized checks.
 2. Build a static musl executable and run it directly in a minimal container.
    No Python, DuckDB, runtime downloads or intermediate staging are shipped.
-   Linux image and restricted-container checks remain CI gates.
+   Linux image and restricted-container checks remain required manual gates;
+   GitHub Actions workflows were removed at `29cf0f5`.
 3. Evaluate the imported, MIT-licensed Express Lane source as an isolated
    AVX-512 Linux candidate. Preserve its license and provenance. Do not infer its
    actual performance from an upstream claim or an ARM Mac development run.
